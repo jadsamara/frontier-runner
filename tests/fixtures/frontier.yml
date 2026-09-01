@@ -1,0 +1,21 @@
+project: jaffle_shop
+environment: dev
+
+model:
+  name: customer_summary
+  entity: customer
+  key: customer_id
+  grain: one_row_per_customer
+
+relations:
+  stg_customers:
+    change_key: customer_id
+    route: direct
+
+  stg_orders:
+    change_key: order_id
+    route:
+      query: |
+        select customer_id
+        from {{ ref('stg_orders') }}
+        where order_id in ({{ changed_values }})

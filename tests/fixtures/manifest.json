@@ -1,0 +1,506 @@
+{
+  "metadata": {
+    "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+    "project_name": "jaffle_shop",
+    "adapter_type": "snowflake",
+    "quoting": {
+      "database": false,
+      "identifier": false,
+      "schema": false
+    }
+  },
+  "nodes": {
+    "model.jaffle_shop.customer_summary": {
+      "resource_type": "model",
+      "unique_id": "model.jaffle_shop.customer_summary",
+      "name": "customer_summary",
+      "database": "DATA_AGENT_DEV",
+      "schema": "DBT_DEV",
+      "alias": "customer_summary",
+      "relation_name": "DATA_AGENT_DEV.DBT_DEV.customer_summary",
+      "package_name": "jaffle_shop",
+      "depends_on": {
+        "nodes": [
+          "model.jaffle_shop.int_customer_orders"
+        ],
+        "macros": []
+      },
+      "original_file_path": "models/marts/customer_summary.sql",
+      "path": "marts/customer_summary.sql",
+      "fqn": [
+        "jaffle_shop",
+        "marts",
+        "customer_summary"
+      ],
+      "tags": [],
+      "columns": {
+        "customer_id": {
+          "name": "customer_id"
+        },
+        "total_orders": {
+          "name": "total_orders"
+        }
+      }
+    },
+    "model.jaffle_shop.int_customer_orders": {
+      "resource_type": "model",
+      "unique_id": "model.jaffle_shop.int_customer_orders",
+      "name": "int_customer_orders",
+      "database": "DATA_AGENT_DEV",
+      "schema": "DBT_DEV",
+      "alias": "int_customer_orders",
+      "relation_name": "DATA_AGENT_DEV.DBT_DEV.int_customer_orders",
+      "package_name": "jaffle_shop",
+      "depends_on": {
+        "nodes": [
+          "model.jaffle_shop.stg_customers",
+          "model.jaffle_shop.stg_orders"
+        ],
+        "macros": []
+      },
+      "original_file_path": "models/intermediate/int_customer_orders.sql",
+      "path": "intermediate/int_customer_orders.sql",
+      "fqn": [
+        "jaffle_shop",
+        "intermediate",
+        "int_customer_orders"
+      ],
+      "tags": [],
+      "columns": {}
+    },
+    "model.jaffle_shop.stg_customers": {
+      "resource_type": "model",
+      "unique_id": "model.jaffle_shop.stg_customers",
+      "name": "stg_customers",
+      "database": "DATA_AGENT_DEV",
+      "schema": "DBT_DEV",
+      "alias": "stg_customers",
+      "relation_name": "DATA_AGENT_DEV.DBT_DEV.stg_customers",
+      "package_name": "jaffle_shop",
+      "depends_on": {
+        "nodes": [
+          "source.jaffle_shop.tpch.CUSTOMER"
+        ],
+        "macros": []
+      },
+      "original_file_path": "models/staging/stg_customers.sql",
+      "path": "staging/stg_customers.sql",
+      "fqn": [
+        "jaffle_shop",
+        "staging",
+        "stg_customers"
+      ],
+      "tags": [],
+      "columns": {
+        "customer_id": {
+          "name": "customer_id"
+        },
+        "customer_name": {
+          "name": "customer_name"
+        }
+      }
+    },
+    "model.jaffle_shop.stg_orders": {
+      "resource_type": "model",
+      "unique_id": "model.jaffle_shop.stg_orders",
+      "name": "stg_orders",
+      "database": "DATA_AGENT_DEV",
+      "schema": "DBT_DEV",
+      "alias": "stg_orders",
+      "relation_name": "DATA_AGENT_DEV.DBT_DEV.stg_orders",
+      "package_name": "jaffle_shop",
+      "depends_on": {
+        "nodes": [
+          "source.jaffle_shop.tpch.ORDERS"
+        ],
+        "macros": []
+      },
+      "original_file_path": "models/staging/stg_orders.sql",
+      "path": "staging/stg_orders.sql",
+      "fqn": [
+        "jaffle_shop",
+        "staging",
+        "stg_orders"
+      ],
+      "tags": [],
+      "columns": {
+        "order_id": {
+          "name": "order_id"
+        },
+        "customer_id": {
+          "name": "customer_id"
+        },
+        "order_status": {
+          "name": "order_status"
+        }
+      }
+    },
+    "model.jaffle_shop.frontier_affected_customers": {
+      "resource_type": "model",
+      "unique_id": "model.jaffle_shop.frontier_affected_customers",
+      "name": "frontier_affected_customers",
+      "database": "DATA_AGENT_DEV",
+      "schema": "DBT_DEV",
+      "alias": "frontier_affected_customers",
+      "relation_name": "DATA_AGENT_DEV.DBT_DEV.frontier_affected_customers",
+      "package_name": "jaffle_shop",
+      "depends_on": {
+        "nodes": [
+          "seed.jaffle_shop.change_events",
+          "model.jaffle_shop.stg_orders"
+        ],
+        "macros": []
+      },
+      "original_file_path": "models/frontier/frontier_affected_customers.sql",
+      "path": "frontier/frontier_affected_customers.sql",
+      "fqn": [
+        "jaffle_shop",
+        "frontier",
+        "frontier_affected_customers"
+      ],
+      "tags": [
+        "frontier_demo"
+      ],
+      "columns": {
+        "customer_id": {
+          "name": "customer_id"
+        }
+      }
+    },
+    "model.jaffle_shop.frontier_customer_orders_target": {
+      "resource_type": "model",
+      "unique_id": "model.jaffle_shop.frontier_customer_orders_target",
+      "name": "frontier_customer_orders_target",
+      "database": "DATA_AGENT_DEV",
+      "schema": "DBT_DEV",
+      "alias": "frontier_customer_orders_target",
+      "relation_name": "DATA_AGENT_DEV.DBT_DEV.frontier_customer_orders_target",
+      "package_name": "jaffle_shop",
+      "depends_on": {
+        "nodes": [
+          "model.jaffle_shop.frontier_affected_customers",
+          "model.jaffle_shop.stg_customers",
+          "model.jaffle_shop.stg_orders"
+        ],
+        "macros": []
+      },
+      "original_file_path": "models/frontier/frontier_customer_orders_target.sql",
+      "path": "frontier/frontier_customer_orders_target.sql",
+      "fqn": [
+        "jaffle_shop",
+        "frontier",
+        "frontier_customer_orders_target"
+      ],
+      "tags": [
+        "frontier_demo"
+      ],
+      "columns": {
+        "customer_id": {
+          "name": "customer_id"
+        }
+      }
+    },
+    "model.jaffle_shop.frontier_customer_summary_target": {
+      "resource_type": "model",
+      "unique_id": "model.jaffle_shop.frontier_customer_summary_target",
+      "name": "frontier_customer_summary_target",
+      "database": "DATA_AGENT_DEV",
+      "schema": "DBT_DEV",
+      "alias": "frontier_customer_summary_target",
+      "relation_name": "DATA_AGENT_DEV.DBT_DEV.frontier_customer_summary_target",
+      "package_name": "jaffle_shop",
+      "depends_on": {
+        "nodes": [
+          "model.jaffle_shop.frontier_customer_orders_target"
+        ],
+        "macros": []
+      },
+      "original_file_path": "models/frontier/frontier_customer_summary_target.sql",
+      "path": "frontier/frontier_customer_summary_target.sql",
+      "fqn": [
+        "jaffle_shop",
+        "frontier",
+        "frontier_customer_summary_target"
+      ],
+      "tags": [
+        "frontier_demo"
+      ],
+      "columns": {
+        "customer_id": {
+          "name": "customer_id"
+        }
+      }
+    },
+    "seed.jaffle_shop.change_events": {
+      "resource_type": "seed",
+      "unique_id": "seed.jaffle_shop.change_events",
+      "name": "change_events",
+      "database": "DATA_AGENT_DEV",
+      "schema": "DBT_DEV_raw",
+      "alias": "change_events",
+      "relation_name": "DATA_AGENT_DEV.DBT_DEV_raw.change_events",
+      "package_name": "jaffle_shop",
+      "depends_on": {
+        "nodes": [],
+        "macros": []
+      },
+      "original_file_path": "seeds/change_events.csv",
+      "path": "change_events.csv",
+      "fqn": [
+        "jaffle_shop",
+        "change_events"
+      ],
+      "tags": [
+        "frontier_demo"
+      ],
+      "columns": {
+        "event_id": {
+          "name": "event_id"
+        },
+        "source_model": {
+          "name": "source_model"
+        },
+        "operation": {
+          "name": "operation"
+        }
+      }
+    },
+    "test.jaffle_shop.assert_frontier_events_resolve": {
+      "resource_type": "test",
+      "unique_id": "test.jaffle_shop.assert_frontier_events_resolve",
+      "name": "assert_frontier_events_resolve",
+      "database": "DATA_AGENT_DEV",
+      "schema": "DBT_DEV_dbt_test__audit",
+      "alias": "assert_frontier_events_resolve",
+      "package_name": "jaffle_shop",
+      "depends_on": {
+        "nodes": [
+          "seed.jaffle_shop.change_events",
+          "model.jaffle_shop.stg_customers",
+          "model.jaffle_shop.stg_orders"
+        ],
+        "macros": []
+      },
+      "original_file_path": "tests/assert_frontier_events_resolve.sql",
+      "path": "assert_frontier_events_resolve.sql",
+      "fqn": [
+        "jaffle_shop",
+        "assert_frontier_events_resolve"
+      ],
+      "tags": [
+        "frontier_demo"
+      ],
+      "compiled_code": "-- Every change event must resolve to a current or before-image customer.\n\n\nwith resolved_events as (\n\n    select distinct ce.event_id\n    from DATA_AGENT_DEV.DBT_DEV_raw.change_events ce\n    inner join DATA_AGENT_DEV.DBT_DEV.stg_customers c\n        on ce.source_model = 'stg_customers'\n       and ce.entity_key = 'customer_id'\n       and c.customer_id = ce.entity_value::number\n\n    union\n\n    select distinct ce.event_id\n    from DATA_AGENT_DEV.DBT_DEV_raw.change_events ce\n    inner join DATA_AGENT_DEV.DBT_DEV.stg_orders o\n        on ce.source_model = 'stg_orders'\n       and ce.entity_key = 'order_id'\n       and o.order_id = ce.entity_value::number\n\n    union\n\n    select distinct event_id\n    from DATA_AGENT_DEV.DBT_DEV_raw.change_events\n    where prior_customer_id is not null\n\n)\n\nselect ce.*\nfrom DATA_AGENT_DEV.DBT_DEV_raw.change_events ce\nleft join resolved_events re using (event_id)\nwhere re.event_id is null",
+      "raw_code": "-- Every change event must resolve to a current or before-image customer.\n{{ config(tags=['frontier_demo']) }}\n\nwith resolved_events as (\n\n    select distinct ce.event_id\n    from {{ ref('change_events') }} ce\n    inner join {{ ref('stg_customers') }} c\n        on ce.source_model = 'stg_customers'\n       and ce.entity_key = 'customer_id'\n       and c.customer_id = ce.entity_value::number\n\n    union\n\n    select distinct ce.event_id\n    from {{ ref('change_events') }} ce\n    inner join {{ ref('stg_orders') }} o\n        on ce.source_model = 'stg_orders'\n       and ce.entity_key = 'order_id'\n       and o.order_id = ce.entity_value::number\n\n    union\n\n    select distinct event_id\n    from {{ ref('change_events') }}\n    where prior_customer_id is not null\n\n)\n\nselect ce.*\nfrom {{ ref('change_events') }} ce\nleft join resolved_events re using (event_id)\nwhere re.event_id is null",
+      "columns": {}
+    },
+    "test.jaffle_shop.assert_frontier_matches_full_mart": {
+      "resource_type": "test",
+      "unique_id": "test.jaffle_shop.assert_frontier_matches_full_mart",
+      "name": "assert_frontier_matches_full_mart",
+      "database": "DATA_AGENT_DEV",
+      "schema": "DBT_DEV_dbt_test__audit",
+      "alias": "assert_frontier_matches_full_mart",
+      "package_name": "jaffle_shop",
+      "depends_on": {
+        "nodes": [
+          "model.jaffle_shop.customer_summary",
+          "model.jaffle_shop.frontier_affected_customers",
+          "model.jaffle_shop.frontier_customer_summary_target"
+        ],
+        "macros": []
+      },
+      "original_file_path": "tests/assert_frontier_matches_full_mart.sql",
+      "path": "assert_frontier_matches_full_mart.sql",
+      "fqn": [
+        "jaffle_shop",
+        "assert_frontier_matches_full_mart"
+      ],
+      "tags": [
+        "frontier_demo"
+      ],
+      "compiled_code": "-- The targeted recomputation must equal the corresponding rows in the full\n-- customer mart. Any returned row fails this dbt singular test.\n\n\nwith expected as (\n\n    select cs.*\n    from DATA_AGENT_DEV.DBT_DEV.customer_summary cs\n    inner join DATA_AGENT_DEV.DBT_DEV.frontier_affected_customers f\n        on cs.customer_id = f.customer_id\n\n),\n\nactual as (\n\n    select *\n    from DATA_AGENT_DEV.DBT_DEV.frontier_customer_summary_target\n\n),\n\nmissing_or_changed as (\n\n    select * from expected\n    except\n    select * from actual\n\n),\n\nunexpected_or_changed as (\n\n    select * from actual\n    except\n    select * from expected\n\n)\n\nselect 'missing_or_changed' as difference_type, * from missing_or_changed\nunion all\nselect 'unexpected_or_changed' as difference_type, * from unexpected_or_changed",
+      "raw_code": "-- The targeted recomputation must equal the corresponding rows in the full\n-- customer mart. Any returned row fails this dbt singular test.\n{{ config(tags=['frontier_demo']) }}\n\nwith expected as (\n\n    select cs.*\n    from {{ ref('customer_summary') }} cs\n    inner join {{ ref('frontier_affected_customers') }} f\n        on cs.customer_id = f.customer_id\n\n),\n\nactual as (\n\n    select *\n    from {{ ref('frontier_customer_summary_target') }}\n\n),\n\nmissing_or_changed as (\n\n    select * from expected\n    except\n    select * from actual\n\n),\n\nunexpected_or_changed as (\n\n    select * from actual\n    except\n    select * from expected\n\n)\n\nselect 'missing_or_changed' as difference_type, * from missing_or_changed\nunion all\nselect 'unexpected_or_changed' as difference_type, * from unexpected_or_changed",
+      "columns": {}
+    },
+    "test.jaffle_shop.unique_customer_summary_customer_id.2fb01e9693": {
+      "resource_type": "test",
+      "unique_id": "test.jaffle_shop.unique_customer_summary_customer_id.2fb01e9693",
+      "name": "unique_customer_summary_customer_id",
+      "database": "DATA_AGENT_DEV",
+      "schema": "DBT_DEV_dbt_test__audit",
+      "alias": "unique_customer_summary_customer_id",
+      "package_name": "jaffle_shop",
+      "depends_on": {
+        "nodes": [
+          "model.jaffle_shop.customer_summary"
+        ],
+        "macros": []
+      },
+      "original_file_path": "models/marts/_marts.yml",
+      "path": "unique_customer_summary_customer_id.sql",
+      "fqn": [
+        "jaffle_shop",
+        "marts",
+        "unique_customer_summary_customer_id"
+      ],
+      "tags": [],
+      "columns": {}
+    },
+    "test.jaffle_shop.not_null_customer_summary_customer_id.a81d32eb67": {
+      "resource_type": "test",
+      "unique_id": "test.jaffle_shop.not_null_customer_summary_customer_id.a81d32eb67",
+      "name": "not_null_customer_summary_customer_id",
+      "database": "DATA_AGENT_DEV",
+      "schema": "DBT_DEV_dbt_test__audit",
+      "alias": "not_null_customer_summary_customer_id",
+      "package_name": "jaffle_shop",
+      "depends_on": {
+        "nodes": [
+          "model.jaffle_shop.customer_summary"
+        ],
+        "macros": []
+      },
+      "original_file_path": "models/marts/_marts.yml",
+      "path": "not_null_customer_summary_customer_id.sql",
+      "fqn": [
+        "jaffle_shop",
+        "marts",
+        "not_null_customer_summary_customer_id"
+      ],
+      "tags": [],
+      "columns": {}
+    }
+  },
+  "sources": {
+    "source.jaffle_shop.tpch.CUSTOMER": {
+      "resource_type": "source",
+      "unique_id": "source.jaffle_shop.tpch.CUSTOMER",
+      "name": "CUSTOMER",
+      "source_name": "tpch",
+      "database": "SNOWFLAKE_SAMPLE_DATA",
+      "schema": "TPCH_SF1",
+      "relation_name": "SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.CUSTOMER",
+      "original_file_path": "models/staging/__sources.yml",
+      "package_name": "jaffle_shop",
+      "identifier": "CUSTOMER",
+      "fqn": [
+        "jaffle_shop",
+        "staging",
+        "tpch",
+        "CUSTOMER"
+      ],
+      "tags": []
+    },
+    "source.jaffle_shop.tpch.ORDERS": {
+      "resource_type": "source",
+      "unique_id": "source.jaffle_shop.tpch.ORDERS",
+      "name": "ORDERS",
+      "source_name": "tpch",
+      "database": "SNOWFLAKE_SAMPLE_DATA",
+      "schema": "TPCH_SF1",
+      "relation_name": "SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.ORDERS",
+      "original_file_path": "models/staging/__sources.yml",
+      "package_name": "jaffle_shop",
+      "identifier": "ORDERS",
+      "fqn": [
+        "jaffle_shop",
+        "staging",
+        "tpch",
+        "ORDERS"
+      ],
+      "tags": []
+    }
+  },
+  "parent_map": {
+    "model.jaffle_shop.customer_summary": [
+      "model.jaffle_shop.int_customer_orders"
+    ],
+    "model.jaffle_shop.int_customer_orders": [
+      "model.jaffle_shop.stg_customers",
+      "model.jaffle_shop.stg_orders"
+    ],
+    "model.jaffle_shop.stg_customers": [
+      "source.jaffle_shop.tpch.CUSTOMER"
+    ],
+    "model.jaffle_shop.stg_orders": [
+      "source.jaffle_shop.tpch.ORDERS"
+    ],
+    "model.jaffle_shop.frontier_affected_customers": [
+      "model.jaffle_shop.stg_orders",
+      "seed.jaffle_shop.change_events"
+    ],
+    "model.jaffle_shop.frontier_customer_orders_target": [
+      "model.jaffle_shop.frontier_affected_customers",
+      "model.jaffle_shop.stg_customers",
+      "model.jaffle_shop.stg_orders"
+    ],
+    "model.jaffle_shop.frontier_customer_summary_target": [
+      "model.jaffle_shop.frontier_customer_orders_target"
+    ],
+    "seed.jaffle_shop.change_events": [],
+    "test.jaffle_shop.assert_frontier_events_resolve": [
+      "model.jaffle_shop.stg_customers",
+      "model.jaffle_shop.stg_orders",
+      "seed.jaffle_shop.change_events"
+    ],
+    "test.jaffle_shop.assert_frontier_matches_full_mart": [
+      "model.jaffle_shop.customer_summary",
+      "model.jaffle_shop.frontier_affected_customers",
+      "model.jaffle_shop.frontier_customer_summary_target"
+    ],
+    "test.jaffle_shop.unique_customer_summary_customer_id.2fb01e9693": [
+      "model.jaffle_shop.customer_summary"
+    ],
+    "test.jaffle_shop.not_null_customer_summary_customer_id.a81d32eb67": [
+      "model.jaffle_shop.customer_summary"
+    ],
+    "source.jaffle_shop.tpch.CUSTOMER": [],
+    "source.jaffle_shop.tpch.ORDERS": []
+  },
+  "child_map": {
+    "model.jaffle_shop.customer_summary": [
+      "test.jaffle_shop.assert_frontier_matches_full_mart",
+      "test.jaffle_shop.not_null_customer_summary_customer_id.a81d32eb67",
+      "test.jaffle_shop.unique_customer_summary_customer_id.2fb01e9693"
+    ],
+    "model.jaffle_shop.int_customer_orders": [
+      "model.jaffle_shop.customer_summary"
+    ],
+    "model.jaffle_shop.stg_customers": [
+      "model.jaffle_shop.frontier_customer_orders_target",
+      "model.jaffle_shop.int_customer_orders",
+      "test.jaffle_shop.assert_frontier_events_resolve"
+    ],
+    "model.jaffle_shop.stg_orders": [
+      "model.jaffle_shop.frontier_affected_customers",
+      "model.jaffle_shop.frontier_customer_orders_target",
+      "model.jaffle_shop.int_customer_orders",
+      "test.jaffle_shop.assert_frontier_events_resolve"
+    ],
+    "model.jaffle_shop.frontier_affected_customers": [
+      "model.jaffle_shop.frontier_customer_orders_target",
+      "test.jaffle_shop.assert_frontier_matches_full_mart"
+    ],
+    "model.jaffle_shop.frontier_customer_orders_target": [
+      "model.jaffle_shop.frontier_customer_summary_target"
+    ],
+    "model.jaffle_shop.frontier_customer_summary_target": [
+      "test.jaffle_shop.assert_frontier_matches_full_mart"
+    ],
+    "seed.jaffle_shop.change_events": [
+      "model.jaffle_shop.frontier_affected_customers",
+      "test.jaffle_shop.assert_frontier_events_resolve"
+    ],
+    "test.jaffle_shop.assert_frontier_events_resolve": [],
+    "test.jaffle_shop.assert_frontier_matches_full_mart": [],
+    "test.jaffle_shop.unique_customer_summary_customer_id.2fb01e9693": [],
+    "test.jaffle_shop.not_null_customer_summary_customer_id.a81d32eb67": [],
+    "source.jaffle_shop.tpch.CUSTOMER": [
+      "model.jaffle_shop.stg_customers"
+    ],
+    "source.jaffle_shop.tpch.ORDERS": [
+      "model.jaffle_shop.stg_orders"
+    ]
+  }
+}

@@ -1,0 +1,360 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from frontier.cli import main
+from frontier.hashing import ENTITY_HASH_KEY_ENV
+from tests.conftest import FIXTURES, JAFFLE_SHOP
+
+TEST_HASH_KEY = "test-only-frontier-entity-hash-key"
+SHA256_OF_ONE = "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
+
+
+def test_init_writes_into_project_dir(tmp_path: Path, capsys) -> None:
+    project = tmp_path / "jaffle_shop"
+    project.mkdir()
+    assert main(["init", str(project)]) == 0
+    config_path = project / "frontier.yml"
+    assert config_path.is_file()
+    out = capsys.readouterr().out
+    assert str(config_path) in out
+    assert "customer_summary" in config_path.read_text()
+
+
+def test_init_and_inspect(dbt_project: Path, capsys) -> None:
+    assert main(["inspect", "--project-dir", str(dbt_project)]) == 0
+    out = capsys.readouterr().out
+    assert "customer_summary" in out
+    assert "stg_customers" in out
+    assert "stg_orders" in out
+    assert "DATA_AGENT_DEV.DBT_DEV.customer_summary" in out
+    assert "SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.CUSTOMER" in out
+    assert "super-secret-password" not in out
+
+
+def test_run_dry_run_writes_metrics(dbt_project: Path, monkeypatch, capsys) -> None:
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    code = main(
+        [
+            "run",
+            "--project-dir",
+            str(dbt_project),
+            "--dry-run",
+            "--include-entity-ids",
+            "--run-id",
+            "snowflake-demo-001",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "150000" in out or "150,000" in out or "Full entities: 150000" in out
+    assert "Frontier: 3" in out
+    assert "99.998%" in out
+    assert "assert_frontier_events_resolve: passed" in out
+    run_file = dbt_project / "target" / "frontier-run.json"
+    payload = run_file.read_text()
+    assert '"fullEntityCount": 150000' in payload
+    assert '"frontierEntityCount": 3' in payload
+    assert "370" in payload
+    assert "password" not in payload
+
+
+def test_prove_dry_run_records_mutation_metrics(dbt_project: Path, monkeypatch, capsys) -> None:
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    code = main(
+        [
+            "prove",
+            "--project-dir",
+            str(dbt_project),
+            "--dry-run",
+            "--include-entity-ids",
+            "--run-id",
+            "mutation-proof-001",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "Full rows recomputed: 150000" in captured.out
+    assert "Frontier rows recomputed: 3" in captured.out
+    assert "Missing frontier entities: 0" in captured.out
+    assert "Mismatched final rows: 0" in captured.out
+    payload = (dbt_project / "target" / "frontier-run.json").read_text()
+    parsed = json.loads(payload)
+    assert parsed["metrics"]["fullRowsRecomputed"] == 150000
+    assert parsed["metrics"]["mismatchedFinalRows"] == 0
+    assert parsed["metrics"]["testDurationMs"] == 1
+    names = {item["testName"] for item in parsed["validationResults"]}
+    assert "assert_repaired_equals_reference" in names
+    delete = next(event for event in parsed["changeEvents"] if event["eventId"] == "event_003")
+    assert delete["entityValue"] == "5"
+    assert delete["priorEntityValue"] == "781"
+
+
+def test_run_requires_entity_hash_key(dbt_project: Path, monkeypatch, capsys) -> None:
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    code = main(["run", "--project-dir", str(dbt_project), "--dry-run", "--run-id", "missing-key"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "FRONTIER_ENTITY_HASH_KEY" in captured.err
+    assert TEST_HASH_KEY not in captured.out
+    assert TEST_HASH_KEY not in captured.err
+    assert not (dbt_project / "target" / "frontier-run.json").exists()
+
+
+def test_run_hashes_entity_ids_with_env_key(dbt_project: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv(ENTITY_HASH_KEY_ENV, TEST_HASH_KEY)
+    code = main(
+        [
+            "run",
+            "--project-dir",
+            str(dbt_project),
+            "--dry-run",
+            "--run-id",
+            "hmac-demo-001",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert TEST_HASH_KEY not in captured.out
+    assert TEST_HASH_KEY not in captured.err
+    assert ENTITY_HASH_KEY_ENV not in captured.out
+    run_file = dbt_project / "target" / "frontier-run.json"
+    payload = run_file.read_text()
+    parsed = json.loads(payload)
+    values = [entity["entityValue"] for entity in parsed["affectedEntities"]]
+    assert "370" not in values
+    assert SHA256_OF_ONE not in payload
+    assert TEST_HASH_KEY not in payload
+    assert "Order 1 belongs to customer" not in payload
+
+
+def test_upload_uses_run_file(dbt_project: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv(ENTITY_HASH_KEY_ENV, TEST_HASH_KEY)
+    assert main(["run", "--project-dir", str(dbt_project), "--dry-run", "--run-id", "cli-upload-1"]) == 0
+
+    class FakeResponse:
+        status = 200
+
+        def read(self) -> bytes:
+            return b'{"id":"11111111-1111-4111-8111-111111111111","created":false,"externalRunId":"cli-upload-1"}'
+
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr("frontier.api.urllib.request.urlopen", lambda request, timeout=30: FakeResponse())
+    monkeypatch.setenv("FRONTIER_API_KEY", "frn_test_key_not_a_password")
+    assert main(["upload", "--project-dir", str(dbt_project)]) == 0
+    out = capsys.readouterr().out
+    assert "cli-upload-1" in out
+    assert "frn_test_key_not_a_password" not in out
+    assert "FRONTIER_API_KEY" in out
+    assert TEST_HASH_KEY not in out
+
+
+def test_inspect_real_jaffle_shop(capsys) -> None:
+    if not (JAFFLE_SHOP / "target" / "manifest.json").is_file():
+        return
+    assert main(
+        [
+            "inspect",
+            "--project-dir",
+            str(JAFFLE_SHOP),
+            "--config",
+            str(FIXTURES / "frontier.yml"),
+        ]
+    ) == 0
+    out = capsys.readouterr().out
+    assert "customer_summary" in out
+    assert "stg_customers" in out
+    assert "stg_orders" in out
+
+
+class FakeUploadResponse:
+    status = 201
+
+    def read(self) -> bytes:
+        return b'{"id":"11111111-1111-4111-8111-111111111111","created":true,"externalRunId":"ignored"}'
+
+    def __enter__(self) -> FakeUploadResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+
+def test_run_uses_commit_sha_and_git_context(dbt_project: Path, monkeypatch) -> None:
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    monkeypatch.setenv("GITHUB_SHA", "abc1234deadbeef0123456789abcdef01234567")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "acme/jaffle_shop")
+    monkeypatch.setenv("GITHUB_HEAD_REF", "feat/orders")
+    monkeypatch.setenv("FRONTIER_PULL_REQUEST", "42")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_must_not_appear_in_payload")
+    monkeypatch.setenv("SNOWFLAKE_PASSWORD", "super-secret-password")
+    code = main(
+        [
+            "run",
+            "--project-dir",
+            str(dbt_project),
+            "--dry-run",
+            "--include-entity-ids",
+        ]
+    )
+    assert code == 0
+    payload = json.loads((dbt_project / "target" / "frontier-run.json").read_text())
+    assert payload["externalRunId"] == "jaffle_shop-abc1234deadbeef0123456789abcdef01234567"
+    assert payload["git"]["repository"] == "acme/jaffle_shop"
+    assert payload["git"]["branch"] == "feat/orders"
+    assert payload["git"]["commitSha"] == "abc1234deadbeef0123456789abcdef01234567"
+    assert payload["git"]["pullRequestNumber"] == 42
+    dumped = json.dumps(payload)
+    assert "ghs_must_not_appear_in_payload" not in dumped
+    assert "super-secret-password" not in dumped
+    assert "password" not in dumped
+
+
+def test_run_writes_failed_validations_and_exits_zero(dbt_project: Path, monkeypatch) -> None:
+    results = json.loads((dbt_project / "target" / "run_results.json").read_text())
+    results["results"][0]["status"] = "fail"
+    results["results"][0]["failures"] = 2
+    (dbt_project / "target" / "run_results.json").write_text(json.dumps(results))
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    code = main(
+        [
+            "run",
+            "--project-dir",
+            str(dbt_project),
+            "--dry-run",
+            "--include-entity-ids",
+            "--run-id",
+            "failed-assessment-001",
+        ]
+    )
+    assert code == 0
+    payload = json.loads((dbt_project / "target" / "frontier-run.json").read_text())
+    assert payload["status"] == "failed"
+    failed = [item for item in payload["validationResults"] if item["status"] == "failed"]
+    assert failed
+    assert payload["externalRunId"] == "failed-assessment-001"
+
+
+def test_upload_blocking_exits_nonzero_after_upload(
+    dbt_project: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    results = json.loads((dbt_project / "target" / "run_results.json").read_text())
+    results["results"][0]["status"] = "fail"
+    results["results"][0]["failures"] = 1
+    (dbt_project / "target" / "run_results.json").write_text(json.dumps(results))
+    assert (
+        main(
+            [
+                "run",
+                "--project-dir",
+                str(dbt_project),
+                "--dry-run",
+                "--include-entity-ids",
+                "--run-id",
+                "blocking-fail-001",
+            ]
+        )
+        == 0
+    )
+    monkeypatch.setattr("frontier.api.urllib.request.urlopen", lambda request, timeout=30: FakeUploadResponse())
+    monkeypatch.setenv("FRONTIER_API_KEY", "frn_test_key_not_a_password")
+    code = main(["upload", "--project-dir", str(dbt_project), "--blocking"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "blocking-fail-001" in captured.out
+    assert "uploaded diagnostics" in captured.err
+
+
+def test_run_honors_dry_run_env(dbt_project: Path, monkeypatch, capsys) -> None:
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    monkeypatch.setenv("FRONTIER_DRY_RUN", "true")
+    code = main(
+        [
+            "run",
+            "--project-dir",
+            str(dbt_project),
+            "--include-entity-ids",
+            "--run-id",
+            "env-dry-run-001",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "No Snowflake session" in out
+    assert (dbt_project / "target" / "frontier-run.json").is_file()
+
+
+def test_record_failure_ignores_stale_run_results(dbt_project: Path, monkeypatch) -> None:
+    monkeypatch.setenv(ENTITY_HASH_KEY_ENV, TEST_HASH_KEY)
+    monkeypatch.setenv("GITHUB_SHA", "abc1234deadbeef0123456789abcdef01234567")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "acme/jaffle_shop")
+    monkeypatch.setenv("GITHUB_HEAD_REF", "feat/orders")
+    code = main(
+        [
+            "record-failure",
+            "--project-dir",
+            str(dbt_project),
+            "--reason",
+            "dbt build failed; no current artifacts",
+        ]
+    )
+    assert code == 0
+    payload = json.loads((dbt_project / "target" / "frontier-run.json").read_text())
+    assert payload["status"] == "failed"
+    assert payload["evidenceLevel"] == "none"
+    names = {item["testName"] for item in payload["validationResults"]}
+    assert names == {"dbt_build"}
+    assert "assert_frontier_events_resolve" not in names
+    dumped = json.dumps(payload)
+    assert "password" not in dumped
+    assert TEST_HASH_KEY not in dumped
+
+
+def test_run_refuses_stale_artifact_sha(dbt_project: Path, monkeypatch, capsys) -> None:
+    from frontier.artifacts import write_artifact_sha
+
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_SHA", "newsha1234567890abcdef")
+    write_artifact_sha(dbt_project / "target", "oldsha1234567890abcdef")
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    code = main(
+        [
+            "run",
+            "--project-dir",
+            str(dbt_project),
+            "--dry-run",
+            "--include-entity-ids",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "stale" in captured.err.lower() or "not newsha" in captured.err
+
+
+def test_run_refuses_missing_artifact_sha_in_ci(dbt_project: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_SHA", "newsha1234567890abcdef")
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    code = main(
+        [
+            "run",
+            "--project-dir",
+            str(dbt_project),
+            "--dry-run",
+            "--include-entity-ids",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "frontier-artifact-sha" in captured.err
+
+

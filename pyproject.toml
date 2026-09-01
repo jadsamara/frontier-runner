@@ -1,0 +1,30 @@
+[project]
+name = "frontier-runner"
+version = "0.1.0"
+description = "Customer-side Frontier CLI: inspect dbt artifacts, run frontier queries, upload aggregates."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pyyaml>=6.0",
+  "sqlglot>=26.0",
+]
+
+[project.optional-dependencies]
+snowflake = ["snowflake-connector-python>=3.12"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+frontier = "frontier.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["frontier*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

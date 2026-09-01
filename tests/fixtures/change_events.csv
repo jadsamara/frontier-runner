@@ -1,0 +1,4 @@
+event_id,source_model,operation,entity_key,entity_value,prior_customer_id
+event_001,stg_orders,UPDATE,order_id,1,
+event_002,stg_customers,UPDATE,customer_id,370,
+event_003,stg_orders,DELETE,order_id,-1,781

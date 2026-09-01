@@ -1,0 +1,12 @@
+jaffle_shop:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: example-account
+      user: frontier_ci
+      password: super-secret-password
+      database: DATA_AGENT_DEV
+      schema: DBT_DEV
+      warehouse: COMPUTE_WH
+      role: TRANSFORMER

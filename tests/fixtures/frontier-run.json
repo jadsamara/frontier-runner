@@ -1,0 +1,75 @@
+{
+  "externalRunId": "jaffle_shop-hmac-fixture",
+  "project": "jaffle_shop",
+  "environment": "dev",
+  "warehouse": {
+    "type": "snowflake",
+    "database": "DATA_AGENT_DEV",
+    "schema": "DBT_DEV"
+  },
+  "model": {
+    "uniqueId": "model.jaffle_shop.customer_summary",
+    "name": "customer_summary",
+    "entityType": "customer",
+    "entityKey": "customer_id",
+    "grain": "one_row_per_customer"
+  },
+  "metrics": {
+    "fullEntityCount": 150000,
+    "frontierEntityCount": 3,
+    "percentRowsAvoided": 99.998
+  },
+  "changeEvents": [
+    {
+      "eventId": "event_001",
+      "sourceModel": "stg_orders",
+      "operation": "UPDATE",
+      "entityKey": "order_id",
+      "entityValue": "15d459b6448be0fee3bbed28a3bbd586c76f11d63316bf73b4dc8336a8ac9602"
+    },
+    {
+      "eventId": "event_002",
+      "sourceModel": "stg_customers",
+      "operation": "UPDATE",
+      "entityKey": "customer_id",
+      "entityValue": "b7440e24f097e71e846d31f583c9004bd97863a037d70c7a6aff4cf463b98277"
+    },
+    {
+      "eventId": "event_003",
+      "sourceModel": "stg_orders",
+      "operation": "DELETE",
+      "entityKey": "order_id",
+      "entityValue": "44f95f67a617dfc86a3977db781d5fd31cdb6c0afae538c82905a55a1515d4e1",
+      "priorEntityValue": "72a6ecd36f3f9b221554cf601d45c14b01d6c2ad7bebb9e74701d6f06a5000a1"
+    }
+  ],
+  "affectedEntities": [
+    {
+      "entityType": "customer",
+      "entityKey": "customer_id",
+      "entityValue": "b7440e24f097e71e846d31f583c9004bd97863a037d70c7a6aff4cf463b98277",
+      "reason": "Direct customer key"
+    },
+    {
+      "entityType": "customer",
+      "entityKey": "customer_id",
+      "entityValue": "72a6ecd36f3f9b221554cf601d45c14b01d6c2ad7bebb9e74701d6f06a5000a1",
+      "reason": "Before-image supplied customer"
+    },
+    {
+      "entityType": "customer",
+      "entityKey": "customer_id",
+      "entityValue": "c9ef44c4d8184d8ae81675a0fef7728d3854764112042edff80bb8460bc7f510",
+      "reason": "Order belongs to customer"
+    }
+  ],
+  "validationResults": [
+    {
+      "testName": "assert_frontier_events_resolve",
+      "status": "passed",
+      "differenceCount": 0
+    }
+  ],
+  "evidenceLevel": "empirically_validated",
+  "status": "passed"
+}
