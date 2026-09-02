@@ -14,6 +14,7 @@ from frontier.api import (
     redact_api_key,
     upload_run,
 )
+from frontier.comment import maybe_upsert_pr_comment
 from frontier.config import (
     ConfigError,
     load_frontier_config,
@@ -449,6 +450,11 @@ def cmd_upload(args: argparse.Namespace) -> int:
     response = upload_run(payload, api_url=api_url, api_key=api_key)
     status = response.pop("_httpStatus", None)
     print(json.dumps({"httpStatus": status, **response}, indent=2))
+    run_id = response.get("id")
+    if isinstance(run_id, str) and not getattr(args, "skip_pr_comment", False):
+        action = maybe_upsert_pr_comment(payload, api_url=api_url, run_id=run_id)
+        if action:
+            print(f"Pull request comment {action}")
     if _wants_blocking(args) and payload.get("status") == "failed":
         print(
             "Assessment failed; uploaded diagnostics before failing the blocking check.",
@@ -563,6 +569,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--blocking",
         action="store_true",
         help="Exit 1 after a successful upload when the assessment status is failed",
+    )
+    upload.add_argument(
+        "--skip-pr-comment",
+        action="store_true",
+        help="Do not post or update a GitHub pull request comment after upload",
     )
     upload.set_defaults(func=cmd_upload)
     return parser

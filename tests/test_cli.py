@@ -274,6 +274,61 @@ def test_upload_blocking_exits_nonzero_after_upload(
     assert "uploaded diagnostics" in captured.err
 
 
+def test_upload_upserts_pr_comment_in_github_actions(
+    dbt_project: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv(ENTITY_HASH_KEY_ENV, TEST_HASH_KEY)
+    assert main(["run", "--project-dir", str(dbt_project), "--dry-run", "--run-id", "pr-comment-1"]) == 0
+    monkeypatch.setenv("FRONTIER_API_KEY", "frn_test_key_not_a_password")
+    monkeypatch.setenv("FRONTIER_API_URL", "https://frontier.example")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_must_not_appear")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "acme/jaffle_shop")
+    monkeypatch.setenv("FRONTIER_PULL_REQUEST", "42")
+
+    comment_calls: list[str] = []
+
+    class GitHubResponse:
+        status = 200
+
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+
+        def read(self) -> bytes:
+            return self._payload
+
+        def __enter__(self) -> GitHubResponse:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def fake_urlopen(request, timeout=30):
+        url = request.full_url
+        if "api.github.com" in url:
+            comment_calls.append(request.get_method())
+            if request.get_method() == "GET":
+                return GitHubResponse(b"[]")
+            return GitHubResponse(b'{"id":1}')
+        return FakeUploadResponse()
+
+    monkeypatch.setattr("frontier.comment.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("frontier.api.urllib.request.urlopen", fake_urlopen)
+    code = main(["upload", "--project-dir", str(dbt_project)])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "Pull request comment created" in captured.out
+    assert "ghs_must_not_appear" not in captured.out
+    assert "ghs_must_not_appear" not in captured.err
+    assert comment_calls == ["GET", "POST"]
+    assert "Pull request comment created" in captured.out
+    assert "ghs_must_not_appear" not in captured.out
+    assert "ghs_must_not_appear" not in captured.err
+    assert comment_calls == ["GET", "POST"]
+
+
 def test_run_honors_dry_run_env(dbt_project: Path, monkeypatch, capsys) -> None:
     monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
     monkeypatch.setenv("FRONTIER_DRY_RUN", "true")

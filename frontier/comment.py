@@ -1,0 +1,189 @@
+from __future__ import annotations
+
+import json
+import os
+import urllib.error
+import urllib.request
+from typing import Any
+
+from frontier.config import ConfigError
+from frontier.github import env_flag, pull_request_number
+
+COMMENT_MARKER = "<!-- frontier-impact-assessment -->"
+_USER_AGENT = "frontier-runner"
+
+_EVIDENCE_LABELS = {
+    "none": "none",
+    "aggregates": "aggregates",
+    "equivalence": "equivalence",
+    "empirically_validated": "empirically validated",
+}
+
+
+def dashboard_run_url(api_url: str, run_id: str) -> str:
+    return f"{api_url.rstrip('/')}/runs/{run_id}"
+
+
+def _format_count(value: int) -> str:
+    return f"{value:,}"
+
+
+def _pluralize(noun: str, count: int) -> str:
+    if count == 1:
+        return noun
+    if noun.endswith("s"):
+        return noun
+    return f"{noun}s"
+
+
+def _validation_difference_total(results: list[dict[str, Any]]) -> int:
+    return sum(int(item.get("differenceCount") or 0) for item in results)
+
+
+def _failed_checks(results: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for item in results:
+        if item.get("status") != "failed":
+            continue
+        name = str(item.get("testName") or "check")
+        differences = int(item.get("differenceCount") or 0)
+        lines.append(f"- {name} (differences={differences})")
+    return lines
+
+
+def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
+    """Aggregate-only PR comment. Never include entity IDs or warehouse values."""
+    status = str(payload.get("status") or "failed").upper()
+    model = payload.get("model") or {}
+    model_name = str(model.get("name") or "unknown")
+    entity_type = str(model.get("entityType") or "entity")
+    metrics = payload.get("metrics") or {}
+    full_count = int(metrics.get("fullEntityCount") or 0)
+    frontier_count = int(metrics.get("frontierEntityCount") or 0)
+    percent = metrics.get("percentRowsAvoided")
+    percent_text = f"{percent}%" if percent is not None else "n/a"
+    events = payload.get("changeEvents") or []
+    validations = payload.get("validationResults") or []
+    evidence = _EVIDENCE_LABELS.get(str(payload.get("evidenceLevel") or ""), "none")
+    headline = f"Frontier impact assessment: {status}"
+    if status != "PASSED":
+        headline = f"**{headline}**"
+
+    lines = [
+        COMMENT_MARKER,
+        headline,
+        "",
+        f"Model: {model_name}",
+        f"Changed source events: {len(events)}",
+        (
+            f"Affected {_pluralize(entity_type, frontier_count)}: "
+            f"{_format_count(frontier_count)} of {_format_count(full_count)}"
+        ),
+        f"Rows avoided: {percent_text}",
+        f"Validation differences: {_validation_difference_total(validations)}",
+        f"Evidence: {evidence}",
+    ]
+    failed = _failed_checks(validations)
+    if failed:
+        lines.extend(["", "Failed checks:", *failed])
+    lines.extend(["", f"View full assessment: {run_url}"])
+    return "\n".join(lines) + "\n"
+
+
+def _github_api_root() -> str:
+    return (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+
+
+def _request_json(
+    method: str,
+    url: str,
+    *,
+    github_token: str,
+    body: dict[str, Any] | None = None,
+) -> tuple[int, Any]:
+    encoded = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(
+        url,
+        data=encoded,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {github_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": _USER_AGENT,
+            **({"Content-Type": "application/json"} if body is not None else {}),
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+            parsed = json.loads(raw) if raw else {}
+            return response.status, parsed
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise ConfigError(f"GitHub PR comment failed with HTTP {error.code}: {detail}") from error
+    except urllib.error.URLError as error:
+        raise ConfigError(f"GitHub PR comment failed: {error.reason}") from error
+
+
+def _list_issue_comments(repository: str, pr_number: int, github_token: str) -> list[dict[str, Any]]:
+    url = f"{_github_api_root()}/repos/{repository}/issues/{pr_number}/comments?per_page=100"
+    _status, parsed = _request_json("GET", url, github_token=github_token)
+    if not isinstance(parsed, list):
+        raise ConfigError("GitHub PR comment list was not an array")
+    return parsed
+
+
+def upsert_pr_comment(
+    *,
+    body: str,
+    repository: str,
+    pr_number: int,
+    github_token: str,
+) -> str:
+    comments = _list_issue_comments(repository, pr_number, github_token)
+    existing = next(
+        (
+            item
+            for item in comments
+            if COMMENT_MARKER in str(item.get("body") or "")
+        ),
+        None,
+    )
+    if existing and existing.get("id") is not None:
+        url = f"{_github_api_root()}/repos/{repository}/issues/comments/{existing['id']}"
+        _request_json("PATCH", url, github_token=github_token, body={"body": body})
+        return "updated"
+    url = f"{_github_api_root()}/repos/{repository}/issues/{pr_number}/comments"
+    _request_json("POST", url, github_token=github_token, body={"body": body})
+    return "created"
+
+
+def maybe_upsert_pr_comment(
+    payload: dict[str, Any],
+    *,
+    api_url: str,
+    run_id: str | None,
+) -> str | None:
+    """Post or update the Frontier PR comment when running in GitHub Actions.
+
+    Uses GITHUB_TOKEN locally in CI. Never sends it to Frontier SaaS.
+    """
+    if env_flag("FRONTIER_SKIP_PR_COMMENT"):
+        return None
+    if (os.environ.get("GITHUB_ACTIONS") or "").strip().lower() != "true":
+        return None
+    github_token = (os.environ.get("GITHUB_TOKEN") or "").strip()
+    repository = (os.environ.get("GITHUB_REPOSITORY") or "").strip()
+    pr_number = pull_request_number()
+    if not github_token or not repository or pr_number is None:
+        return None
+    if not run_id:
+        return None
+    body = format_pr_comment(payload, run_url=dashboard_run_url(api_url, run_id))
+    return upsert_pr_comment(
+        body=body,
+        repository=repository,
+        pr_number=pr_number,
+        github_token=github_token,
+    )
