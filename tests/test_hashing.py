@@ -22,7 +22,7 @@ from frontier.hashing import (
     hmac_equal,
     normalize_entity_value,
 )
-from frontier.snowflake import FakeWarehouse
+from frontier.warehouse import FakeWarehouse
 from tests.conftest import FIXTURES
 
 TEST_HASH_KEY = "test-only-frontier-entity-hash-key"
@@ -105,6 +105,7 @@ def hashed_ingest_payload(secret: str = TEST_HASH_KEY) -> dict:
         ],
         evidence_level="empirically_validated",
         status="passed",
+        entity_ids_hashed=True,
     )
 
 
@@ -239,6 +240,7 @@ def test_hashed_payload_omits_raw_ids_and_plain_sha256() -> None:
     assert "Order belongs to customer" in serialized
     assert TEST_HASH_KEY not in serialized
     assert ENTITY_HASH_KEY_ENV not in serialized
+    assert payload["entityIdsHashed"] is True
 
 
 def test_fixture_run_file_has_no_plain_hashes() -> None:

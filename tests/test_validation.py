@@ -3,7 +3,7 @@ from __future__ import annotations
 from frontier.config import load_frontier_config
 from frontier.dbt_artifacts import load_manifest, load_run_results
 from frontier.frontier import load_change_events_csv, run_frontier
-from frontier.snowflake import FakeWarehouse
+from frontier.warehouse import FakeWarehouse
 from frontier.validation import collect_validation_results, evidence_level
 from tests.conftest import FIXTURES
 

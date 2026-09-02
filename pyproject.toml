@@ -11,6 +11,17 @@ dependencies = [
 
 [project.optional-dependencies]
 snowflake = ["snowflake-connector-python>=3.12"]
+bigquery = ["google-cloud-bigquery>=3.0"]
+databricks = ["databricks-sql-connector>=3.0"]
+postgres = ["psycopg[binary]>=3.2"]
+redshift = ["redshift-connector>=2.1"]
+warehouses = [
+  "snowflake-connector-python>=3.12",
+  "google-cloud-bigquery>=3.0",
+  "databricks-sql-connector>=3.0",
+  "psycopg[binary]>=3.2",
+  "redshift-connector>=2.1",
+]
 dev = ["pytest>=8.0"]
 
 [project.scripts]

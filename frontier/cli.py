@@ -40,12 +40,12 @@ from frontier.proof import (
     proof_validation_results,
     recorded_proof,
 )
-from frontier.snowflake import (
+from frontier.warehouse import (
     FakeWarehouse,
-    Warehouse,
-    describe_connection,
-    load_snowflake_config,
-    open_warehouse,
+    WarehouseAdapter,
+    connect_warehouse,
+    describe_adapter,
+    normalize_warehouse_type,
 )
 from frontier.validation import (
     collect_validation_results,
@@ -171,6 +171,8 @@ def _emit_run(
         evidence_level=evidence_level(validations),
         status=overall_status(validations),
         git=github_source(),
+        entity_ids_hashed=not send_raw_ids,
+        warehouse_type=normalize_warehouse_type(manifest.adapter_type),
     )
     output = Path(args.output) if args.output else _target_dir(_project_dir(args)) / RUN_FILE_NAME
     _write_run_file(output, payload)
@@ -187,7 +189,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     events = load_change_events_csv(events_path)
 
     dry_run = _use_dry_run(args)
-    warehouse: Warehouse
+    warehouse: WarehouseAdapter
     if dry_run:
         warehouse = FakeWarehouse(
             {
@@ -197,15 +199,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "difference_count": [(0,)],
             }
         )
-        print("Using in-memory warehouse (--dry-run). No Snowflake session.")
+        print("Using in-memory warehouse (--dry-run). No live warehouse session.")
     else:
-        snowflake_config = load_snowflake_config(
+        warehouse = connect_warehouse(
             project_dir,
             profiles_path=Path(args.profiles).expanduser() if args.profiles else None,
             target=args.target,
         )
-        print("Snowflake: " + json.dumps(describe_connection(snowflake_config)))
-        warehouse = open_warehouse(snowflake_config)
+        print(f"{warehouse.warehouse_type}: " + json.dumps(describe_adapter(warehouse)))
 
     try:
         result = run_frontier(
@@ -328,6 +329,10 @@ def cmd_record_failure(args: argparse.Namespace) -> int:
         evidence_level="none",
         status="failed",
         git=github_source(),
+        entity_ids_hashed=not send_raw_ids,
+        warehouse_type=normalize_warehouse_type(
+            os.environ.get("FRONTIER_WAREHOUSE_TYPE") or "snowflake",
+        ),
     )
     output = Path(args.output) if args.output else _target_dir(project_dir) / RUN_FILE_NAME
     _write_run_file(output, payload)
@@ -345,7 +350,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
     events = load_change_events_csv(events_path)
 
     dry_run = _use_dry_run(args)
-    warehouse: Warehouse
+    warehouse: WarehouseAdapter
     if dry_run:
         warehouse = FakeWarehouse(
             {
@@ -355,16 +360,15 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 "difference_count": [(0,)],
             }
         )
-        print("Using in-memory warehouse (--dry-run). No Snowflake session.")
+        print("Using in-memory warehouse (--dry-run). No live warehouse session.")
         proof = recorded_proof()
     else:
-        snowflake_config = load_snowflake_config(
+        warehouse = connect_warehouse(
             project_dir,
             profiles_path=Path(args.profiles).expanduser() if args.profiles else None,
             target=args.target,
         )
-        print("Snowflake: " + json.dumps(describe_connection(snowflake_config)))
-        warehouse = open_warehouse(snowflake_config)
+        print(f"{warehouse.warehouse_type}: " + json.dumps(describe_adapter(warehouse)))
         try:
             proof = measure_mutation_proof(config, manifest=manifest, warehouse=warehouse)
         except ConfigError:

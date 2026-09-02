@@ -12,7 +12,7 @@ from sqlglot import exp
 from frontier.config import ConfigError, FrontierConfig
 from frontier.dbt_artifacts import Manifest
 from frontier.hashing import entity_type_from_key, hmac_entity_id
-from frontier.snowflake import Warehouse
+from frontier.warehouse import WarehouseAdapter
 
 REF_PATTERN = re.compile(r"\{\{\s*ref\(\s*['\"]([^'\"]+)['\"]\s*\)\s*\}\}")
 TEMPLATE_PATTERN = re.compile(r"\{\{.*?\}\}")
@@ -105,6 +105,7 @@ def compile_route_sql(
     *,
     manifest: Manifest,
     changed_values: list[str],
+    dialect: str = "snowflake",
 ) -> str:
     def replace_ref(match: re.Match[str]) -> str:
         node = manifest.find_by_name(match.group(1), resource_types=("model", "seed", "source"))
@@ -115,7 +116,7 @@ def compile_route_sql(
     leftover = TEMPLATE_PATTERN.findall(sql)
     if leftover:
         raise ConfigError(f"Unresolved SQL template fragments: {leftover}")
-    parsed = sqlglot.parse_one(sql, dialect="snowflake")
+    parsed = sqlglot.parse_one(sql, dialect=dialect)
     if parsed is None:
         raise ConfigError("Route query could not be parsed")
     if not isinstance(parsed, exp.Select) and parsed.find(exp.Select) is None:
@@ -143,7 +144,7 @@ def resolve_affected_entities(
     events: list[ChangeEvent],
     *,
     manifest: Manifest,
-    warehouse: Warehouse | None,
+    warehouse: WarehouseAdapter | None,
 ) -> tuple[list[AffectedEntity], str]:
     affected: list[AffectedEntity] = []
     sql_parts: list[str] = []
@@ -173,9 +174,10 @@ def resolve_affected_entities(
                 relation.route.query,
                 manifest=manifest,
                 changed_values=[event.entity_value],
+                dialect=warehouse.dialect,
             )
             sql_parts.append(sql)
-            for row in warehouse.fetch_all(sql):
+            for row in warehouse.execute(sql):
                 if not row or row[0] is None:
                     continue
                 affected.append(
@@ -226,7 +228,12 @@ def entity_sort_key(value: str) -> tuple[int, str | int]:
     return (1, value)
 
 
-def current_frontier_metrics_sql(manifest: Manifest, model_name: str) -> str:
+def current_frontier_metrics_sql(
+    manifest: Manifest,
+    model_name: str,
+    *,
+    dialect: str = "snowflake",
+) -> str:
     model = manifest.find_model(model_name)
     try:
         frontier = manifest.find_model("frontier_affected_customers")
@@ -243,7 +250,7 @@ def current_frontier_metrics_sql(manifest: Manifest, model_name: str) -> str:
         )
     else:
         sql = f"select count(*) as full_entity_count from {full}"
-    sqlglot.parse_one(sql, dialect="snowflake")
+    sqlglot.parse_one(sql, dialect=dialect)
     return sql
 
 
@@ -252,7 +259,7 @@ def run_frontier(
     *,
     manifest: Manifest,
     events: list[ChangeEvent],
-    warehouse: Warehouse,
+    warehouse: WarehouseAdapter,
 ) -> FrontierResult:
     affected, frontier_sql = resolve_affected_entities(
         config,
@@ -260,8 +267,12 @@ def run_frontier(
         manifest=manifest,
         warehouse=warehouse,
     )
-    metrics_sql = current_frontier_metrics_sql(manifest, config.model.name)
-    metric_rows = warehouse.fetch_all(metrics_sql)
+    metrics_sql = current_frontier_metrics_sql(
+        manifest,
+        config.model.name,
+        dialect=warehouse.dialect,
+    )
+    metric_rows = warehouse.execute(metrics_sql)
     if not metric_rows:
         raise ConfigError("Frontier metrics query returned no rows")
     row = metric_rows[0]

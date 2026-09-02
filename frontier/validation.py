@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from frontier.config import FrontierConfig
 from frontier.dbt_artifacts import Manifest, RunResults
 from frontier.frontier import ChangeEvent, FrontierResult
-from frontier.snowflake import Warehouse
+from frontier.warehouse import WarehouseAdapter
 
 
 @dataclass(frozen=True)
@@ -50,9 +50,9 @@ def event_resolution_result(
     )
 
 
-def _count_failures(compiled_sql: str, warehouse: Warehouse) -> int:
+def _count_failures(compiled_sql: str, warehouse: WarehouseAdapter) -> int:
     wrapped = f"select count(*) as difference_count from ({compiled_sql}) as frontier_validation"
-    rows = warehouse.fetch_all(wrapped)
+    rows = warehouse.execute(wrapped)
     if not rows or rows[0][0] is None:
         return 0
     return int(rows[0][0])
@@ -65,7 +65,7 @@ def collect_validation_results(
     run_results: RunResults,
     events: list[ChangeEvent],
     result: FrontierResult,
-    warehouse: Warehouse | None = None,
+    warehouse: WarehouseAdapter | None = None,
 ) -> list[ValidationResult]:
     collected: list[ValidationResult] = []
 

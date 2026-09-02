@@ -71,5 +71,6 @@
     }
   ],
   "evidenceLevel": "empirically_validated",
-  "status": "passed"
+  "status": "passed",
+  "entityIdsHashed": true
 }

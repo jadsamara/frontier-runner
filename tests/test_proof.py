@@ -14,7 +14,7 @@ from frontier.proof import (
     proof_validation_results,
     recorded_proof,
 )
-from frontier.snowflake import FakeWarehouse
+from frontier.warehouse import FakeWarehouse
 from frontier.validation import evidence_level
 from tests.conftest import FIXTURES, JAFFLE_SHOP
 

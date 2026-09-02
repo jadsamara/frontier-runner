@@ -10,7 +10,7 @@ from frontier.frontier import (
     percent_rows_avoided,
     run_frontier,
 )
-from frontier.snowflake import FakeWarehouse
+from frontier.warehouse import FakeWarehouse
 from tests.conftest import FIXTURES
 
 

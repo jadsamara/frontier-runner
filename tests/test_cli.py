@@ -344,7 +344,7 @@ def test_run_honors_dry_run_env(dbt_project: Path, monkeypatch, capsys) -> None:
     )
     out = capsys.readouterr().out
     assert code == 0
-    assert "No Snowflake session" in out
+    assert "No live warehouse session" in out
     assert (dbt_project / "target" / "frontier-run.json").is_file()
 
 

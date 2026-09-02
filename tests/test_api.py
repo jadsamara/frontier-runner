@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,8 @@ from frontier.frontier import (
     run_frontier,
 )
 from frontier.hashing import hmac_equal
-from frontier.snowflake import FakeWarehouse, describe_connection, load_snowflake_config
+from frontier.adapters.snowflake import describe_connection, load_snowflake_config
+from frontier.warehouse import FakeWarehouse
 from tests.conftest import FIXTURES
 
 
@@ -181,6 +183,131 @@ def test_upload_posts_aggregates(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "password" not in json.dumps(captured["body"])
     assert "rows" not in captured["body"]
     assert response["created"] is True
+
+
+def test_upload_retries_retryable_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = {"count": 0}
+    delays: list[float] = []
+
+    class FakeResponse:
+        status = 201
+
+        def read(self) -> bytes:
+            return json.dumps({"id": "11111111-1111-4111-8111-111111111111", "created": True, "externalRunId": "run-1"}).encode()
+
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def fake_urlopen(request, timeout=30):  # noqa: ANN001
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                503,
+                "unavailable",
+                hdrs={"Retry-After": "0"},  # type: ignore[arg-type]
+                fp=None,
+            )
+        return FakeResponse()
+
+    monkeypatch.setattr("frontier.api.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("frontier.api.time.sleep", lambda seconds: delays.append(seconds))
+    payload = build_ingest_payload(
+        external_run_id="snowflake-demo-001",
+        project="jaffle_shop",
+        environment="dev",
+        database="DATA_AGENT_DEV",
+        schema="DBT_DEV",
+        model_unique_id="model.jaffle_shop.customer_summary",
+        model_name="customer_summary",
+        entity_type="customer",
+        entity_key="customer_id",
+        grain="one_row_per_customer",
+        metrics={"fullEntityCount": 150000, "frontierEntityCount": 3, "percentRowsAvoided": 99.998},
+        change_events=[
+            {
+                "eventId": "event_001",
+                "sourceModel": "stg_orders",
+                "operation": "UPDATE",
+                "entityKey": "order_id",
+                "entityValue": "1",
+            }
+        ],
+        affected_entities=[
+            {
+                "entityType": "customer",
+                "entityKey": "customer_id",
+                "entityValue": "370",
+                "reason": "Direct customer key",
+            }
+        ],
+        validation_results=[
+            {"testName": "assert_frontier_events_resolve", "status": "passed", "differenceCount": 0}
+        ],
+        evidence_level="empirically_validated",
+        status="passed",
+    )
+    response = upload_run(payload, api_url="http://127.0.0.1:3000", api_key="frn_demo")
+    assert attempts["count"] == 3
+    assert delays == [0.0, 0.0]
+    assert response["created"] is True
+
+
+def test_upload_honors_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays: list[float] = []
+
+    def fake_urlopen(request, timeout=30):  # noqa: ANN001
+        raise urllib.error.HTTPError(
+            request.full_url,
+            429,
+            "slow down",
+            hdrs={"Retry-After": "1.5"},  # type: ignore[arg-type]
+            fp=None,
+        )
+
+    monkeypatch.setattr("frontier.api.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("frontier.api.time.sleep", lambda seconds: delays.append(seconds))
+    payload = build_ingest_payload(
+        external_run_id="snowflake-demo-001",
+        project="jaffle_shop",
+        environment="dev",
+        database="DATA_AGENT_DEV",
+        schema="DBT_DEV",
+        model_unique_id="model.jaffle_shop.customer_summary",
+        model_name="customer_summary",
+        entity_type="customer",
+        entity_key="customer_id",
+        grain="one_row_per_customer",
+        metrics={"fullEntityCount": 150000, "frontierEntityCount": 3, "percentRowsAvoided": 99.998},
+        change_events=[
+            {
+                "eventId": "event_001",
+                "sourceModel": "stg_orders",
+                "operation": "UPDATE",
+                "entityKey": "order_id",
+                "entityValue": "1",
+            }
+        ],
+        affected_entities=[
+            {
+                "entityType": "customer",
+                "entityKey": "customer_id",
+                "entityValue": "370",
+                "reason": "Direct customer key",
+            }
+        ],
+        validation_results=[
+            {"testName": "assert_frontier_events_resolve", "status": "passed", "differenceCount": 0}
+        ],
+        evidence_level="empirically_validated",
+        status="passed",
+    )
+    with pytest.raises(ConfigError, match="HTTP 429"):
+        upload_run(payload, api_url="http://127.0.0.1:3000", api_key="frn_demo", max_attempts=2)
+    assert delays == [1.5]
 
 
 def test_api_key_prefers_frontier_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

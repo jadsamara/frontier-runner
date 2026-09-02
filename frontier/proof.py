@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from frontier.config import ConfigError, FrontierConfig, ProofConfig
 from frontier.dbt_artifacts import Manifest
 from frontier.frontier import ChangeEvent
-from frontier.snowflake import Warehouse
+from frontier.warehouse import WarehouseAdapter
 from frontier.validation import ValidationResult
 
 
@@ -29,11 +29,17 @@ class MutationProof:
         return round((1 - self.frontier_rows_recomputed / self.full_rows_recomputed) * 100, 3)
 
 
-def _count(warehouse: Warehouse, sql: str) -> int:
-    rows = warehouse.fetch_all(sql)
+def _count(warehouse: WarehouseAdapter, sql: str) -> int:
+    rows = warehouse.execute(sql)
     if not rows or rows[0][0] is None:
         return 0
     return int(rows[0][0])
+
+
+def except_keyword(dialect: str) -> str:
+    if dialect == "bigquery":
+        return "except distinct"
+    return "except"
 
 
 def deleted_order_sql(relation: str) -> str:
@@ -51,46 +57,66 @@ def frontier_rows_sql(targeted_relation: str) -> str:
     return f"select count(*) as frontier_rows_recomputed from {targeted_relation}"
 
 
-def missing_frontier_sql(*, before_relation: str, after_relation: str, frontier_relation: str) -> str:
+def missing_frontier_sql(
+    *,
+    before_relation: str,
+    after_relation: str,
+    frontier_relation: str,
+    dialect: str = "snowflake",
+) -> str:
+    except_op = except_keyword(dialect)
     return (
         "select count(*) as missing_frontier_entities from ("
         "    select customer_id from ("
         f"        select * from {after_relation}"
-        "        except"
+        f"        {except_op}"
         f"        select * from {before_relation}"
         "    ) as actually_changed"
-        "    except"
+        f"    {except_op}"
         f"    select customer_id from {frontier_relation}"
         ") as missing_frontier"
     )
 
 
-def extra_frontier_sql(*, before_relation: str, after_relation: str, frontier_relation: str) -> str:
+def extra_frontier_sql(
+    *,
+    before_relation: str,
+    after_relation: str,
+    frontier_relation: str,
+    dialect: str = "snowflake",
+) -> str:
+    except_op = except_keyword(dialect)
     return (
         "select count(*) as extra_frontier_entities from ("
         f"    select customer_id from {frontier_relation}"
-        "    except"
+        f"    {except_op}"
         "    select customer_id from ("
         f"        select * from {after_relation}"
-        "        except"
+        f"        {except_op}"
         f"        select * from {before_relation}"
         "    ) as actually_changed"
         ") as extra_frontier"
     )
 
 
-def mismatched_rows_sql(*, after_relation: str, repaired_relation: str) -> str:
+def mismatched_rows_sql(
+    *,
+    after_relation: str,
+    repaired_relation: str,
+    dialect: str = "snowflake",
+) -> str:
+    except_op = except_keyword(dialect)
     return (
         "select count(*) as mismatched_final_rows from ("
         "    select * from ("
         f"        select * from {after_relation}"
-        "        except"
+        f"        {except_op}"
         f"        select * from {repaired_relation}"
         "    ) as after_not_repaired"
         "    union all"
         "    select * from ("
         f"        select * from {repaired_relation}"
-        "        except"
+        f"        {except_op}"
         f"        select * from {after_relation}"
         "    ) as repaired_not_after"
         ") as mismatched_final"
@@ -124,7 +150,7 @@ def measure_mutation_proof(
     config: FrontierConfig,
     *,
     manifest: Manifest,
-    warehouse: Warehouse,
+    warehouse: WarehouseAdapter,
     proof: ProofConfig | None = None,
 ) -> MutationProof:
     spec = proof or config.proof
@@ -135,7 +161,7 @@ def measure_mutation_proof(
     targeted = _relation(manifest, spec.targeted_after)
     deleted = _relation(manifest, spec.deleted_order)
 
-    deleted_rows = warehouse.fetch_all(deleted_order_sql(deleted))
+    deleted_rows = warehouse.execute(deleted_order_sql(deleted))
     if not deleted_rows or deleted_rows[0][0] is None:
         raise ConfigError("mutation_deleted_order returned no order to delete")
     deleted_order_id = str(deleted_rows[0][0])
@@ -149,6 +175,7 @@ def measure_mutation_proof(
             before_relation=before,
             after_relation=after,
             frontier_relation=frontier,
+            dialect=warehouse.dialect,
         ),
     )
     extra = _count(
@@ -157,12 +184,17 @@ def measure_mutation_proof(
             before_relation=before,
             after_relation=after,
             frontier_relation=frontier,
+            dialect=warehouse.dialect,
         ),
     )
     started = time.perf_counter()
     mismatched = _count(
         warehouse,
-        mismatched_rows_sql(after_relation=after, repaired_relation=repaired),
+        mismatched_rows_sql(
+            after_relation=after,
+            repaired_relation=repaired,
+            dialect=warehouse.dialect,
+        ),
     )
     duration_ms = max(0, round((time.perf_counter() - started) * 1000))
     if full_rows <= 0:
