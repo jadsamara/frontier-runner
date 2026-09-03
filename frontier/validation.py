@@ -155,7 +155,15 @@ def sql_change_narrow_frontier_result(
         extra = ", ".join(kinds) if kinds else "unsafe SQL change"
         if row.get("impactStatus") == "FULL_REBUILD_REQUIRED":
             extra = f"{extra}; FULL_REBUILD_REQUIRED".strip("; ")
-        reasons = [str(reason) for reason in (row.get("unsupportedReasons") or [])]
+        reasons = list(
+            dict.fromkeys(
+                str(reason)
+                for reason in (
+                    *(row.get("unsupportedReasons") or []),
+                    *(row.get("impactReasons") or []),
+                )
+            )
+        )
         if reasons:
             extra = f"{extra} ({'; '.join(reasons)})"
         details.append(f"{name}: {extra}")

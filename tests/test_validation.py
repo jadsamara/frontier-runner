@@ -73,3 +73,22 @@ def test_sql_change_validation_fails_closed_without_empty_affected_set() -> None
     assert failed.difference_count >= 1
     assert "GROUPING_CHANGED" in (failed.message or "")
     assert sql_change_narrow_frontier_result(None) is None
+
+    rebuild = sql_change_narrow_frontier_result(
+        {
+            "modified": [
+                {
+                    "name": "int_customer_orders",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "unsafe": False,
+                    "impactStatus": "FULL_REBUILD_REQUIRED",
+                    "impactReasons": ["RECURSIVE_CTE"],
+                }
+            ],
+            "narrowFrontierSafe": False,
+        }
+    )
+    assert rebuild is not None
+    assert rebuild.status == "failed"
+    assert "RECURSIVE_CTE" in (rebuild.message or "")
+    assert "FILTER_CHANGED" in (rebuild.message or "")

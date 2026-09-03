@@ -222,3 +222,34 @@ def test_unparseable_sql_is_unsupported_not_empty() -> None:
     assert comparison["modified"][0]["unsafe"] is True
     assert comparison["narrowFrontierSafe"] is False
     assert comparison["modified"][0]["unsupportedReasons"]
+
+
+def test_cte_filter_change_compiles_for_narrow_frontier() -> None:
+    base_sql = """
+        with customers as (
+            select c.* from stg_customers c
+        ),
+        orders as (
+            select o.* from stg_orders o where o.order_status = 'F'
+        )
+        select c.customer_id, count(o.order_id) as total_orders
+        from customers c
+        left join orders o on c.customer_id = o.customer_id
+        group by c.customer_id
+    """
+    pr_sql = base_sql.replace(
+        "where o.order_status = 'F'",
+        "where o.order_status in ('F', 'O')",
+    )
+    base = _manifest(_node("int_customer_orders", sql=base_sql))
+    pr = _manifest(_node("int_customer_orders", sql=pr_sql))
+    comparison = compare_manifests(base, pr, entity_key="customer_id").to_dict()
+    modified = comparison["modified"]
+    assert len(modified) == 1
+    assert modified[0]["changeKinds"] == ["FILTER_CHANGED"]
+    assert modified[0]["unsafe"] is False
+    assert modified[0]["impactStatus"] == "COMPILED"
+    assert "is distinct from" in (modified[0].get("candidateSql") or "").lower()
+    assert comparison["narrowFrontierSafe"] is True
+    assert comparison["fullRebuildRequired"] is False
+

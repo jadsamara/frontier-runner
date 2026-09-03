@@ -119,6 +119,16 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
         )
         if statuses:
             lines.append(f"Impact status: {', '.join(statuses)}")
+        reasons = list(
+            dict.fromkeys(
+                str(reason)
+                for row in modified
+                if row.get("impactStatus") == "FULL_REBUILD_REQUIRED"
+                for reason in (row.get("impactReasons") or [])
+            )
+        )
+        if reasons:
+            lines.append(f"Impact reasons: {', '.join(reasons[:8])}")
     failed = _failed_checks(validations)
     if failed:
         lines.extend(["", "Failed checks:", *failed])

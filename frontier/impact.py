@@ -102,6 +102,9 @@ _NONDET_NAMES = frozenset(
 
 _DYNAMIC_FUNCS = frozenset({"IDENTIFIER", "TO_QUERY", "PARSE_JSON"})
 
+# Outer query key in the named-select map. CTE names are lowercased aliases.
+_OUTER = ""
+
 
 @dataclass(frozen=True)
 class ImpactCompileResult:
@@ -221,7 +224,15 @@ def _confirmed(name: str, confirmed_keys: frozenset[str]) -> bool:
     return name.lower() in confirmed_keys
 
 
-def _primary_select(sql: str) -> tuple[exp.Select | None, tuple[str, ...]]:
+@dataclass(frozen=True)
+class _ParsedQuery:
+    outer: exp.Select
+    named: dict[str, exp.Select]
+    cte_nodes: dict[str, exp.CTE]
+    cte_order: tuple[str, ...]
+
+
+def _parse_query(sql: str) -> tuple[_ParsedQuery | None, tuple[str, ...]]:
     text = (sql or "").strip()
     if not text:
         return None, ("empty SQL",)
@@ -235,17 +246,108 @@ def _primary_select(sql: str) -> tuple[exp.Select | None, tuple[str, ...]]:
     root = expressions[0]
     if isinstance(root, (exp.Union, exp.Except, exp.Intersect)):
         return None, ("set operation",)
-    if root.find(exp.With):
-        return None, ("CTE",)
     outer = root if isinstance(root, exp.Select) else None
     if outer is None:
         return None, ("nested or missing select",)
-    extras = [node for node in root.find_all(exp.Select) if node is not outer]
+
+    named: dict[str, exp.Select] = {_OUTER: outer}
+    cte_nodes: dict[str, exp.CTE] = {}
+    cte_order: list[str] = []
+    with_ = outer.args.get("with_")
+    if with_ is not None:
+        if with_.args.get("recursive"):
+            return None, ("RECURSIVE_CTE",)
+        for cte in with_.expressions or []:
+            if not isinstance(cte, exp.CTE):
+                return None, ("nested or missing select",)
+            name = str(cte.alias or "").lower()
+            body = cte.this
+            if not name or not isinstance(body, exp.Select):
+                return None, ("nested or missing select",)
+            if name in named:
+                return None, ("nested or missing select",)
+            named[name] = body
+            cte_nodes[name] = cte
+            cte_order.append(name)
+
+    allowed = set(named.values())
+    extras = [node for node in root.find_all(exp.Select) if node not in allowed]
     if extras:
         if any(_has_ancestor(node, exp.Exists) for node in extras):
             return None, ("unsupported correlated query",)
         return None, ("nested or missing select",)
-    return outer, ()
+    return (
+        _ParsedQuery(
+            outer=outer,
+            named=named,
+            cte_nodes=cte_nodes,
+            cte_order=tuple(cte_order),
+        ),
+        (),
+    )
+
+
+def _cte_deps(select: exp.Select, named: dict[str, exp.Select]) -> set[str]:
+    cte_names = {name for name in named if name}
+    needed: set[str] = set()
+
+    def visit(node: exp.Select) -> None:
+        for table in node.find_all(exp.Table):
+            name = str(table.name or "").lower()
+            if name in cte_names and name not in needed:
+                needed.add(name)
+                visit(named[name])
+
+    visit(select)
+    return needed
+
+
+def _attach_with(query: exp.Select, source: exp.Select, parsed: _ParsedQuery) -> exp.Select:
+    needed = _cte_deps(source, parsed.named)
+    if not needed:
+        return query
+    expressions = [
+        parsed.cte_nodes[name].copy()
+        for name in parsed.cte_order
+        if name in needed
+    ]
+    if not expressions:
+        return query
+    query.set("with_", exp.With(expressions=expressions))
+    return query
+
+
+def _compile_filter_queries(
+    base_q: _ParsedQuery,
+    pr_q: _ParsedQuery,
+    entity_key: str,
+) -> tuple[list[exp.Select], tuple[str, ...]]:
+    if set(base_q.named) != set(pr_q.named):
+        return [], ("SOURCE_CHANGED",)
+    queries: list[exp.Select] = []
+    for name in base_q.named:
+        base_sel = base_q.named[name]
+        pr_sel = pr_q.named[name]
+        old_where = _clause_predicate(base_sel.args.get("where"))
+        new_where = _clause_predicate(pr_sel.args.get("where"))
+        if _render(old_where) != _render(new_where):
+            query = _build_select(pr_sel, entity_key, where=_is_distinct(old_where, new_where))
+            queries.append(_attach_with(query, pr_sel, pr_q))
+        old_having = _clause_predicate(base_sel.args.get("having"))
+        new_having = _clause_predicate(pr_sel.args.get("having"))
+        if _render(old_having) != _render(new_having):
+            if pr_sel.args.get("group") is None and base_sel.args.get("group") is None:
+                return [], ("unsupported aggregate change",)
+            source = pr_sel if pr_sel.args.get("group") is not None else base_sel
+            query = _build_select(
+                source,
+                entity_key,
+                having=_is_distinct(old_having, new_having),
+            )
+            queries.append(_attach_with(query, source, pr_q))
+    if not queries:
+        return [], ("FILTER_CHANGED",)
+    return queries, ()
 
 
 def _has_ancestor(node: exp.Expression, kind: type[exp.Expression]) -> bool:
@@ -593,6 +695,8 @@ def _entity_column(select: exp.Select, entity_key: str) -> exp.Column:
             inner = _unalias(item)
             if isinstance(inner, exp.Column):
                 return inner.copy()
+    if from_table:
+        return exp.column(entity_key, table=from_table)
     return exp.column(entity_key)
 
 
@@ -668,8 +772,8 @@ def compile_impact_query(
             candidate_set_state=CANDIDATE_SET_EMPTY,
         )
 
-    base_select, base_err = _primary_select(base_sql)
-    pr_select, pr_err = _primary_select(pr_sql)
+    base_q, base_err = _parse_query(base_sql)
+    pr_q, pr_err = _parse_query(pr_sql)
     rebuild_reasons: list[str] = []
     rebuild_reasons.extend(base_err)
     rebuild_reasons.extend(pr_err)
@@ -683,31 +787,28 @@ def compile_impact_query(
         rebuild_reasons.append("unsupported SQL")
     unsupported_kinds = [kind for kind in change.kinds if kind not in _SUPPORTED_KINDS and kind not in _REBUILD_KINDS]
     rebuild_reasons.extend(unsupported_kinds)
-    if base_select is not None:
-        rebuild_reasons.extend(_structural_rebuild_reasons(base_select))
-        rebuild_reasons.extend(_validate_joins(base_select, confirmed))
-    if pr_select is not None:
-        rebuild_reasons.extend(_structural_rebuild_reasons(pr_select))
-        rebuild_reasons.extend(_validate_joins(pr_select, confirmed))
+    for parsed in (base_q, pr_q):
+        if parsed is None:
+            continue
+        for select in parsed.named.values():
+            rebuild_reasons.extend(_structural_rebuild_reasons(select))
+            rebuild_reasons.extend(_validate_joins(select, confirmed))
     if rebuild_reasons:
         return _rebuild(*rebuild_reasons, entity_key=entity_key)
-    if base_select is None or pr_select is None:
+    if base_q is None or pr_q is None:
         return _rebuild("nested or missing select", entity_key=entity_key)
+    base_select = base_q.outer
+    pr_select = pr_q.outer
+
+    queries: list[exp.Select] = []
+    if FILTER_CHANGED in change.kinds:
+        filter_queries, filter_err = _compile_filter_queries(base_q, pr_q, entity_key)
+        if filter_err:
+            return _rebuild(*filter_err, entity_key=entity_key)
+        queries.extend(filter_queries)
 
     where_preds: list[exp.Expression] = []
     having_preds: list[exp.Expression] = []
-
-    if FILTER_CHANGED in change.kinds:
-        old_where = _clause_predicate(base_select.args.get("where"))
-        new_where = _clause_predicate(pr_select.args.get("where"))
-        if _render(old_where) != _render(new_where):
-            where_preds.append(_is_distinct(old_where, new_where))
-        old_having = _clause_predicate(base_select.args.get("having"))
-        new_having = _clause_predicate(pr_select.args.get("having"))
-        if _render(old_having) != _render(new_having):
-            having_preds.append(_is_distinct(old_having, new_having))
-        if not where_preds and not having_preds:
-            return _rebuild("FILTER_CHANGED", entity_key=entity_key)
 
     if EXPRESSION_CHANGED in change.kinds:
         cases = _case_impacts(base_select, pr_select)
@@ -738,21 +839,27 @@ def compile_impact_query(
             return _rebuild("unsupported join change", entity_key=entity_key)
         where_preds.extend(joins)
 
-    if not where_preds and not having_preds:
-        return _rebuild("no supported impact predicate", entity_key=entity_key)
-
-    queries: list[exp.Select] = []
     if where_preds:
         queries.append(
-            _build_select(pr_select, entity_key, where=_or_all(where_preds))
+            _attach_with(
+                _build_select(pr_select, entity_key, where=_or_all(where_preds)),
+                pr_select,
+                pr_q,
+            )
         )
     if having_preds:
         if pr_select.args.get("group") is None and base_select.args.get("group") is None:
             return _rebuild("unsupported aggregate change", entity_key=entity_key)
         source = pr_select if pr_select.args.get("group") is not None else base_select
         queries.append(
-            _build_select(source, entity_key, having=_or_all(having_preds))
+            _attach_with(
+                _build_select(source, entity_key, having=_or_all(having_preds)),
+                source,
+                pr_q,
+            )
         )
+    if not queries:
+        return _rebuild("no supported impact predicate", entity_key=entity_key)
 
     tree: exp.Expression = queries[0]
     for extra in queries[1:]:

@@ -158,6 +158,40 @@ def test_comment_marks_unsafe_sql_without_entity_ids() -> None:
     assert "370" not in body
 
 
+def test_comment_includes_impact_reasons_without_entity_ids() -> None:
+    payload = {
+        **FAILED_PAYLOAD,
+        "sqlComparison": {
+            "base": {
+                "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "modelCount": 4,
+            },
+            "pr": {
+                "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "modelCount": 4,
+            },
+            "added": [],
+            "removed": [],
+            "modified": [
+                {
+                    "name": "int_customer_orders",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "unsafe": False,
+                    "impactStatus": "FULL_REBUILD_REQUIRED",
+                    "impactReasons": ["RECURSIVE_CTE"],
+                }
+            ],
+            "narrowFrontierSafe": False,
+            "fullRebuildRequired": True,
+        },
+    }
+    body = format_pr_comment(payload, run_url="https://frontier.example/runs/1")
+    assert "Impact: full rebuild required" in body
+    assert "Impact reasons: RECURSIVE_CTE" in body
+    assert "370" not in body
+    assert "customer_id" not in body
+
+
 def test_failed_comment_is_prominent_without_customer_data() -> None:
     body = format_pr_comment(
         FAILED_PAYLOAD,

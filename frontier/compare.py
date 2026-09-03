@@ -261,6 +261,9 @@ def format_compare_report(comparison: dict[str, Any]) -> str:
             impact_status = row.get("impactStatus")
             if impact_status:
                 lines.append(f"    impact: {impact_status}")
+            reasons = row.get("impactReasons") or []
+            if reasons:
+                lines.append(f"    impact reasons: {', '.join(str(reason) for reason in reasons)}")
             if row.get("candidateSql"):
                 lines.append(f"    candidate sql: {row['candidateSql']}")
 
