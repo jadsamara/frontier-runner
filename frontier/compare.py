@@ -1,0 +1,244 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from frontier.dbt_artifacts import DbtNode, Manifest
+from frontier.sql_fingerprint import sql_dialect, sql_fingerprint
+from frontier.snowflake_sql import (
+    classify_sql_change,
+    narrow_frontier_safe,
+)
+
+
+def compiled_sql_for(node: DbtNode, compiled_root: Path | None = None) -> str | None:
+    if node.compiled_code and node.compiled_code.strip():
+        return node.compiled_code
+    if compiled_root is None or not node.original_file_path:
+        return None
+    relative = Path(node.original_file_path)
+    candidates = []
+    if node.package_name:
+        candidates.append(compiled_root / node.package_name / relative)
+    candidates.append(compiled_root / relative)
+    for path in candidates:
+        if path.is_file():
+            text = path.read_text(encoding="utf-8")
+            if text.strip():
+                return text
+    return None
+
+
+def model_sql_fingerprint(
+    node: DbtNode,
+    *,
+    dialect: str | None,
+    compiled_root: Path | None = None,
+) -> str:
+    sql = compiled_sql_for(node, compiled_root) or ""
+    return sql_fingerprint(sql, dialect=dialect)
+
+
+def artifact_fingerprint(model_fingerprints: dict[str, str]) -> str:
+    canonical = json.dumps(
+        [[unique_id, model_fingerprints[unique_id]] for unique_id in sorted(model_fingerprints)],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _ref(node: DbtNode) -> dict[str, str]:
+    return {"uniqueId": node.unique_id, "name": node.name}
+
+
+def _downstream_payload(manifest: Manifest, unique_id: str) -> list[dict[str, str]]:
+    return [_ref(node) for node in manifest.downstream_models(unique_id)]
+
+
+def _model_payload(
+    *,
+    unique_id: str,
+    name: str,
+    base_fingerprint: str | None,
+    pr_fingerprint: str | None,
+    downstream: list[dict[str, str]],
+    change_kinds: list[str] | None = None,
+    unsafe: bool | None = None,
+    unsupported_reasons: list[str] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "uniqueId": unique_id,
+        "name": name,
+        "baseFingerprint": base_fingerprint,
+        "prFingerprint": pr_fingerprint,
+        "downstream": downstream,
+    }
+    if change_kinds:
+        payload["changeKinds"] = change_kinds
+    if unsafe is not None:
+        payload["unsafe"] = unsafe
+    if unsupported_reasons:
+        payload["unsupportedReasons"] = unsupported_reasons
+    return payload
+
+
+@dataclass(frozen=True)
+class SqlComparison:
+    payload: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(json.dumps(self.payload))
+
+
+def compare_manifests(
+    base: Manifest,
+    pr: Manifest,
+    *,
+    base_compiled_root: Path | None = None,
+    pr_compiled_root: Path | None = None,
+    base_commit_sha: str | None = None,
+    pr_commit_sha: str | None = None,
+) -> SqlComparison:
+    dialect = sql_dialect(pr.adapter_type or base.adapter_type)
+    base_models = base.models()
+    pr_models = pr.models()
+    base_prints = {
+        unique_id: model_sql_fingerprint(
+            node,
+            dialect=dialect,
+            compiled_root=base_compiled_root,
+        )
+        for unique_id, node in base_models.items()
+    }
+    pr_prints = {
+        unique_id: model_sql_fingerprint(
+            node,
+            dialect=dialect,
+            compiled_root=pr_compiled_root,
+        )
+        for unique_id, node in pr_models.items()
+    }
+
+    added: list[dict[str, Any]] = []
+    removed: list[dict[str, Any]] = []
+    modified: list[dict[str, Any]] = []
+
+    for unique_id in sorted(pr_models):
+        node = pr_models[unique_id]
+        if unique_id not in base_models:
+            added.append(
+                _model_payload(
+                    unique_id=unique_id,
+                    name=node.name,
+                    base_fingerprint=None,
+                    pr_fingerprint=pr_prints[unique_id],
+                    downstream=_downstream_payload(pr, unique_id),
+                )
+            )
+            continue
+        if base_prints[unique_id] == pr_prints[unique_id]:
+            continue
+        base_sql = compiled_sql_for(base_models[unique_id], base_compiled_root) or ""
+        pr_sql = compiled_sql_for(node, pr_compiled_root) or ""
+        classification = classify_sql_change(base_sql, pr_sql)
+        if not classification.kinds:
+            continue
+        modified.append(
+            _model_payload(
+                unique_id=unique_id,
+                name=node.name,
+                base_fingerprint=base_prints[unique_id],
+                pr_fingerprint=pr_prints[unique_id],
+                downstream=_downstream_payload(pr, unique_id),
+                change_kinds=list(classification.kinds),
+                unsafe=classification.unsafe,
+                unsupported_reasons=list(classification.unsupported_reasons) or None,
+            )
+        )
+
+    for unique_id in sorted(base_models):
+        if unique_id in pr_models:
+            continue
+        node = base_models[unique_id]
+        removed.append(
+            _model_payload(
+                unique_id=unique_id,
+                name=node.name,
+                base_fingerprint=base_prints[unique_id],
+                pr_fingerprint=None,
+                downstream=_downstream_payload(base, unique_id),
+            )
+        )
+
+    base_side: dict[str, Any] = {
+        "fingerprint": artifact_fingerprint(base_prints),
+        "modelCount": len(base_prints),
+    }
+    pr_side: dict[str, Any] = {
+        "fingerprint": artifact_fingerprint(pr_prints),
+        "modelCount": len(pr_prints),
+    }
+    if base_commit_sha:
+        base_side["commitSha"] = base_commit_sha
+    if pr_commit_sha:
+        pr_side["commitSha"] = pr_commit_sha
+
+    payload = {
+        "base": base_side,
+        "pr": pr_side,
+        "added": added,
+        "removed": removed,
+        "modified": modified,
+        "narrowFrontierSafe": narrow_frontier_safe({"modified": modified}),
+    }
+    return SqlComparison(payload)
+
+
+def format_compare_report(comparison: dict[str, Any]) -> str:
+    base = comparison["base"]
+    pr = comparison["pr"]
+    lines = [
+        f"Base artifact: {base['fingerprint']}",
+        f"PR artifact:   {pr['fingerprint']}",
+        f"Models: {base['modelCount']} base, {pr['modelCount']} PR",
+    ]
+    if base.get("commitSha") or pr.get("commitSha"):
+        lines.append(
+            f"Commits: base={base.get('commitSha') or '—'} pr={pr.get('commitSha') or '—'}"
+        )
+
+    def section(title: str, rows: list[dict[str, Any]]) -> None:
+        lines.extend(["", f"{title}:"])
+        if not rows:
+            lines.append("  (none)")
+            return
+        for row in rows:
+            lines.append(f"  - {row['name']} ({row['uniqueId']})")
+            downstream = row.get("downstream") or []
+            if downstream:
+                names = ", ".join(item["name"] for item in downstream)
+                lines.append(f"    downstream: {names}")
+            else:
+                lines.append("    downstream: (none)")
+            kinds = row.get("changeKinds") or []
+            if kinds:
+                lines.append(f"    change kinds: {', '.join(kinds)}")
+            if row.get("unsafe"):
+                lines.append("    unsafe: narrow frontier is not allowed")
+
+    section("Added", comparison.get("added") or [])
+    section("Removed", comparison.get("removed") or [])
+    section("Modified", comparison.get("modified") or [])
+    safe = comparison.get("narrowFrontierSafe")
+    if safe is not None:
+        lines.extend(
+            [
+                "",
+                f"Narrow frontier safe: {'yes' if safe else 'no'}",
+            ]
+        )
+    return "\n".join(lines)

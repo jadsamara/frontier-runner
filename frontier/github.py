@@ -23,6 +23,11 @@ def pull_request_number() -> int | None:
     return None
 
 
+def base_commit_sha() -> str | None:
+    sha = (os.environ.get("FRONTIER_BASE_SHA") or "").strip()
+    return sha or None
+
+
 def github_source() -> dict[str, Any] | None:
     """GitHub Actions context for the ingest payload. Never includes tokens or secrets."""
     sha = (os.environ.get("GITHUB_SHA") or "").strip()

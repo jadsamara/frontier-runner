@@ -33,6 +33,28 @@ def test_init_and_inspect(dbt_project: Path, capsys) -> None:
     assert "super-secret-password" not in out
 
 
+def test_inspect_prints_both_artifact_fingerprints(dbt_project: Path, capsys) -> None:
+    base = dbt_project / "target-base" / "manifest.json"
+    base.parent.mkdir()
+    base.write_text((dbt_project / "target" / "manifest.json").read_text())
+    assert (
+        main(
+            [
+                "inspect",
+                "--project-dir",
+                str(dbt_project),
+                "--base-manifest",
+                str(base),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "Base artifact:" in out
+    assert "PR artifact:" in out
+    assert "Modified:" in out
+
+
 def test_run_dry_run_writes_metrics(dbt_project: Path, monkeypatch, capsys) -> None:
     monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
     code = main(
@@ -411,5 +433,144 @@ def test_run_refuses_missing_artifact_sha_in_ci(dbt_project: Path, monkeypatch, 
     captured = capsys.readouterr()
     assert code == 1
     assert "frontier-artifact-sha" in captured.err
+
+
+def _mini_manifest(
+    *,
+    orders_sql: str,
+    include_legacy: bool = True,
+) -> dict:
+    nodes = {
+        "model.jaffle_shop.stg_customers": {
+            "resource_type": "model",
+            "unique_id": "model.jaffle_shop.stg_customers",
+            "name": "stg_customers",
+            "database": "DATA_AGENT_DEV",
+            "schema": "DBT_DEV",
+            "relation_name": "DATA_AGENT_DEV.DBT_DEV.stg_customers",
+            "depends_on": {"nodes": []},
+            "compiled_code": "select id as customer_id from customer",
+            "original_file_path": "models/stg_customers.sql",
+            "package_name": "jaffle_shop",
+        },
+        "model.jaffle_shop.stg_orders": {
+            "resource_type": "model",
+            "unique_id": "model.jaffle_shop.stg_orders",
+            "name": "stg_orders",
+            "database": "DATA_AGENT_DEV",
+            "schema": "DBT_DEV",
+            "relation_name": "DATA_AGENT_DEV.DBT_DEV.stg_orders",
+            "depends_on": {"nodes": []},
+            "compiled_code": orders_sql,
+            "original_file_path": "models/stg_orders.sql",
+            "package_name": "jaffle_shop",
+        },
+        "model.jaffle_shop.customer_summary": {
+            "resource_type": "model",
+            "unique_id": "model.jaffle_shop.customer_summary",
+            "name": "customer_summary",
+            "database": "DATA_AGENT_DEV",
+            "schema": "DBT_DEV",
+            "relation_name": "DATA_AGENT_DEV.DBT_DEV.customer_summary",
+            "depends_on": {"nodes": ["model.jaffle_shop.stg_orders"]},
+            "compiled_code": "select customer_id from stg_orders",
+            "original_file_path": "models/customer_summary.sql",
+            "package_name": "jaffle_shop",
+        },
+    }
+    if include_legacy:
+        nodes["model.jaffle_shop.stg_legacy"] = {
+            "resource_type": "model",
+            "unique_id": "model.jaffle_shop.stg_legacy",
+            "name": "stg_legacy",
+            "database": "DATA_AGENT_DEV",
+            "schema": "DBT_DEV",
+            "relation_name": "DATA_AGENT_DEV.DBT_DEV.stg_legacy",
+            "depends_on": {"nodes": []},
+            "compiled_code": "select 1 as id",
+            "original_file_path": "models/stg_legacy.sql",
+            "package_name": "jaffle_shop",
+        }
+        nodes["model.jaffle_shop.customer_summary"]["depends_on"]["nodes"].append(
+            "model.jaffle_shop.stg_legacy"
+        )
+    return {
+        "metadata": {"project_name": "jaffle_shop", "adapter_type": "snowflake"},
+        "nodes": nodes,
+        "sources": {},
+    }
+
+
+def test_compare_cli_classifies_filter_and_removed(tmp_path: Path, capsys) -> None:
+    base_path = tmp_path / "base-manifest.json"
+    pr_path = tmp_path / "pr-manifest.json"
+    out_path = tmp_path / "frontier-compare.json"
+    base_sql = "select id as order_id from orders where status = 'complete'"
+    pr_sql = "select id as order_id from orders where status = 'returned'"
+    base_path.write_text(json.dumps(_mini_manifest(orders_sql=base_sql, include_legacy=True)))
+    pr_path.write_text(json.dumps(_mini_manifest(orders_sql=pr_sql, include_legacy=False)))
+    code = main(
+        [
+            "compare",
+            "--base-manifest",
+            str(base_path),
+            "--pr-manifest",
+            str(pr_path),
+            "--output",
+            str(out_path),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Modified:" in out
+    assert "stg_orders" in out
+    assert "Removed:" in out
+    assert "stg_legacy" in out
+    assert "customer_summary" in out
+    comparison = json.loads(out_path.read_text())
+    assert comparison["base"]["fingerprint"] != comparison["pr"]["fingerprint"]
+    assert comparison["modified"][0]["name"] == "stg_orders"
+    assert comparison["modified"][0]["changeKinds"] == ["FILTER_CHANGED"]
+    assert comparison["modified"][0]["unsafe"] is False
+    assert comparison["narrowFrontierSafe"] is True
+    assert comparison["removed"][0]["name"] == "stg_legacy"
+    assert "affectedEntities" not in comparison
+    assert "FILTER_CHANGED" in out
+    assert "Narrow frontier safe: yes" in out
+
+
+def test_run_attaches_both_artifact_fingerprints(dbt_project: Path, monkeypatch) -> None:
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    monkeypatch.setenv("FRONTIER_BASE_SHA", "base1234deadbeef")
+    monkeypatch.setenv("GITHUB_SHA", "prsha1234deadbeef")
+    base = dbt_project / "target-base" / "manifest.json"
+    base.parent.mkdir()
+    base.write_text((dbt_project / "target" / "manifest.json").read_text())
+    code = main(
+        [
+            "run",
+            "--project-dir",
+            str(dbt_project),
+            "--dry-run",
+            "--include-entity-ids",
+            "--run-id",
+            "sql-compare-run-001",
+            "--base-manifest",
+            str(base),
+        ]
+    )
+    assert code == 0
+    payload = json.loads((dbt_project / "target" / "frontier-run.json").read_text())
+    assert payload["sqlComparison"]["base"]["fingerprint"]
+    assert payload["sqlComparison"]["pr"]["fingerprint"]
+    assert payload["sqlComparison"]["base"]["fingerprint"] == payload["sqlComparison"]["pr"]["fingerprint"]
+    assert payload["sqlComparison"]["base"]["commitSha"] == "base1234deadbeef"
+    assert payload["sqlComparison"]["pr"]["commitSha"] == "prsha1234deadbeef"
+    assert payload["sqlComparison"]["narrowFrontierSafe"] is True
+    names = {item["testName"] for item in payload["validationResults"]}
+    assert "assert_sql_change_allows_narrow_frontier" in names
+    assert payload["status"] == "passed"
+    assert len(payload["affectedEntities"]) == 3
+    assert "password" not in json.dumps(payload)
 
 

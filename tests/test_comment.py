@@ -93,6 +93,69 @@ def test_passed_comment_matches_acceptance_shape() -> None:
     assert "Direct customer key" not in body
 
 
+def test_comment_includes_artifact_fingerprints() -> None:
+    payload = {
+        **PASSED_PAYLOAD,
+        "sqlComparison": {
+            "base": {
+                "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "modelCount": 4,
+            },
+            "pr": {
+                "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "modelCount": 4,
+            },
+            "added": [],
+            "removed": [],
+            "modified": [
+                {
+                    "name": "stg_orders",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "unsafe": False,
+                }
+            ],
+            "narrowFrontierSafe": True,
+        },
+    }
+    body = format_pr_comment(payload, run_url="https://frontier.example/runs/1")
+    assert "SQL models changed: 1 modified, 0 added, 0 removed" in body
+    assert "SQL change kinds: FILTER_CHANGED" in body
+    assert "Narrow frontier: not allowed" not in body
+    assert "Base artifact: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in body
+    assert "PR artifact: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" in body
+    assert "370" not in body
+
+
+def test_comment_marks_unsafe_sql_without_entity_ids() -> None:
+    payload = {
+        **FAILED_PAYLOAD,
+        "sqlComparison": {
+            "base": {
+                "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "modelCount": 4,
+            },
+            "pr": {
+                "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "modelCount": 4,
+            },
+            "added": [],
+            "removed": [],
+            "modified": [
+                {
+                    "name": "customer_summary",
+                    "changeKinds": ["GROUPING_CHANGED"],
+                    "unsafe": True,
+                }
+            ],
+            "narrowFrontierSafe": False,
+        },
+    }
+    body = format_pr_comment(payload, run_url="https://frontier.example/runs/1")
+    assert "SQL change kinds: GROUPING_CHANGED" in body
+    assert "Narrow frontier: not allowed" in body
+    assert "370" not in body
+
+
 def test_failed_comment_is_prominent_without_customer_data() -> None:
     body = format_pr_comment(
         FAILED_PAYLOAD,

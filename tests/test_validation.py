@@ -4,7 +4,11 @@ from frontier.config import load_frontier_config
 from frontier.dbt_artifacts import load_manifest, load_run_results
 from frontier.frontier import load_change_events_csv, run_frontier
 from frontier.warehouse import FakeWarehouse
-from frontier.validation import collect_validation_results, evidence_level
+from frontier.validation import (
+    collect_validation_results,
+    evidence_level,
+    sql_change_narrow_frontier_result,
+)
 from tests.conftest import FIXTURES
 
 
@@ -33,3 +37,39 @@ def test_reads_validation_status_from_run_results() -> None:
     assert by_name["assert_frontier_matches_full_mart"].status == "passed"
     assert by_name["assert_frontier_events_resolve"].difference_count == 0
     assert evidence_level(validations) == "empirically_validated"
+
+
+def test_sql_change_validation_fails_closed_without_empty_affected_set() -> None:
+    passed = sql_change_narrow_frontier_result(
+        {
+            "modified": [
+                {
+                    "name": "stg_orders",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "unsafe": False,
+                }
+            ],
+            "narrowFrontierSafe": True,
+        }
+    )
+    assert passed is not None
+    assert passed.status == "passed"
+    assert passed.difference_count == 0
+
+    failed = sql_change_narrow_frontier_result(
+        {
+            "modified": [
+                {
+                    "name": "customer_summary",
+                    "changeKinds": ["GROUPING_CHANGED"],
+                    "unsafe": True,
+                }
+            ],
+            "narrowFrontierSafe": False,
+        }
+    )
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.difference_count >= 1
+    assert "GROUPING_CHANGED" in (failed.message or "")
+    assert sql_change_narrow_frontier_result(None) is None

@@ -83,6 +83,31 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
         f"Validation differences: {_validation_difference_total(validations)}",
         f"Evidence: {evidence}",
     ]
+    comparison = payload.get("sqlComparison") or {}
+    if comparison:
+        base = comparison.get("base") or {}
+        pr = comparison.get("pr") or {}
+        added = len(comparison.get("added") or [])
+        removed = len(comparison.get("removed") or [])
+        modified = comparison.get("modified") or []
+        lines.extend(
+            [
+                f"SQL models changed: {len(modified)} modified, {added} added, {removed} removed",
+                f"Base artifact: {base.get('fingerprint') or '—'}",
+                f"PR artifact: {pr.get('fingerprint') or '—'}",
+            ]
+        )
+        kinds = list(
+            dict.fromkeys(
+                str(kind)
+                for row in modified
+                for kind in (row.get("changeKinds") or [])
+            )
+        )
+        if kinds:
+            lines.append(f"SQL change kinds: {', '.join(kinds)}")
+        if comparison.get("narrowFrontierSafe") is False:
+            lines.append("Narrow frontier: not allowed")
     failed = _failed_checks(validations)
     if failed:
         lines.extend(["", "Failed checks:", *failed])

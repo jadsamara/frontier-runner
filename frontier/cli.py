@@ -21,7 +21,8 @@ from frontier.config import (
     write_init_config,
 )
 from frontier.artifacts import require_current_artifacts
-from frontier.github import default_external_run_id, env_flag, github_source
+from frontier.compare import compare_manifests, format_compare_report
+from frontier.github import base_commit_sha, default_external_run_id, env_flag, github_source
 from frontier.dbt_artifacts import (
     format_inspect_report,
     inspect_report,
@@ -51,6 +52,7 @@ from frontier.validation import (
     collect_validation_results,
     evidence_level,
     overall_status,
+    sql_change_narrow_frontier_result,
 )
 
 RUN_FILE_NAME = "frontier-run.json"
@@ -72,6 +74,33 @@ def _target_dir(project_dir: Path) -> Path:
     return project_dir / "target"
 
 
+def _compiled_root_for(manifest_path: Path) -> Path:
+    return manifest_path.parent / "compiled"
+
+
+def _load_sql_comparison(
+    args: argparse.Namespace,
+    *,
+    pr_manifest,
+    project_dir: Path,
+) -> dict[str, Any] | None:
+    base_path = getattr(args, "base_manifest", None)
+    if not base_path:
+        return None
+    base_manifest_path = Path(base_path).expanduser().resolve()
+    base_manifest = load_manifest(base_manifest_path)
+    pr_path = pr_manifest.path or (_target_dir(project_dir) / "manifest.json")
+    comparison = compare_manifests(
+        base_manifest,
+        pr_manifest,
+        base_compiled_root=_compiled_root_for(base_manifest_path),
+        pr_compiled_root=_compiled_root_for(Path(pr_path)),
+        base_commit_sha=base_commit_sha(),
+        pr_commit_sha=(os.environ.get("GITHUB_SHA") or "").strip() or None,
+    )
+    return comparison.to_dict()
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
     path = Path(args.config).expanduser().resolve() if args.config else project_dir / "frontier.yml"
@@ -91,6 +120,10 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         )
     report = inspect_report(manifest, config.model.name)
     print(format_inspect_report(report))
+    comparison = _load_sql_comparison(args, pr_manifest=manifest, project_dir=project_dir)
+    if comparison:
+        print()
+        print(format_compare_report(comparison))
 
     missing = [
         name
@@ -127,6 +160,7 @@ def _emit_run(
     result,
     validations,
     extra_metrics: dict[str, Any] | None = None,
+    sql_comparison: dict[str, Any] | None = None,
 ) -> Path:
     include_entity_ids = args.include_entity_ids or config.upload.include_entity_ids
     hash_entity_ids = args.hash_entity_ids or config.upload.hash_entity_ids
@@ -145,6 +179,9 @@ def _emit_run(
     metrics = dict(details["metrics"])
     if extra_metrics:
         metrics.update(extra_metrics)
+    sql_check = sql_change_narrow_frontier_result(sql_comparison)
+    if sql_check is not None:
+        validations.append(sql_check)
     payload = build_ingest_payload(
         external_run_id=run_id,
         project=config.project,
@@ -173,6 +210,7 @@ def _emit_run(
         git=github_source(),
         entity_ids_hashed=not send_raw_ids,
         warehouse_type=normalize_warehouse_type(manifest.adapter_type),
+        sql_comparison=sql_comparison,
     )
     output = Path(args.output) if args.output else _target_dir(_project_dir(args)) / RUN_FILE_NAME
     _write_run_file(output, payload)
@@ -232,6 +270,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         manifest=manifest,
         result=result,
         validations=validations,
+        sql_comparison=_load_sql_comparison(
+            args,
+            pr_manifest=manifest,
+            project_dir=project_dir,
+        ),
     )
     print(f"Full entities: {result.full_entity_count}")
     print(f"Frontier: {result.frontier_entity_count}")
@@ -414,6 +457,11 @@ def cmd_prove(args: argparse.Namespace) -> int:
             "mismatchedFinalRows": proof.mismatched_final_rows,
             "testDurationMs": proof.test_duration_ms,
         },
+        sql_comparison=_load_sql_comparison(
+            args,
+            pr_manifest=manifest,
+            project_dir=project_dir,
+        ),
     )
     print(f"Full rows recomputed: {proof.full_rows_recomputed}")
     print(f"Frontier rows recomputed: {proof.frontier_rows_recomputed}")
@@ -431,6 +479,33 @@ def cmd_prove(args: argparse.Namespace) -> int:
             "Assessment failed; wrote diagnostics for upload.",
             file=sys.stderr,
         )
+    return 0
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    project_dir = _project_dir(args)
+    pr_manifest_path = (
+        Path(args.pr_manifest).expanduser().resolve()
+        if getattr(args, "pr_manifest", None)
+        else _target_dir(project_dir) / "manifest.json"
+    )
+    if not getattr(args, "pr_manifest", None):
+        require_current_artifacts(_target_dir(project_dir))
+    base_manifest_path = Path(args.base_manifest).expanduser().resolve()
+    base_manifest = load_manifest(base_manifest_path)
+    pr_manifest = load_manifest(pr_manifest_path)
+    comparison = compare_manifests(
+        base_manifest,
+        pr_manifest,
+        base_compiled_root=_compiled_root_for(base_manifest_path),
+        pr_compiled_root=_compiled_root_for(pr_manifest_path),
+        base_commit_sha=base_commit_sha(),
+        pr_commit_sha=(os.environ.get("GITHUB_SHA") or "").strip() or None,
+    ).to_dict()
+    print(format_compare_report(comparison))
+    output = Path(args.output) if args.output else _target_dir(project_dir) / "frontier-compare.json"
+    _write_run_file(output, comparison)
+    print(f"Wrote {output}")
     return 0
 
 
@@ -482,6 +557,13 @@ def _add_project_dir(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_base_manifest(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--base-manifest",
+        help="manifest.json compiled from the pull request base branch",
+    )
+
+
 def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", help="Path to frontier.yml")
     parser.add_argument("--profiles", help="dbt profiles.yml (default: ~/.dbt/profiles.yml)")
@@ -504,6 +586,7 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Use the recorded TPCH counts without a live warehouse",
     )
+    _add_base_manifest(parser)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -523,7 +606,25 @@ def build_parser() -> argparse.ArgumentParser:
     inspect = sub.add_parser("inspect", help="Read dbt artifacts and print model lineage")
     _add_project_dir(inspect)
     inspect.add_argument("--config", help="Path to frontier.yml")
+    _add_base_manifest(inspect)
     inspect.set_defaults(func=cmd_inspect)
+
+    compare = sub.add_parser(
+        "compare",
+        help="Compare compiled SQL between base-branch and PR manifests",
+    )
+    _add_project_dir(compare)
+    compare.add_argument(
+        "--base-manifest",
+        required=True,
+        help="manifest.json compiled from the pull request base branch",
+    )
+    compare.add_argument(
+        "--pr-manifest",
+        help="manifest.json compiled from the pull request (default: target/manifest.json)",
+    )
+    compare.add_argument("--output", help="Where to write frontier-compare.json")
+    compare.set_defaults(func=cmd_compare)
 
     run = sub.add_parser("run", help="Execute frontier and validation queries")
     _add_project_dir(run)

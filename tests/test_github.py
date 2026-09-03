@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from frontier.github import default_external_run_id, env_flag, github_source, pull_request_number
+from frontier.github import (
+    base_commit_sha,
+    default_external_run_id,
+    env_flag,
+    github_source,
+    pull_request_number,
+)
 
 RUNNER_ROOT = Path(__file__).resolve().parents[1]
 SAAS_ROOT = RUNNER_ROOT.parent
@@ -61,6 +67,13 @@ def test_env_flag(monkeypatch) -> None:
     assert env_flag("FRONTIER_DRY_RUN") is True
 
 
+def test_base_commit_sha(monkeypatch) -> None:
+    monkeypatch.delenv("FRONTIER_BASE_SHA", raising=False)
+    assert base_commit_sha() is None
+    monkeypatch.setenv("FRONTIER_BASE_SHA", "abc1234deadbeef")
+    assert base_commit_sha() == "abc1234deadbeef"
+
+
 def test_workflow_contains_required_steps() -> None:
     if not WORKFLOW.is_file():
         pytest.skip("SaaS workflow is not present in a standalone runner checkout")
@@ -68,6 +81,9 @@ def test_workflow_contains_required_steps() -> None:
     assert "pip install ./runner" in text
     assert "frontier inspect" in text
     assert "frontier run" in text
+    assert "--base-manifest target-base/manifest.json" in text
+    assert "target-base" in text
+    assert "FRONTIER_BASE_SHA" in text
     assert "frontier record-failure" in text
     assert "frontier upload" in text
     assert "FRONTIER_DRY_RUN" in text
@@ -91,6 +107,11 @@ def test_reference_customer_workflow_uses_prove_and_pinned_runner() -> None:
     text = REFERENCE_WORKFLOW.read_text()
     assert "frontier inspect" in text
     assert "frontier prove" in text
+    assert "frontier compare" in text
+    assert "--base-manifest" in text
+    assert "target-base" in text
+    assert "dbt compile" in text
+    assert "FRONTIER_BASE_SHA" in text
     assert "frontier upload" in text
     assert "frontier record-failure" in text
     assert "rm -rf target" in text

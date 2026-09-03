@@ -24,9 +24,10 @@ Then, from the dbt project or with a project path:
 
 ```bash
 python3 -m frontier init /path/to/jaffle_shop
-python3 -m frontier inspect /path/to/jaffle_shop
+python3 -m frontier inspect /path/to/jaffle_shop --base-manifest /path/to/base/manifest.json
+python3 -m frontier compare /path/to/jaffle_shop --base-manifest /path/to/base/manifest.json
 python3 -m frontier run /path/to/jaffle_shop
-python3 -m frontier prove /path/to/jaffle_shop
+python3 -m frontier prove /path/to/jaffle_shop --base-manifest /path/to/base/manifest.json
 python3 -m frontier upload /path/to/jaffle_shop
 ```
 
@@ -39,6 +40,8 @@ Entity IDs in `frontier-run.json` are HMAC-SHA-256 hashed with `FRONTIER_ENTITY_
 `frontier prove` measures the mutation-repair experiment (full vs frontier rows recomputed, missing/extra frontier entities, mismatched final rows, and EXCEPT duration) after the jaffle-shop overlay models have been built. Customer CI must call `prove`, not `run`.
 
 `frontier record-failure` writes a failed assessment without reading `target/manifest.json` or `run_results.json`. Use it when dbt build fails so CI cannot upload stale artifacts.
+
+`frontier compare` reads compiled SQL from the base-branch and PR manifests, classifies semantic changes with a restricted Snowflake parser (sqlglot), and reports added, removed, and modified models plus downstream consumers. Alias and formatting changes are ignored. Grouping, grain, and unsupported SQL cannot be treated as a safe narrow frontier. The comparison does not infer affected rows. `inspect`, `run`, and `prove` accept `--base-manifest` so both artifact fingerprints and change kinds are stored on the uploaded assessment.
 
 `frontier upload` posts `target/frontier-run.json` to `POST /api/v1/runs`. It retries HTTP 429/5xx and network errors, and honors `Retry-After`. It uses `FRONTIER_API_KEY` if that variable is set, otherwise `FRONTIER_DEMO_API_KEY`. A leftover placeholder in `FRONTIER_API_KEY` will win over the demo key — `unset FRONTIER_API_KEY` if you intend to use the local demo key. Hashed uploads set `entityIdsHashed: true`.
 

@@ -99,6 +99,7 @@ def test_core_modules_do_not_import_snowflake_client() -> None:
     root = Path(__file__).resolve().parents[1] / "frontier"
     for name in CORE_MODULES:
         text = (root / name).read_text()
-        assert "frontier.snowflake" not in text
+        assert "from frontier.snowflake import" not in text
+        assert "import frontier.snowflake\n" not in text
         assert "snowflake.connector" not in text
         assert "from frontier.warehouse import" in text

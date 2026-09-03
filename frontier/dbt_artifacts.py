@@ -98,6 +98,33 @@ class Manifest:
             if node.resource_type == "test" and unique_id in node.depends_on
         ]
 
+    def models(self) -> dict[str, DbtNode]:
+        return {
+            unique_id: node
+            for unique_id, node in self.nodes.items()
+            if node.resource_type == "model"
+        }
+
+    def downstream_models(self, unique_id: str) -> list[DbtNode]:
+        dependents: dict[str, list[str]] = {}
+        for node in self.models().values():
+            for dep in node.depends_on:
+                dependents.setdefault(dep, []).append(node.unique_id)
+        seen: set[str] = set()
+        ordered: list[DbtNode] = []
+        stack = list(dependents.get(unique_id, []))
+        while stack:
+            current_id = stack.pop()
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            node = self.get(current_id)
+            if node is None or node.resource_type != "model":
+                continue
+            ordered.append(node)
+            stack.extend(dependents.get(current_id, []))
+        return sorted(ordered, key=lambda node: node.unique_id)
+
     def singular_tests(self) -> list[DbtNode]:
         return [
             node
@@ -120,7 +147,7 @@ def _node_from_raw(unique_id: str, raw: dict[str, Any]) -> DbtNode:
         original_file_path=raw.get("original_file_path"),
         tags=tuple(raw.get("tags") or []),
         source_name=raw.get("source_name"),
-        compiled_code=raw.get("compiled_code"),
+        compiled_code=raw.get("compiled_code") or raw.get("compiled_sql"),
         package_name=raw.get("package_name"),
     )
 

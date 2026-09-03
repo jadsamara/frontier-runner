@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from frontier.config import FrontierConfig
 from frontier.dbt_artifacts import Manifest, RunResults
 from frontier.frontier import ChangeEvent, FrontierResult
+from frontier.snowflake_sql import UNSAFE_KINDS, UNSUPPORTED, narrow_frontier_safe
 from frontier.warehouse import WarehouseAdapter
+
+SQL_CHANGE_NARROW_FRONTIER = "assert_sql_change_allows_narrow_frontier"
 
 
 @dataclass(frozen=True)
@@ -121,6 +125,46 @@ def collect_validation_results(
         )
 
     return collected
+
+
+def sql_change_narrow_frontier_result(
+    comparison: dict[str, Any] | None,
+) -> ValidationResult | None:
+    """Fail closed when classified SQL cannot back a safe narrow frontier.
+
+    The parser never yields an affected set. A miss is not "nothing changed".
+    """
+    if not comparison:
+        return None
+    if narrow_frontier_safe(comparison):
+        return ValidationResult(
+            test_name=SQL_CHANGE_NARROW_FRONTIER,
+            status="passed",
+            difference_count=0,
+        )
+    details: list[str] = []
+    for row in comparison.get("modified") or []:
+        kinds = [str(kind) for kind in (row.get("changeKinds") or [])]
+        if not (
+            row.get("unsafe")
+            or any(kind in UNSAFE_KINDS or kind == UNSUPPORTED for kind in kinds)
+        ):
+            continue
+        name = str(row.get("name") or row.get("uniqueId") or "model")
+        extra = ", ".join(kinds) if kinds else "unsafe SQL change"
+        reasons = [str(reason) for reason in (row.get("unsupportedReasons") or [])]
+        if reasons:
+            extra = f"{extra} ({'; '.join(reasons)})"
+        details.append(f"{name}: {extra}")
+    message = "SQL change cannot be treated as a safe narrow frontier"
+    if details:
+        message = f"{message}: {'; '.join(details)}"
+    return ValidationResult(
+        test_name=SQL_CHANGE_NARROW_FRONTIER,
+        status="failed",
+        difference_count=max(1, len(details)),
+        message=message,
+    )
 
 
 def evidence_level(results: list[ValidationResult]) -> str:
