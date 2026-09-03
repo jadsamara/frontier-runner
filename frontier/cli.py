@@ -21,7 +21,7 @@ from frontier.config import (
     write_init_config,
 )
 from frontier.artifacts import require_current_artifacts
-from frontier.compare import compare_manifests, format_compare_report
+from frontier.compare import compare_manifests, format_compare_report, comparison_for_ingest
 from frontier.github import base_commit_sha, default_external_run_id, env_flag, github_source
 from frontier.dbt_artifacts import (
     format_inspect_report,
@@ -78,6 +78,25 @@ def _compiled_root_for(manifest_path: Path) -> Path:
     return manifest_path.parent / "compiled"
 
 
+def _impact_keys(args: argparse.Namespace, project_dir: Path) -> tuple[str | None, tuple[str, ...]]:
+    path = _config_path(args, project_dir)
+    if not path.is_file():
+        return None, ()
+    try:
+        config = load_frontier_config(path)
+    except ConfigError:
+        return None, ()
+    confirmed = tuple(
+        dict.fromkeys(
+            [
+                config.model.key,
+                *[relation.change_key for relation in config.relations.values()],
+            ]
+        )
+    )
+    return config.model.key, confirmed
+
+
 def _load_sql_comparison(
     args: argparse.Namespace,
     *,
@@ -90,6 +109,7 @@ def _load_sql_comparison(
     base_manifest_path = Path(base_path).expanduser().resolve()
     base_manifest = load_manifest(base_manifest_path)
     pr_path = pr_manifest.path or (_target_dir(project_dir) / "manifest.json")
+    entity_key, confirmed_keys = _impact_keys(args, project_dir)
     comparison = compare_manifests(
         base_manifest,
         pr_manifest,
@@ -97,6 +117,8 @@ def _load_sql_comparison(
         pr_compiled_root=_compiled_root_for(Path(pr_path)),
         base_commit_sha=base_commit_sha(),
         pr_commit_sha=(os.environ.get("GITHUB_SHA") or "").strip() or None,
+        entity_key=entity_key,
+        confirmed_keys=confirmed_keys,
     )
     return comparison.to_dict()
 
@@ -210,7 +232,7 @@ def _emit_run(
         git=github_source(),
         entity_ids_hashed=not send_raw_ids,
         warehouse_type=normalize_warehouse_type(manifest.adapter_type),
-        sql_comparison=sql_comparison,
+        sql_comparison=comparison_for_ingest(sql_comparison),
     )
     output = Path(args.output) if args.output else _target_dir(_project_dir(args)) / RUN_FILE_NAME
     _write_run_file(output, payload)
@@ -494,6 +516,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     base_manifest_path = Path(args.base_manifest).expanduser().resolve()
     base_manifest = load_manifest(base_manifest_path)
     pr_manifest = load_manifest(pr_manifest_path)
+    entity_key, confirmed_keys = _impact_keys(args, project_dir)
     comparison = compare_manifests(
         base_manifest,
         pr_manifest,
@@ -501,6 +524,8 @@ def cmd_compare(args: argparse.Namespace) -> int:
         pr_compiled_root=_compiled_root_for(pr_manifest_path),
         base_commit_sha=base_commit_sha(),
         pr_commit_sha=(os.environ.get("GITHUB_SHA") or "").strip() or None,
+        entity_key=entity_key,
+        confirmed_keys=confirmed_keys,
     ).to_dict()
     print(format_compare_report(comparison))
     output = Path(args.output) if args.output else _target_dir(project_dir) / "frontier-compare.json"
@@ -614,6 +639,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compare compiled SQL between base-branch and PR manifests",
     )
     _add_project_dir(compare)
+    compare.add_argument("--config", help="Path to frontier.yml")
     compare.add_argument(
         "--base-manifest",
         required=True,

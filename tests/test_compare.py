@@ -94,7 +94,7 @@ def test_whitespace_and_comments_are_unchanged() -> None:
 def test_filter_change_marks_model_modified() -> None:
     base = _manifest(*_graph())
     pr = _manifest(*_graph(orders_sql=STG_ORDERS_FILTER_SQL))
-    comparison = compare_manifests(base, pr).to_dict()
+    comparison = compare_manifests(base, pr, entity_key="customer_id").to_dict()
     modified = comparison["modified"]
     assert [item["uniqueId"] for item in modified] == ["model.jaffle_shop.stg_orders"]
     assert modified[0]["baseFingerprint"] != modified[0]["prFingerprint"]
@@ -103,6 +103,8 @@ def test_filter_change_marks_model_modified() -> None:
     assert comparison["base"]["fingerprint"] != comparison["pr"]["fingerprint"]
     assert modified[0]["changeKinds"] == ["FILTER_CHANGED"]
     assert modified[0]["unsafe"] is False
+    assert modified[0]["impactStatus"] == "COMPILED"
+    assert "is distinct from" in (modified[0].get("candidateSql") or "").lower()
     assert comparison["narrowFrontierSafe"] is True
 
 
@@ -165,8 +167,10 @@ def test_compiled_sql_falls_back_to_compiled_dir(tmp_path: Path) -> None:
         base,
         pr,
         pr_compiled_root=tmp_path / "compiled",
+        entity_key="customer_id",
     ).to_dict()
     assert comparison["modified"][0]["uniqueId"] == "model.jaffle_shop.stg_orders"
+    assert comparison["modified"][0]["impactStatus"] == "COMPILED"
 
 
 def test_alias_only_sql_is_not_modified() -> None:
@@ -200,9 +204,11 @@ def test_grouping_change_is_unsafe() -> None:
             sql="select customer_id, status, count(*) from orders group by customer_id, status",
         )
     )
-    comparison = compare_manifests(base, pr).to_dict()
+    comparison = compare_manifests(base, pr, entity_key="customer_id").to_dict()
     assert comparison["modified"][0]["changeKinds"] == ["EXPRESSION_CHANGED", "GROUPING_CHANGED"]
     assert comparison["modified"][0]["unsafe"] is True
+    assert comparison["modified"][0]["impactStatus"] == "FULL_REBUILD_REQUIRED"
+    assert comparison["fullRebuildRequired"] is True
     assert comparison["narrowFrontierSafe"] is False
     dumped = str(comparison)
     assert "affectedEntities" not in dumped

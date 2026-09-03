@@ -410,4 +410,6 @@ def narrow_frontier_safe(comparison: dict[str, Any] | None) -> bool:
         kinds = row.get("changeKinds") or []
         if UNSUPPORTED in kinds or any(kind in UNSAFE_KINDS for kind in kinds):
             return False
+        if row.get("impactStatus") == "FULL_REBUILD_REQUIRED":
+            return False
     return True

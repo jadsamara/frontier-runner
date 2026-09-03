@@ -4,13 +4,17 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from frontier.dbt_artifacts import DbtNode, Manifest
 from frontier.sql_fingerprint import sql_dialect, sql_fingerprint
 from frontier.snowflake_sql import (
     classify_sql_change,
     narrow_frontier_safe,
+)
+from frontier.impact import (
+    FULL_REBUILD_REQUIRED,
+    compile_impact_query,
 )
 
 
@@ -69,6 +73,7 @@ def _model_payload(
     change_kinds: list[str] | None = None,
     unsafe: bool | None = None,
     unsupported_reasons: list[str] | None = None,
+    impact: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "uniqueId": unique_id,
@@ -83,6 +88,8 @@ def _model_payload(
         payload["unsafe"] = unsafe
     if unsupported_reasons:
         payload["unsupportedReasons"] = unsupported_reasons
+    if impact:
+        payload.update(impact)
     return payload
 
 
@@ -102,6 +109,8 @@ def compare_manifests(
     pr_compiled_root: Path | None = None,
     base_commit_sha: str | None = None,
     pr_commit_sha: str | None = None,
+    entity_key: str | None = None,
+    confirmed_keys: Iterable[str] | None = None,
 ) -> SqlComparison:
     dialect = sql_dialect(pr.adapter_type or base.adapter_type)
     base_models = base.models()
@@ -126,6 +135,11 @@ def compare_manifests(
     added: list[dict[str, Any]] = []
     removed: list[dict[str, Any]] = []
     modified: list[dict[str, Any]] = []
+    added_removed_impact = {
+        "impactStatus": FULL_REBUILD_REQUIRED,
+        "candidateSetState": "analysis_failed",
+        "impactReasons": ["model added or removed"],
+    }
 
     for unique_id in sorted(pr_models):
         node = pr_models[unique_id]
@@ -137,6 +151,7 @@ def compare_manifests(
                     base_fingerprint=None,
                     pr_fingerprint=pr_prints[unique_id],
                     downstream=_downstream_payload(pr, unique_id),
+                    impact=added_removed_impact,
                 )
             )
             continue
@@ -147,6 +162,13 @@ def compare_manifests(
         classification = classify_sql_change(base_sql, pr_sql)
         if not classification.kinds:
             continue
+        impact = compile_impact_query(
+            base_sql,
+            pr_sql,
+            entity_key=entity_key or "",
+            confirmed_keys=confirmed_keys or (),
+            classification=classification,
+        )
         modified.append(
             _model_payload(
                 unique_id=unique_id,
@@ -157,6 +179,7 @@ def compare_manifests(
                 change_kinds=list(classification.kinds),
                 unsafe=classification.unsafe,
                 unsupported_reasons=list(classification.unsupported_reasons) or None,
+                impact=impact.to_payload(include_sql=True),
             )
         )
 
@@ -171,6 +194,7 @@ def compare_manifests(
                 base_fingerprint=base_prints[unique_id],
                 pr_fingerprint=None,
                 downstream=_downstream_payload(base, unique_id),
+                impact=added_removed_impact,
             )
         )
 
@@ -187,6 +211,10 @@ def compare_manifests(
     if pr_commit_sha:
         pr_side["commitSha"] = pr_commit_sha
 
+    full_rebuild = any(
+        row.get("impactStatus") == FULL_REBUILD_REQUIRED
+        for row in (*added, *removed, *modified)
+    )
     payload = {
         "base": base_side,
         "pr": pr_side,
@@ -194,6 +222,7 @@ def compare_manifests(
         "removed": removed,
         "modified": modified,
         "narrowFrontierSafe": narrow_frontier_safe({"modified": modified}),
+        "fullRebuildRequired": full_rebuild,
     }
     return SqlComparison(payload)
 
@@ -229,6 +258,11 @@ def format_compare_report(comparison: dict[str, Any]) -> str:
                 lines.append(f"    change kinds: {', '.join(kinds)}")
             if row.get("unsafe"):
                 lines.append("    unsafe: narrow frontier is not allowed")
+            impact_status = row.get("impactStatus")
+            if impact_status:
+                lines.append(f"    impact: {impact_status}")
+            if row.get("candidateSql"):
+                lines.append(f"    candidate sql: {row['candidateSql']}")
 
     section("Added", comparison.get("added") or [])
     section("Removed", comparison.get("removed") or [])
@@ -241,4 +275,21 @@ def format_compare_report(comparison: dict[str, Any]) -> str:
                 f"Narrow frontier safe: {'yes' if safe else 'no'}",
             ]
         )
+    if comparison.get("fullRebuildRequired"):
+        lines.append("Full rebuild required: yes")
     return "\n".join(lines)
+
+
+_INGEST_STRIP_KEYS = ("candidateSql", "parameterizedSql", "parameters")
+
+
+def comparison_for_ingest(comparison: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Drop generated SQL from the SaaS payload. Status and fingerprints remain."""
+    if not comparison:
+        return None
+    copied = json.loads(json.dumps(comparison))
+    for group in ("added", "removed", "modified"):
+        for row in copied.get(group) or []:
+            for key in _INGEST_STRIP_KEYS:
+                row.pop(key, None)
+    return copied

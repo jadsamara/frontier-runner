@@ -505,6 +505,24 @@ def test_compare_cli_classifies_filter_and_removed(tmp_path: Path, capsys) -> No
     base_path = tmp_path / "base-manifest.json"
     pr_path = tmp_path / "pr-manifest.json"
     out_path = tmp_path / "frontier-compare.json"
+    (tmp_path / "frontier.yml").write_text(
+        "\n".join(
+            [
+                "project: jaffle_shop",
+                "environment: dev",
+                "model:",
+                "  name: customer_summary",
+                "  entity: customer",
+                "  key: customer_id",
+                "  grain: one_row_per_customer",
+                "relations:",
+                "  stg_orders:",
+                "    change_key: order_id",
+                "    route: direct",
+                "",
+            ]
+        )
+    )
     base_sql = "select id as order_id from orders where status = 'complete'"
     pr_sql = "select id as order_id from orders where status = 'returned'"
     base_path.write_text(json.dumps(_mini_manifest(orders_sql=base_sql, include_legacy=True)))
@@ -512,6 +530,8 @@ def test_compare_cli_classifies_filter_and_removed(tmp_path: Path, capsys) -> No
     code = main(
         [
             "compare",
+            "--project-dir",
+            str(tmp_path),
             "--base-manifest",
             str(base_path),
             "--pr-manifest",
@@ -532,10 +552,15 @@ def test_compare_cli_classifies_filter_and_removed(tmp_path: Path, capsys) -> No
     assert comparison["modified"][0]["name"] == "stg_orders"
     assert comparison["modified"][0]["changeKinds"] == ["FILTER_CHANGED"]
     assert comparison["modified"][0]["unsafe"] is False
+    assert comparison["modified"][0]["impactStatus"] == "COMPILED"
+    assert "is distinct from" in (comparison["modified"][0].get("candidateSql") or "").lower()
     assert comparison["narrowFrontierSafe"] is True
     assert comparison["removed"][0]["name"] == "stg_legacy"
+    assert comparison["removed"][0]["impactStatus"] == "FULL_REBUILD_REQUIRED"
+    assert comparison["fullRebuildRequired"] is True
     assert "affectedEntities" not in comparison
     assert "FILTER_CHANGED" in out
+    assert "COMPILED" in out
     assert "Narrow frontier safe: yes" in out
 
 

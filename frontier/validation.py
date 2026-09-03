@@ -147,11 +147,14 @@ def sql_change_narrow_frontier_result(
         kinds = [str(kind) for kind in (row.get("changeKinds") or [])]
         if not (
             row.get("unsafe")
+            or row.get("impactStatus") == "FULL_REBUILD_REQUIRED"
             or any(kind in UNSAFE_KINDS or kind == UNSUPPORTED for kind in kinds)
         ):
             continue
         name = str(row.get("name") or row.get("uniqueId") or "model")
         extra = ", ".join(kinds) if kinds else "unsafe SQL change"
+        if row.get("impactStatus") == "FULL_REBUILD_REQUIRED":
+            extra = f"{extra}; FULL_REBUILD_REQUIRED".strip("; ")
         reasons = [str(reason) for reason in (row.get("unsupportedReasons") or [])]
         if reasons:
             extra = f"{extra} ({'; '.join(reasons)})"

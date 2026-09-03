@@ -108,6 +108,17 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
             lines.append(f"SQL change kinds: {', '.join(kinds)}")
         if comparison.get("narrowFrontierSafe") is False:
             lines.append("Narrow frontier: not allowed")
+        if comparison.get("fullRebuildRequired"):
+            lines.append("Impact: full rebuild required")
+        statuses = list(
+            dict.fromkeys(
+                str(row.get("impactStatus"))
+                for row in modified
+                if row.get("impactStatus")
+            )
+        )
+        if statuses:
+            lines.append(f"Impact status: {', '.join(statuses)}")
     failed = _failed_checks(validations)
     if failed:
         lines.extend(["", "Failed checks:", *failed])

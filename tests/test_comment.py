@@ -112,6 +112,7 @@ def test_comment_includes_artifact_fingerprints() -> None:
                     "name": "stg_orders",
                     "changeKinds": ["FILTER_CHANGED"],
                     "unsafe": False,
+                    "impactStatus": "COMPILED",
                 }
             ],
             "narrowFrontierSafe": True,
@@ -120,6 +121,7 @@ def test_comment_includes_artifact_fingerprints() -> None:
     body = format_pr_comment(payload, run_url="https://frontier.example/runs/1")
     assert "SQL models changed: 1 modified, 0 added, 0 removed" in body
     assert "SQL change kinds: FILTER_CHANGED" in body
+    assert "Impact status: COMPILED" in body
     assert "Narrow frontier: not allowed" not in body
     assert "Base artifact: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in body
     assert "PR artifact: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" in body
