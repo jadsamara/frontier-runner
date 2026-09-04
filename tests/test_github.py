@@ -111,6 +111,8 @@ def test_reference_customer_workflow_uses_prove_and_pinned_runner() -> None:
     assert "--base-manifest" in text
     assert "target-base" in text
     assert "dbt compile" in text
+    assert "target-base/compiled" in text
+    assert "base-branch dbt compile failed" in text
     assert "FRONTIER_BASE_SHA" in text
     assert "frontier upload" in text
     assert "frontier record-failure" in text

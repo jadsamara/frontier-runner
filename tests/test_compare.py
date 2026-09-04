@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from frontier.compare import compare_manifests, compiled_sql_for
+from frontier.compare import (
+    compare_manifests,
+    compiled_sql_for,
+    compiled_sql_pair_for_sql_change,
+)
 from frontier.dbt_artifacts import DbtNode, Manifest
 from frontier.sql_fingerprint import sql_fingerprint
 
@@ -253,4 +257,49 @@ def test_cte_filter_change_compiles_for_narrow_frontier() -> None:
     assert "is distinct from" in (modified[0].get("candidateSql") or "").lower()
     assert comparison["narrowFrontierSafe"] is True
     assert comparison["fullRebuildRequired"] is False
+
+
+def test_empty_base_sql_is_rebuild_not_added_filter() -> None:
+    base = _manifest(_node("int_customer_orders", sql=""))
+    pr = _manifest(
+        _node(
+            "int_customer_orders",
+            sql="select customer_id from stg_orders where order_status in ('F', 'O')",
+        )
+    )
+    comparison = compare_manifests(base, pr, entity_key="customer_id").to_dict()
+    modified = comparison["modified"][0]
+    assert modified["changeKinds"] == ["UNSUPPORTED"]
+    assert "empty SQL" in (modified.get("unsupportedReasons") or [])
+    assert modified["impactStatus"] == "FULL_REBUILD_REQUIRED"
+    assert comparison["fullRebuildRequired"] is True
+    assert comparison["narrowFrontierSafe"] is False
+
+
+def test_compiled_sql_pair_prefers_changed_production_model() -> None:
+    mart_sql = "select customer_id from int_customer_orders"
+    before = "select customer_id from stg_orders where order_status = 'F'"
+    after = "select customer_id from stg_orders where order_status in ('F', 'O')"
+    base = _manifest(
+        _node("customer_summary", sql=mart_sql),
+        _node("int_customer_orders", sql=before),
+        _node("frontier_customer_orders_target", sql=before),
+    )
+    pr = _manifest(
+        _node("customer_summary", sql=mart_sql),
+        _node("int_customer_orders", sql=after),
+        _node("frontier_customer_orders_target", sql=after),
+    )
+    pair = compiled_sql_pair_for_sql_change(
+        target_name="customer_summary",
+        pr_manifest=pr,
+        base_manifest=base,
+        sql_comparison={
+            "modified": [
+                {"name": "frontier_customer_orders_target"},
+                {"name": "int_customer_orders"},
+            ]
+        },
+    )
+    assert pair == (before, after)
 

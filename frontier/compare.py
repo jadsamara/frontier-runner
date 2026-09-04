@@ -6,16 +6,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from frontier.config import ConfigError
 from frontier.dbt_artifacts import DbtNode, Manifest
+from frontier.execute import is_sql_change_impact_model
+from frontier.impact import (
+    FULL_REBUILD_REQUIRED,
+    compile_impact_query,
+)
 from frontier.sql_fingerprint import sql_dialect, sql_fingerprint
 from frontier.snowflake_sql import (
     classify_sql_change,
     describe_sql_change,
     narrow_frontier_safe,
-)
-from frontier.impact import (
-    FULL_REBUILD_REQUIRED,
-    compile_impact_query,
 )
 
 
@@ -35,6 +37,59 @@ def compiled_sql_for(node: DbtNode, compiled_root: Path | None = None) -> str | 
             if text.strip():
                 return text
     return None
+
+
+def compiled_sql_for_name(
+    manifest: Manifest | None,
+    name: str,
+    compiled_root: Path | None = None,
+) -> str | None:
+    if manifest is None or not name:
+        return None
+    try:
+        node = manifest.find_model(name)
+    except ConfigError:
+        return None
+    return compiled_sql_for(node, compiled_root)
+
+
+def compiled_sql_pair_for_sql_change(
+    *,
+    target_name: str,
+    pr_manifest: Manifest,
+    base_manifest: Manifest | None,
+    pr_compiled_root: Path | None = None,
+    base_compiled_root: Path | None = None,
+    sql_comparison: dict[str, Any] | None = None,
+) -> tuple[str | None, str | None]:
+    """Compiled SQL used to confirm and prove a SQL change.
+
+    The configured mart often only `select`s from a changed intermediate
+    model. Proving that wrapper against the already-built PR relation
+    makes before and after identical, so confirmed=0 and every candidate
+    looks extra. Prefer the production model whose compiled SQL actually
+    changed.
+    """
+    names: list[str] = []
+    for row in (sql_comparison or {}).get("modified") or []:
+        name = str(row.get("name") or "")
+        if is_sql_change_impact_model(name) and name not in names:
+            names.append(name)
+    if target_name and target_name not in names:
+        names.append(target_name)
+
+    fallback: tuple[str | None, str | None] = (None, None)
+    for name in names:
+        after = compiled_sql_for_name(pr_manifest, name, pr_compiled_root)
+        before = compiled_sql_for_name(base_manifest, name, base_compiled_root)
+        if before and after:
+            if before.strip() != after.strip():
+                return before, after
+            if fallback == (None, None):
+                fallback = (before, after)
+        elif fallback == (None, None):
+            fallback = (before, after)
+    return fallback
 
 
 def model_sql_fingerprint(

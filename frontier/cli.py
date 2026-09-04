@@ -21,7 +21,12 @@ from frontier.config import (
     write_init_config,
 )
 from frontier.artifacts import require_current_artifacts
-from frontier.compare import compare_manifests, format_compare_report, comparison_for_ingest, compiled_sql_for
+from frontier.compare import (
+    compare_manifests,
+    comparison_for_ingest,
+    compiled_sql_pair_for_sql_change,
+    format_compare_report,
+)
 from frontier.github import base_commit_sha, default_external_run_id, env_flag, github_source
 from frontier.dbt_artifacts import (
     format_inspect_report,
@@ -197,12 +202,30 @@ def _wants_blocking(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "blocking", False)) or env_flag("FRONTIER_BLOCKING")
 
 
-def _compiled_model_sql(manifest, name: str, compiled_root: Path | None) -> str | None:
-    try:
-        node = manifest.find_model(name)
-    except ConfigError:
-        return None
-    return compiled_sql_for(node, compiled_root)
+def _proof_sql_pair(
+    args: argparse.Namespace,
+    *,
+    config,
+    manifest,
+    project_dir: Path,
+    sql_comparison: dict[str, Any] | None,
+) -> tuple[str | None, str | None]:
+    pr_root = _compiled_root_for(_target_dir(project_dir) / "manifest.json")
+    base_manifest = None
+    base_root = None
+    base_path = getattr(args, "base_manifest", None)
+    if base_path:
+        resolved = Path(base_path).expanduser().resolve()
+        base_manifest = load_manifest(resolved)
+        base_root = _compiled_root_for(resolved)
+    return compiled_sql_pair_for_sql_change(
+        target_name=config.model.name,
+        pr_manifest=manifest,
+        base_manifest=base_manifest,
+        pr_compiled_root=pr_root,
+        base_compiled_root=base_root,
+        sql_comparison=sql_comparison,
+    )
 
 
 def _sql_change_present(comparison: dict[str, Any] | None) -> bool:
@@ -379,19 +402,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         print(f"{warehouse.warehouse_type}: " + json.dumps(describe_adapter(warehouse)))
 
-    base_sql = None
-    after_sql = compiled_sql_for(
-        manifest.find_model(config.model.name),
-        _compiled_root_for(_target_dir(project_dir) / "manifest.json"),
+    base_sql, after_sql = _proof_sql_pair(
+        args,
+        config=config,
+        manifest=manifest,
+        project_dir=project_dir,
+        sql_comparison=sql_comparison,
     )
-    base_path = getattr(args, "base_manifest", None)
-    if base_path:
-        base_manifest = load_manifest(Path(base_path).expanduser().resolve())
-        base_sql = _compiled_model_sql(
-            base_manifest,
-            config.model.name,
-            _compiled_root_for(Path(base_path).expanduser().resolve()),
-        )
 
     try:
         sql_change_queries, sql_change_required = _sql_change_queries(
@@ -607,19 +624,13 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 customer_id=deleted_customer_id,
             )
 
-    base_sql = None
-    after_sql = compiled_sql_for(
-        manifest.find_model(config.model.name),
-        _compiled_root_for(_target_dir(project_dir) / "manifest.json"),
+    base_sql, after_sql = _proof_sql_pair(
+        args,
+        config=config,
+        manifest=manifest,
+        project_dir=project_dir,
+        sql_comparison=sql_comparison,
     )
-    base_path = getattr(args, "base_manifest", None)
-    if base_path:
-        base_manifest = load_manifest(Path(base_path).expanduser().resolve())
-        base_sql = _compiled_model_sql(
-            base_manifest,
-            config.model.name,
-            _compiled_root_for(Path(base_path).expanduser().resolve()),
-        )
 
     isolated = None
     try:
