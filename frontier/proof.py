@@ -20,6 +20,7 @@ class SqlChangeProof:
     confirmed_frontier_count: int
     before_entity_count: int
     after_entity_count: int
+    changed_source_row_count: int
     missing_frontier_entities: int
     extra_frontier_entities: int
     mismatched_final_rows: int
@@ -220,7 +221,7 @@ def recorded_sql_change_affected(
 
 
 def recorded_sql_change_proof(*, test_duration_ms: int = 1) -> SqlChangeProof:
-    """Recorded TPCH filter-change demonstration: F → IN (F, O)."""
+    """Fixture SQL-change demonstration: F → IN (F, O). Not live warehouse evidence."""
     return SqlChangeProof(
         full_rows_recomputed=150_000,
         frontier_rows_recomputed=12,
@@ -230,6 +231,7 @@ def recorded_sql_change_proof(*, test_duration_ms: int = 1) -> SqlChangeProof:
         confirmed_frontier_count=8,
         before_entity_count=150_000,
         after_entity_count=150_000,
+        changed_source_row_count=12,
         missing_frontier_entities=0,
         extra_frontier_entities=4,
         mismatched_final_rows=0,
@@ -309,11 +311,16 @@ def measure_sql_change_proof(
 
     before_count = _count_subquery(warehouse, before_sql, "before_entity_count")
     after_count = _count_subquery(warehouse, after_sql, "after_entity_count")
-    source_population = (
-        _count_subquery(warehouse, impact_sql, "source_population_count")
-        if impact_sql
-        else (candidate_count or 0)
-    )
+    from frontier.impact import source_row_count_sql
+
+    source_population = 0
+    changed_source = 0
+    if impact_sql:
+        changed_source = _count(warehouse, source_row_count_sql(impact_sql, dialect=dialect))
+        source_population = changed_source
+    elif candidate_count is not None:
+        changed_source = candidate_count
+        source_population = candidate_count
     started = time.perf_counter()
     mismatched = _count(
         warehouse,
@@ -352,6 +359,7 @@ def measure_sql_change_proof(
         confirmed_frontier_count=confirmed,
         before_entity_count=before_count,
         after_entity_count=after_count,
+        changed_source_row_count=changed_source,
         missing_frontier_entities=missing,
         extra_frontier_entities=extra,
         mismatched_final_rows=mismatched,

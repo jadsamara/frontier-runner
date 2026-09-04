@@ -98,13 +98,17 @@ def test_comment_explains_sql_change_without_entity_ids() -> None:
         {
             **PASSED_PAYLOAD,
             "changeEvents": [],
+            "runMode": "fixture",
+            "candidateSetOrigin": "sql_change",
             "metrics": {
                 **PASSED_PAYLOAD["metrics"],
-                "frontierEntityCount": 8,
-                "percentRowsAvoided": 99.995,
+                "frontierEntityCount": 12,
+                "percentRowsAvoided": 99.992,
                 "candidateFrontierCount": 12,
                 "confirmedFrontierCount": 8,
                 "sourcePopulationCount": 12,
+                "changedSourceRowCount": 12,
+                "eventCandidateCount": 0,
                 "beforeEntityCount": 150_000,
                 "afterEntityCount": 150_000,
                 "mismatchedFinalRows": 0,
@@ -135,9 +139,12 @@ def test_comment_explains_sql_change_without_entity_ids() -> None:
         },
         run_url="https://frontier.example/runs/11111111-1111-4111-8111-111111111111",
     )
-    assert "SQL operator changed: FILTER_CHANGED: ORDER_STATUS = 'F' → ORDER_STATUS IN ('F', 'O')" in body
-    assert "Source population matching the changed condition: 12" in body
-    assert "Candidate-affected customers: 12" in body
+    assert "Demo fixture — not executed against a live warehouse" in body
+    assert "Candidate set origin: sql_change" in body
+    assert "SQL operator: FILTER_CHANGED" in body
+    assert "Changed source rows: 12" in body
+    assert "Candidate customers: 12" in body
+    assert "Event-derived candidates: 0" in body
     assert "Customer summaries that actually differ: 8" in body
     assert "Row count: 150,000 → 150,000" in body
     assert "Targeted repair: safe" in body
@@ -146,6 +153,55 @@ def test_comment_explains_sql_change_without_entity_ids() -> None:
     assert "370" not in body
     assert "36901" not in body
     assert "event_001" not in body
+
+
+def test_comment_reports_live_sql_change_warehouse_counts() -> None:
+    body = format_pr_comment(
+        {
+            **PASSED_PAYLOAD,
+            "changeEvents": [],
+            "runMode": "live",
+            "candidateSetOrigin": "sql_change",
+            "metrics": {
+                **PASSED_PAYLOAD["metrics"],
+                "frontierEntityCount": 99_621,
+                "percentRowsAvoided": 33.586,
+                "candidateFrontierCount": 99_621,
+                "confirmedFrontierCount": 99_621,
+                "changedSourceRowCount": 732_044,
+                "sourcePopulationCount": 732_044,
+                "eventCandidateCount": 0,
+                "beforeEntityCount": 150_000,
+                "afterEntityCount": 150_000,
+                "mismatchedFinalRows": 0,
+                "missingFrontierEntities": 0,
+            },
+            "sqlComparison": {
+                "base": {"fingerprint": "a" * 64, "modelCount": 4},
+                "pr": {"fingerprint": "b" * 64, "modelCount": 4},
+                "added": [],
+                "removed": [],
+                "modified": [
+                    {
+                        "name": "int_customer_orders",
+                        "changeKinds": ["FILTER_CHANGED"],
+                        "impactStatus": "COMPILED",
+                    }
+                ],
+                "narrowFrontierSafe": True,
+                "fullRebuildRequired": False,
+            },
+        },
+        run_url="https://frontier.example/runs/11111111-1111-4111-8111-111111111111",
+    )
+    assert "Live warehouse assessment" in body
+    assert "Demo fixture" not in body
+    assert "SQL operator: FILTER_CHANGED" in body
+    assert "Changed source rows: 732,044" in body
+    assert "Candidate customers: 99,621" in body
+    assert "Event-derived candidates: 0" in body
+    assert "Rows avoided: 33.586%" in body
+    assert "12" not in body
 
 
 def test_comment_reports_origin_counts_without_entity_ids() -> None:

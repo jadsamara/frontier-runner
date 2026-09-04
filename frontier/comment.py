@@ -77,16 +77,14 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
             for kind in (row.get("changeKinds") or [])
         )
     )
-    summaries = [
-        str(row.get("changeSummary"))
-        for row in modified
-        if row.get("changeSummary")
-    ]
     candidate_count = metrics.get("candidateFrontierCount")
     if candidate_count is None:
         candidate_count = metrics.get("unionCandidateCount")
     confirmed_count = metrics.get("confirmedFrontierCount")
-    source_population = metrics.get("sourcePopulationCount")
+    changed_source = metrics.get("changedSourceRowCount")
+    if changed_source is None:
+        changed_source = metrics.get("sourcePopulationCount")
+    event_candidates = metrics.get("eventCandidateCount")
     before_count = metrics.get("beforeEntityCount")
     after_count = metrics.get("afterEntityCount")
     full_rebuild = bool(comparison.get("fullRebuildRequired") or comparison.get("narrowFrontierSafe") is False)
@@ -95,6 +93,8 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
         and int(metrics.get("missingFrontierEntities") or 0) == 0
         and not full_rebuild
     )
+    run_mode = payload.get("runMode")
+    origin = payload.get("candidateSetOrigin")
 
     lines = [
         COMMENT_MARKER,
@@ -102,17 +102,22 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
         "",
         f"Model: {model_name}",
     ]
-    if summaries or sql_kinds:
-        lines.append(f"SQL operator changed: {summaries[0] if summaries else ', '.join(sql_kinds)}")
-        if source_population is not None:
-            lines.append(
-                f"Source population matching the changed condition: {_format_count(int(source_population))}"
-            )
+    if run_mode == "fixture":
+        lines.append("Demo fixture — not executed against a live warehouse")
+    elif run_mode == "live":
+        lines.append("Live warehouse assessment")
+    if origin:
+        lines.append(f"Candidate set origin: {origin}")
+    if sql_kinds or modified:
+        operator = sql_kinds[0] if sql_kinds else "SQL change"
+        lines.append(f"SQL operator: {operator}")
+        if changed_source is not None:
+            lines.append(f"Changed source rows: {_format_count(int(changed_source))}")
         if candidate_count is not None:
-            lines.append(
-                f"Candidate-affected {_pluralize(entity_type, int(candidate_count))}: "
-                f"{_format_count(int(candidate_count))}"
-            )
+            lines.append(f"Candidate customers: {_format_count(int(candidate_count))}")
+        lines.append(
+            f"Event-derived candidates: {_format_count(int(event_candidates or 0))}"
+        )
         if confirmed_count is not None:
             lines.append(
                 f"Customer summaries that actually differ: {_format_count(int(confirmed_count))}"

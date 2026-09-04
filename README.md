@@ -55,7 +55,7 @@ event-only frontier. Customer CI must call `prove`, not `run`.
 
 `frontier upload` posts `target/frontier-run.json` to `POST /api/v1/runs`. It retries HTTP 429/5xx and network errors, and honors `Retry-After`. It uses `FRONTIER_API_KEY` if that variable is set, otherwise `FRONTIER_DEMO_API_KEY`. A leftover placeholder in `FRONTIER_API_KEY` will win over the demo key — `unset FRONTIER_API_KEY` if you intend to use the local demo key. Hashed uploads set `entityIdsHashed: true`.
 
-In GitHub Actions, assessments use `{project}-{GITHUB_SHA}` as `externalRunId` and record repository, branch, commit, and PR number. After a successful upload the runner upserts one pull-request comment (aggregates only, plus a dashboard `/runs/<id>` link). `GITHUB_TOKEN` stays in the customer job. `FRONTIER_DRY_RUN=true` is only for the SaaS fixture self-test. `frontier upload --blocking` (or `FRONTIER_BLOCKING=true`) uploads and comments first, then exits 1 if the assessment failed.
+In GitHub Actions, assessments use `{project}-{GITHUB_SHA}` as `externalRunId` and record repository, branch, commit, and PR number. After a successful upload the runner upserts one pull-request comment (aggregates only, plus a dashboard `/runs/<id>` link). `GITHUB_TOKEN` stays in the customer job. `FRONTIER_DRY_RUN=true` is only for the SaaS fixture self-test and is rejected by `frontier prove` in GitHub Actions. Customer CI must execute against the live warehouse (`DATA_AGENT_DEV.DBT_CI`). Uploaded assessments set `runMode` to `live` or `fixture`. `frontier upload --blocking` (or `FRONTIER_BLOCKING=true`) uploads and comments first, then exits 1 if the assessment failed.
 
 ## Releases
 

@@ -8,6 +8,7 @@ from frontier.impact import (
     FULL_REBUILD_REQUIRED,
     compile_impact_query,
     evaluate_impact_query,
+    source_row_count_sql,
 )
 from frontier.warehouse import FakeWarehouse
 
@@ -28,6 +29,10 @@ def test_filter_change_compiles_is_distinct_from() -> None:
     assert "select distinct" in sql
     assert "customer_id" in sql
     assert "is distinct from" in sql
+    count_sql = source_row_count_sql(result.candidate_sql).lower()
+    assert "changed_source_row_count" in count_sql
+    assert "select distinct" not in count_sql
+    assert "count(*)" in count_sql
     assert result.candidate_set_state == CANDIDATE_SET_NOT_EVALUATED
     assert result.candidates is None
     assert result.parameters

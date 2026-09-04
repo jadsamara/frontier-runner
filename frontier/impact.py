@@ -880,6 +880,32 @@ def compile_impact_query(
     )
 
 
+def source_row_count_sql(candidate_sql: str, *, dialect: str = DIALECT) -> str:
+    """Count matching source rows, not distinct entity keys."""
+    parsed = sqlglot.parse_one(candidate_sql, dialect=dialect)
+    if parsed is None:
+        raise SqlglotError("impact SQL could not be parsed")
+    tree = parsed.copy()
+
+    def strip_distinct(node: exp.Expression) -> None:
+        if isinstance(node, exp.Select):
+            node.set("distinct", None)
+            node.set("expressions", [exp.Star()])
+        if isinstance(node, exp.Union):
+            node.set("distinct", False)
+            if node.this is not None:
+                strip_distinct(node.this)
+            if node.expression is not None:
+                strip_distinct(node.expression)
+
+    strip_distinct(tree)
+    inner = _render(tree)
+    return (
+        "select count(*) as changed_source_row_count "
+        f"from ({inner}) as frontier_changed_source_rows"
+    )
+
+
 def evaluate_impact_query(
     compiled: ImpactCompileResult,
     warehouse: WarehouseAdapter,

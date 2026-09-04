@@ -174,6 +174,25 @@ def _use_dry_run(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "dry_run", False)) or env_flag("FRONTIER_DRY_RUN")
 
 
+def _run_mode(args: argparse.Namespace) -> str:
+    return "fixture" if _use_dry_run(args) else "live"
+
+
+def _candidate_set_origin(
+    change_events: list[Any],
+    sql_comparison: dict[str, Any] | None,
+) -> str | None:
+    has_sql = _sql_change_present(sql_comparison)
+    has_events = bool(change_events)
+    if has_sql and has_events:
+        return "union"
+    if has_sql:
+        return "sql_change"
+    if has_events:
+        return "event"
+    return None
+
+
 def _wants_blocking(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "blocking", False)) or env_flag("FRONTIER_BLOCKING")
 
@@ -314,6 +333,11 @@ def _emit_run(
         entity_ids_hashed=not send_raw_ids,
         warehouse_type=normalize_warehouse_type(manifest.adapter_type),
         sql_comparison=comparison_for_ingest(sql_comparison),
+        run_mode=_run_mode(args),
+        candidate_set_origin=_candidate_set_origin(
+            details["changeEvents"],
+            sql_comparison,
+        ),
     )
     output = Path(args.output) if args.output else _target_dir(_project_dir(args)) / RUN_FILE_NAME
     _write_run_file(output, payload)
@@ -507,6 +531,8 @@ def cmd_record_failure(args: argparse.Namespace) -> int:
         warehouse_type=normalize_warehouse_type(
             os.environ.get("FRONTIER_WAREHOUSE_TYPE") or "snowflake",
         ),
+        run_mode="live",
+        candidate_set_origin="event",
     )
     output = Path(args.output) if args.output else _target_dir(project_dir) / RUN_FILE_NAME
     _write_run_file(output, payload)
@@ -529,6 +555,11 @@ def cmd_prove(args: argparse.Namespace) -> int:
     sql_change_demo = _sql_change_present(sql_comparison)
 
     dry_run = _use_dry_run(args)
+    if dry_run and os.environ.get("GITHUB_ACTIONS") == "true":
+        raise ConfigError(
+            "FRONTIER_DRY_RUN is not allowed in GitHub Actions prove. "
+            "Customer CI must execute against DATA_AGENT_DEV.DBT_CI."
+        )
     warehouse: WarehouseAdapter
     run_id = args.run_id or default_external_run_id(config.project)
     persist = not dry_run
@@ -537,7 +568,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
     if dry_run:
         warehouse = FakeWarehouse(
             {
-                "full_entity_count": [(150_000, 3 if not sql_change_demo else 8)],
+                "full_entity_count": [(150_000, 3 if not sql_change_demo else 12)],
                 "order_id in (1)": [(36901,)],
                 "order_id in (5)": [(781,)],
                 "difference_count": [(0,)],
@@ -639,11 +670,13 @@ def cmd_prove(args: argparse.Namespace) -> int:
                     entity_type=config.model.entity,
                     entity_key=config.model.key,
                 )
-                result.frontier_entity_count = sql_proof.confirmed_frontier_count
-                result.percent_rows_avoided = percent_rows_avoided(
-                    result.full_entity_count,
-                    sql_proof.confirmed_frontier_count,
-                )
+            else:
+                result.affected_entities = []
+            result.frontier_entity_count = sql_proof.candidate_frontier_count
+            result.percent_rows_avoided = percent_rows_avoided(
+                result.full_entity_count,
+                sql_proof.candidate_frontier_count,
+            )
         elif proof is None:
             proof = measure_mutation_proof(
                 config,
@@ -681,16 +714,18 @@ def cmd_prove(args: argparse.Namespace) -> int:
     if sql_proof is not None:
         extra_metrics.update(
             {
-                "frontierEntityCount": sql_proof.confirmed_frontier_count,
+                "frontierEntityCount": sql_proof.candidate_frontier_count,
                 "percentRowsAvoided": percent_rows_avoided(
                     sql_proof.full_rows_recomputed,
-                    sql_proof.confirmed_frontier_count,
+                    sql_proof.candidate_frontier_count,
                 ),
                 "candidateFrontierCount": sql_proof.candidate_frontier_count,
                 "confirmedFrontierCount": sql_proof.confirmed_frontier_count,
-                "sourcePopulationCount": sql_proof.source_population_count,
+                "sourcePopulationCount": sql_proof.changed_source_row_count,
+                "changedSourceRowCount": sql_proof.changed_source_row_count,
                 "beforeEntityCount": sql_proof.before_entity_count,
                 "afterEntityCount": sql_proof.after_entity_count,
+                "eventCandidateCount": result.event_candidate_count or 0,
             }
         )
     output = _emit_run(
@@ -707,9 +742,13 @@ def cmd_prove(args: argparse.Namespace) -> int:
     print(f"Rows avoided: {assessed.rows_avoided}")
     _print_origin_counts(result)
     if sql_proof is not None:
-        print(f"SQL operator: {((sql_comparison or {}).get('modified') or [{}])[0].get('changeSummary') or 'SQL change'}")
-        print(f"Source population: {sql_proof.source_population_count}")
-        print(f"Candidate-affected: {sql_proof.candidate_frontier_count}")
+        kinds = ((sql_comparison or {}).get("modified") or [{}])[0].get("changeKinds") or []
+        operator = kinds[0] if kinds else "SQL change"
+        print(f"Run mode: {'fixture' if dry_run else 'live'}")
+        print(f"SQL operator: {operator}")
+        print(f"Changed source rows: {sql_proof.changed_source_row_count}")
+        print(f"Candidate customers: {sql_proof.candidate_frontier_count}")
+        print(f"Event-derived candidates: {result.event_candidate_count or 0}")
         print(f"Confirmed changed summaries: {sql_proof.confirmed_frontier_count}")
         print(f"Row count: {sql_proof.before_entity_count} → {sql_proof.after_entity_count}")
         print(f"Targeted repair: {'safe' if sql_proof.targeted_repair_safe else 'not safe'}")
@@ -769,6 +808,15 @@ def cmd_upload(args: argparse.Namespace) -> int:
             f"Missing run file {run_file}. Run `frontier prove`, `frontier run`, or `frontier record-failure` first.",
         )
     payload = json.loads(run_file.read_text())
+    if (
+        payload.get("runMode") == "fixture"
+        and os.environ.get("GITHUB_ACTIONS") == "true"
+        and not env_flag("FRONTIER_DRY_RUN")
+    ):
+        raise ConfigError(
+            "Refusing to upload a fixture assessment from GitHub Actions. "
+            "Customer CI must not set FRONTIER_DRY_RUN; live prove must execute against the warehouse."
+        )
     if args.run_id:
         payload["externalRunId"] = args.run_id
     api_url = args.api_url or os.environ.get("FRONTIER_API_URL") or config.api_url
@@ -835,7 +883,7 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Use the recorded TPCH counts without a live warehouse",
+        help="Use the recorded fixture counts without a live warehouse",
     )
     _add_base_manifest(parser)
 

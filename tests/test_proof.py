@@ -125,6 +125,7 @@ def test_recorded_sql_change_proof_covers_reference() -> None:
     assert proof.candidate_frontier_count == 12
     assert proof.confirmed_frontier_count == 8
     assert proof.source_population_count == 12
+    assert proof.changed_source_row_count == 12
     assert proof.extra_frontier_entities == 4
     assert proof.missing_frontier_entities == 0
     assert proof.mismatched_final_rows == 0
@@ -147,7 +148,7 @@ def test_measure_sql_change_proof_with_fake_warehouse() -> None:
         {
             "before_entity_count": [(150_000,)],
             "after_entity_count": [(150_000,)],
-            "source_population_count": [(12,)],
+            "changed_source_row_count": [(12,)],
             "mismatched_final_rows": [(0,)],
             "frontier_rows_recomputed": [(12,)],
             "missing_frontier": [(0,)],
@@ -166,12 +167,44 @@ def test_measure_sql_change_proof_with_fake_warehouse() -> None:
     assert proof.candidate_frontier_count == 12
     assert proof.confirmed_frontier_count == 8
     assert proof.source_population_count == 12
+    assert proof.changed_source_row_count == 12
     assert proof.before_entity_count == 150_000
     assert proof.after_entity_count == 150_000
     assert proof.missing_frontier_entities == 0
     assert proof.extra_frontier_entities == 4
     assert proof.mismatched_final_rows == 0
     assert proof.targeted_repair_safe is True
+
+
+def test_measure_sql_change_proof_separates_source_rows_from_candidates() -> None:
+    config = load_frontier_config(FIXTURES / "frontier.yml")
+    warehouse = FakeWarehouse(
+        {
+            "before_entity_count": [(150_000,)],
+            "after_entity_count": [(150_000,)],
+            "changed_source_row_count": [(732_044,)],
+            "mismatched_final_rows": [(0,)],
+            "frontier_rows_recomputed": [(99_621,)],
+            "missing_frontier": [(0,)],
+            "extra_frontier": [(0,)],
+            "confirmed_frontier_count": [(99_621,)],
+        }
+    )
+    proof = measure_sql_change_proof(
+        config,
+        warehouse=warehouse,
+        before_sql="select customer_id, 1 as total_orders from orders where order_status = 'F'",
+        after_sql="select customer_id, 1 as total_orders from orders where order_status in ('F', 'O')",
+        affected_relation="DATA_AGENT_DEV.DBT_CI.FRONTIER_TEST_AFFECTED_KEYS",
+        impact_sql="select distinct customer_id from DATA_AGENT_DEV.DBT_CI.STG_ORDERS where order_status in ('O')",
+        candidate_count=99_621,
+        confirmed_count=99_621,
+    )
+    assert proof.changed_source_row_count == 732_044
+    assert proof.source_population_count == 732_044
+    assert proof.candidate_frontier_count == 99_621
+    assert proof.confirmed_frontier_count == 99_621
+    assert proof.full_rows_recomputed == 150_000
 
 
 def test_jaffle_shop_overlays_do_not_write_sample_data() -> None:

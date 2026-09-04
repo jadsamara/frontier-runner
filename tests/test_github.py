@@ -119,10 +119,13 @@ def test_reference_customer_workflow_uses_prove_and_pinned_runner() -> None:
     assert "frontier-runner[snowflake]==0.1.0" in text
     assert "pip install ./runner" not in text
     assert "FRONTIER_BLOCKING" in text
-    assert "FRONTIER_DRY_RUN" not in text
     assert "pull-requests: write" in text
     assert "github.token" in text
     generate = text.split("- name: Generate impact assessment", 1)[1]
+    assert "FRONTIER_DRY_RUN must not be set in customer CI" in generate
+    assert "FRONTIER_DRY_RUN:" not in generate
     assert "SNOWFLAKE_PASSWORD" not in generate
     assert "https://" in text
+    assert "DATA_AGENT_DEV" in text
+    assert "DBT_CI" in text
 

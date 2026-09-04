@@ -75,6 +75,8 @@ def build_ingest_payload(
     entity_ids_hashed: bool = False,
     warehouse_type: str = "snowflake",
     sql_comparison: dict[str, Any] | None = None,
+    run_mode: str | None = None,
+    candidate_set_origin: str | None = None,
 ) -> dict[str, Any]:
     payload = {
         "externalRunId": external_run_id,
@@ -104,6 +106,10 @@ def build_ingest_payload(
         payload["git"] = git
     if sql_comparison:
         payload["sqlComparison"] = sql_comparison
+    if run_mode:
+        payload["runMode"] = run_mode
+    if candidate_set_origin:
+        payload["candidateSetOrigin"] = candidate_set_origin
     assert_payload_has_no_secrets(payload)
     assert_no_raw_rows(payload)
     return payload

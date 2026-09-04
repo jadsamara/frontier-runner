@@ -29,6 +29,8 @@ def recorded_warehouse() -> FakeWarehouse:
 def test_percent_matches_verified_tpch() -> None:
     assert percent_rows_avoided(150_000, 3) == 99.998
     assert percent_rows_avoided(150_000, 8) == 99.995
+    assert percent_rows_avoided(150_000, 12) == 99.992
+    assert percent_rows_avoided(150_000, 99_621) == 33.586
 
 
 def test_change_events_csv_is_optional(tmp_path: Path) -> None:

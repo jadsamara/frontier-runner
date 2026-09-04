@@ -156,10 +156,10 @@ def test_prove_dry_run_sql_change_without_events(dbt_project: Path, monkeypatch,
     )
     captured = capsys.readouterr()
     assert code == 0
-    assert "SQL operator:" in captured.out
-    assert "FILTER_CHANGED" in captured.out
-    assert "Source population: 12" in captured.out
-    assert "Candidate-affected: 12" in captured.out
+    assert "SQL operator: FILTER_CHANGED" in captured.out
+    assert "Changed source rows: 12" in captured.out
+    assert "Candidate customers: 12" in captured.out
+    assert "Event-derived candidates: 0" in captured.out
     assert "Confirmed changed summaries: 8" in captured.out
     assert "Row count: 150000 → 150000" in captured.out or "Row count: 150,000 → 150,000" in captured.out
     assert "Targeted repair: safe" in captured.out
@@ -168,11 +168,15 @@ def test_prove_dry_run_sql_change_without_events(dbt_project: Path, monkeypatch,
     assert "frontier_affected_customers" not in captured.out
     payload = json.loads((dbt_project / "target" / "frontier-run.json").read_text())
     assert payload["changeEvents"] == []
-    assert payload["metrics"]["frontierEntityCount"] == 8
-    assert payload["metrics"]["percentRowsAvoided"] == 99.995
+    assert payload["runMode"] == "fixture"
+    assert payload["candidateSetOrigin"] == "sql_change"
+    assert payload["metrics"]["frontierEntityCount"] == 12
+    assert payload["metrics"]["percentRowsAvoided"] == 99.992
     assert payload["metrics"]["candidateFrontierCount"] == 12
     assert payload["metrics"]["confirmedFrontierCount"] == 8
     assert payload["metrics"]["sourcePopulationCount"] == 12
+    assert payload["metrics"]["changedSourceRowCount"] == 12
+    assert payload["metrics"]["eventCandidateCount"] == 0
     assert payload["sqlComparison"]["modified"][0]["name"] == "int_customer_orders"
     assert payload["sqlComparison"]["modified"][0]["changeKinds"] == ["FILTER_CHANGED"]
     assert "FILTER_CHANGED" in (payload["sqlComparison"]["modified"][0].get("changeSummary") or "")
@@ -378,6 +382,7 @@ def test_upload_upserts_pr_comment_in_github_actions(
     monkeypatch.setenv("FRONTIER_API_KEY", "frn_test_key_not_a_password")
     monkeypatch.setenv("FRONTIER_API_URL", "https://frontier.example")
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("FRONTIER_DRY_RUN", "true")
     monkeypatch.setenv("GITHUB_TOKEN", "ghs_must_not_appear")
     monkeypatch.setenv("GITHUB_REPOSITORY", "acme/jaffle_shop")
     monkeypatch.setenv("FRONTIER_PULL_REQUEST", "42")
@@ -663,11 +668,35 @@ def test_run_attaches_both_artifact_fingerprints(dbt_project: Path, monkeypatch)
     assert payload["sqlComparison"]["base"]["fingerprint"] == payload["sqlComparison"]["pr"]["fingerprint"]
     assert payload["sqlComparison"]["base"]["commitSha"] == "base1234deadbeef"
     assert payload["sqlComparison"]["pr"]["commitSha"] == "prsha1234deadbeef"
+    assert payload["runMode"] == "fixture"
     assert payload["sqlComparison"]["narrowFrontierSafe"] is True
     names = {item["testName"] for item in payload["validationResults"]}
     assert "assert_sql_change_allows_narrow_frontier" in names
     assert payload["status"] == "passed"
     assert len(payload["affectedEntities"]) == 3
     assert "password" not in json.dumps(payload)
+
+
+def test_prove_dry_run_is_rejected_in_github_actions(dbt_project: Path, monkeypatch, capsys) -> None:
+    sha = "abc1234deadbeef0123456789abcdef01234567"
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("FRONTIER_DRY_RUN", "true")
+    monkeypatch.setenv("GITHUB_SHA", sha)
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    base_path = _write_sql_change_manifests(dbt_project)
+    (dbt_project / "target" / "frontier-artifact-sha").write_text(sha + "\n")
+    code = main(
+        [
+            "prove",
+            "--project-dir",
+            str(dbt_project),
+            "--base-manifest",
+            str(base_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "FRONTIER_DRY_RUN is not allowed in GitHub Actions prove" in captured.err
+    assert not (dbt_project / "target" / "frontier-run.json").exists()
 
 
