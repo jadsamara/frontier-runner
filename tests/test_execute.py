@@ -108,6 +108,58 @@ def test_targeted_sql_pushes_join_into_sources() -> None:
         )
 
 
+def test_targeted_sql_qualifies_entity_key_on_mart_wrapper() -> None:
+    sql = generate_targeted_sql(
+        "select customer_id, total_orders from int_customer_orders",
+        entity_key="customer_id",
+        affected_relation="DATA_AGENT_DEV.DBT_CI.FRONTIER_RUN1_AFFECTED_KEYS",
+    )
+    lowered = sql.lower()
+    assert "frontier_keys" in lowered
+    assert "int_customer_orders.customer_id" in lowered
+    assert "select\n  customer_id" not in lowered
+    assert "select customer_id" not in lowered.replace("int_customer_orders.customer_id", "")
+
+
+def test_sql_change_impact_queries_skip_handwritten_frontier_models() -> None:
+    production = (
+        "select distinct o.customer_id from data_agent_dev.dbt_ci.stg_orders as o "
+        "where o.order_status in ('O')"
+    )
+    demo = (
+        "select distinct o.customer_id from data_agent_dev.dbt_ci.stg_orders as o "
+        "inner join data_agent_dev.dbt_ci.frontier_affected_customers as f "
+        "on o.customer_id = f.customer_id "
+        "where o.order_status in ('O')"
+    )
+    queries, required = sql_change_impact_queries(
+        {
+            "modified": [
+                {
+                    "name": "frontier_customer_orders_target",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "impactStatus": "COMPILED",
+                    "candidateSql": demo,
+                },
+                {
+                    "name": "int_customer_orders_after",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "impactStatus": "COMPILED",
+                    "candidateSql": demo,
+                },
+                {
+                    "name": "int_customer_orders",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "impactStatus": "COMPILED",
+                    "candidateSql": production,
+                },
+            ]
+        }
+    )
+    assert required is True
+    assert queries == (production,)
+
+
 def test_unsupported_confirmation_is_not_an_empty_set() -> None:
     warehouse = FakeWarehouse({})
     session = IsolatedRun(

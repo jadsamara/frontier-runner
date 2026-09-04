@@ -33,6 +33,7 @@ def test_filter_change_compiles_is_distinct_from() -> None:
     assert "changed_source_row_count" in count_sql
     assert "select distinct" not in count_sql
     assert "count(*)" in count_sql
+    assert "select *" not in count_sql.split("from", 1)[0]
     assert result.candidate_set_state == CANDIDATE_SET_NOT_EVALUATED
     assert result.candidates is None
     assert result.parameters
@@ -41,6 +42,17 @@ def test_filter_change_compiles_is_distinct_from() -> None:
     again = compile_impact_query(FILTER_BASE, FILTER_PR, entity_key="customer_id")
     assert again.candidate_sql == result.candidate_sql
     assert again.query_fingerprint == result.query_fingerprint
+
+
+def test_source_row_count_sql_does_not_project_join_keys() -> None:
+    count_sql = source_row_count_sql(
+        "select distinct o.customer_id from stg_orders as o "
+        "inner join frontier_affected_customers as f on o.customer_id = f.customer_id "
+        "where o.order_status in ('O')"
+    ).lower()
+    assert "changed_source_row_count" in count_sql
+    assert "select *" not in count_sql
+    assert "select distinct" not in count_sql
 
 
 def test_identical_sql_is_empty_not_failure() -> None:

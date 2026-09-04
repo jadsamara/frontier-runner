@@ -890,7 +890,7 @@ def source_row_count_sql(candidate_sql: str, *, dialect: str = DIALECT) -> str:
     def strip_distinct(node: exp.Expression) -> None:
         if isinstance(node, exp.Select):
             node.set("distinct", None)
-            node.set("expressions", [exp.Star()])
+            node.set("expressions", [exp.Literal.number(1)])
         if isinstance(node, exp.Union):
             node.set("distinct", False)
             if node.this is not None:

@@ -33,6 +33,31 @@ HANDWRITTEN_FRONTIER_MODELS = (
     "customer_summary_repaired",
 )
 
+_HANDWRITTEN_FRONTIER_MODEL_NAMES = frozenset(
+    name.lower() for name in HANDWRITTEN_FRONTIER_MODELS
+)
+
+
+def is_sql_change_impact_model(name: str) -> bool:
+    """Production models whose impact SQL may run against the warehouse.
+
+    Mutation overlays and handwritten Frontier demo models join
+    frontier_affected_customers. Using them as the live candidate query
+    counts the seed table instead of STG_ORDERS.
+    """
+    lowered = (name or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered in _HANDWRITTEN_FRONTIER_MODEL_NAMES:
+        return False
+    if lowered.startswith("frontier_") or lowered.startswith("mutation_"):
+        return False
+    if lowered.endswith(("_after", "_repaired", "_mutated")):
+        return False
+    if lowered in {"change_events_resolved", "mutation_deleted_order"}:
+        return False
+    return True
+
 
 def _normalize_ident(value: str | None) -> str:
     return (value or "").strip().strip('"').strip("`").upper()
@@ -250,8 +275,48 @@ def _is_keys_join(join: exp.Join) -> bool:
     return table_alias == "frontier_keys" or name.endswith("affected_keys")
 
 
+def _qualify_entity_key_against_keys_join(select: exp.Select, entity_key: str) -> None:
+    """Keep customer_id unambiguous after joining frontier_keys."""
+    alias = _from_table_alias(select)
+    if not alias:
+        return
+    target = entity_key.lower()
+    qualified: list[exp.Expression] = []
+    for expr in select.expressions or []:
+        if isinstance(expr, exp.Star):
+            if expr.this is None:
+                expr.set("this", exp.to_identifier(alias))
+            qualified.append(expr)
+            continue
+        for column in expr.find_all(exp.Column):
+            if str(column.name or "").lower() != target:
+                continue
+            if column.table:
+                continue
+            column.set("table", exp.to_identifier(alias))
+        qualified.append(expr)
+    select.set("expressions", qualified)
+
+    def qualify_root(root: exp.Expression | None) -> None:
+        if root is None:
+            return
+        for column in root.find_all(exp.Column):
+            if str(column.name or "").lower() != target:
+                continue
+            if column.table:
+                continue
+            column.set("table", exp.to_identifier(alias))
+
+    qualify_root(select.args.get("where"))
+    group = select.args.get("group")
+    if group is not None:
+        qualify_root(group)
+    qualify_root(select.args.get("having"))
+
+
 def _inject_keys_join(select: exp.Select, entity_key: str, affected_relation: str) -> bool:
     if any(_is_keys_join(join) for join in (select.args.get("joins") or [])):
+        _qualify_entity_key_against_keys_join(select, entity_key)
         return True
     if not _select_can_bind_entity_key(select, entity_key):
         return False
@@ -265,6 +330,7 @@ def _inject_keys_join(select: exp.Select, entity_key: str, affected_relation: st
     )
     existing = list(select.args.get("joins") or [])
     select.set("joins", [join, *existing])
+    _qualify_entity_key_against_keys_join(select, entity_key)
     return True
 
 
@@ -325,12 +391,16 @@ def sql_change_impact_queries(
         return (), True
     queries: list[str] = []
     for row in modified:
+        if not is_sql_change_impact_model(str(row.get("name") or "")):
+            continue
         if row.get("unsafe") or row.get("impactStatus") == "FULL_REBUILD_REQUIRED":
             return (), True
         sql = str(row.get("candidateSql") or "").strip()
         if not sql:
             return (), True
         queries.append(sql)
+    if not queries:
+        return (), True
     return tuple(queries), True
 
 
@@ -418,8 +488,9 @@ def generic_repaired_sql(
     if not _IDENT.fullmatch(entity_key):
         raise ConfigError("entity key is not a confirmed identifier")
     return (
-        f"select * from {before_relation} "
-        f"where {entity_key} not in (select {entity_key} from {affected_relation}) "
+        f"select * from {before_relation} as frontier_keep "
+        f"where frontier_keep.{entity_key} not in ("
+        f"select {entity_key} from {affected_relation}) "
         "union all "
         f"select * from ({targeted_after_sql}) as frontier_repaired_target"
     )
