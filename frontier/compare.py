@@ -10,6 +10,7 @@ from frontier.dbt_artifacts import DbtNode, Manifest
 from frontier.sql_fingerprint import sql_dialect, sql_fingerprint
 from frontier.snowflake_sql import (
     classify_sql_change,
+    describe_sql_change,
     narrow_frontier_safe,
 )
 from frontier.impact import (
@@ -74,6 +75,7 @@ def _model_payload(
     unsafe: bool | None = None,
     unsupported_reasons: list[str] | None = None,
     impact: dict[str, Any] | None = None,
+    change_summary: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "uniqueId": unique_id,
@@ -90,6 +92,8 @@ def _model_payload(
         payload["unsupportedReasons"] = unsupported_reasons
     if impact:
         payload.update(impact)
+    if change_summary:
+        payload["changeSummary"] = change_summary[:512]
     return payload
 
 
@@ -180,6 +184,7 @@ def compare_manifests(
                 unsafe=classification.unsafe,
                 unsupported_reasons=list(classification.unsupported_reasons) or None,
                 impact=impact.to_payload(include_sql=True),
+                change_summary=describe_sql_change(base_sql, pr_sql),
             )
         )
 
@@ -256,6 +261,9 @@ def format_compare_report(comparison: dict[str, Any]) -> str:
             kinds = row.get("changeKinds") or []
             if kinds:
                 lines.append(f"    change kinds: {', '.join(kinds)}")
+            summary = row.get("changeSummary")
+            if summary:
+                lines.append(f"    change: {summary}")
             if row.get("unsafe"):
                 lines.append("    unsafe: narrow frontier is not allowed")
             impact_status = row.get("impactStatus")

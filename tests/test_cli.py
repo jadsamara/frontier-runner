@@ -113,6 +113,78 @@ def test_prove_dry_run_records_mutation_metrics(dbt_project: Path, monkeypatch, 
     assert delete["priorEntityValue"] == "781"
 
 
+def _write_sql_change_manifests(project: Path) -> Path:
+    pr_path = project / "target" / "manifest.json"
+    payload = json.loads(pr_path.read_text())
+    after_sql = (
+        "select customer_id from DATA_AGENT_DEV.DBT_DEV.stg_orders "
+        "where order_status in ('F', 'O')"
+    )
+    before_sql = (
+        "select customer_id from DATA_AGENT_DEV.DBT_DEV.stg_orders "
+        "where order_status = 'F'"
+    )
+    payload["nodes"]["model.jaffle_shop.int_customer_orders"]["compiled_code"] = after_sql
+    pr_path.write_text(json.dumps(payload))
+    base = json.loads(json.dumps(payload))
+    base["nodes"]["model.jaffle_shop.int_customer_orders"]["compiled_code"] = before_sql
+    base_path = project / "target-base" / "manifest.json"
+    base_path.parent.mkdir(parents=True, exist_ok=True)
+    base_path.write_text(json.dumps(base))
+    events = project / "seeds" / "change_events.csv"
+    if events.exists():
+        events.unlink()
+    return base_path
+
+
+def test_prove_dry_run_sql_change_without_events(dbt_project: Path, monkeypatch, capsys) -> None:
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    base_path = _write_sql_change_manifests(dbt_project)
+    assert not (dbt_project / "seeds" / "change_events.csv").exists()
+    code = main(
+        [
+            "prove",
+            "--project-dir",
+            str(dbt_project),
+            "--dry-run",
+            "--include-entity-ids",
+            "--run-id",
+            "sql-change-proof-001",
+            "--base-manifest",
+            str(base_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "SQL operator:" in captured.out
+    assert "FILTER_CHANGED" in captured.out
+    assert "Source population: 12" in captured.out
+    assert "Candidate-affected: 12" in captured.out
+    assert "Confirmed changed summaries: 8" in captured.out
+    assert "Row count: 150000 → 150000" in captured.out or "Row count: 150,000 → 150,000" in captured.out
+    assert "Targeted repair: safe" in captured.out
+    assert "Full backfill: not required" in captured.out
+    assert "customer_summary_repaired" not in captured.out
+    assert "frontier_affected_customers" not in captured.out
+    payload = json.loads((dbt_project / "target" / "frontier-run.json").read_text())
+    assert payload["changeEvents"] == []
+    assert payload["metrics"]["frontierEntityCount"] == 8
+    assert payload["metrics"]["percentRowsAvoided"] == 99.995
+    assert payload["metrics"]["candidateFrontierCount"] == 12
+    assert payload["metrics"]["confirmedFrontierCount"] == 8
+    assert payload["metrics"]["sourcePopulationCount"] == 12
+    assert payload["sqlComparison"]["modified"][0]["name"] == "int_customer_orders"
+    assert payload["sqlComparison"]["modified"][0]["changeKinds"] == ["FILTER_CHANGED"]
+    assert "FILTER_CHANGED" in (payload["sqlComparison"]["modified"][0].get("changeSummary") or "")
+    assert "candidateSql" not in payload["sqlComparison"]["modified"][0]
+    names = {item["testName"] for item in payload["validationResults"]}
+    assert "assert_sql_frontier_covers_reference" in names
+    assert "assert_repaired_equals_reference" in names
+    assert "assert_changed_customers_in_frontier" not in names
+    values = {entity["entityValue"] for entity in payload["affectedEntities"]}
+    assert values == {"4", "7", "9", "22", "31", "44", "73", "88"}
+
+
 def test_run_requires_entity_hash_key(dbt_project: Path, monkeypatch, capsys) -> None:
     monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
     code = main(["run", "--project-dir", str(dbt_project), "--dry-run", "--run-id", "missing-key"])

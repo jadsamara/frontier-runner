@@ -95,6 +95,30 @@ class SnowflakeAdapter(CursorAdapter):
             for row in rows
         ]
 
+    def get_query_profile(self, query_id: str) -> dict[str, Any]:
+        """Local QUERY_HISTORY stats. Never send query text or rows to SaaS."""
+        token = (query_id or "").strip()
+        if not token:
+            return {}
+        try:
+            rows = self.execute(
+                "select query_id, bytes_scanned, partitions_scanned, rows_produced "
+                "from table(information_schema.query_history()) "
+                f"where query_id = {sql_string(token)} "
+                "order by start_time desc limit 1"
+            )
+        except Exception:
+            return {}
+        if not rows:
+            return {}
+        row = rows[0]
+        return {
+            "query_id": row[0],
+            "bytes_scanned": row[1] if len(row) > 1 else None,
+            "partitions_scanned": row[2] if len(row) > 2 else None,
+            "rows_produced": row[3] if len(row) > 3 else None,
+        }
+
     def describe(self) -> dict[str, Any]:
         if self._config is None:
             return {"warehouse_type": self.warehouse_type}

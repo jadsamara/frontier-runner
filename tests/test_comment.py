@@ -93,6 +93,80 @@ def test_passed_comment_matches_acceptance_shape() -> None:
     assert "Direct customer key" not in body
 
 
+def test_comment_explains_sql_change_without_entity_ids() -> None:
+    body = format_pr_comment(
+        {
+            **PASSED_PAYLOAD,
+            "changeEvents": [],
+            "metrics": {
+                **PASSED_PAYLOAD["metrics"],
+                "frontierEntityCount": 8,
+                "percentRowsAvoided": 99.995,
+                "candidateFrontierCount": 12,
+                "confirmedFrontierCount": 8,
+                "sourcePopulationCount": 12,
+                "beforeEntityCount": 150_000,
+                "afterEntityCount": 150_000,
+                "mismatchedFinalRows": 0,
+                "missingFrontierEntities": 0,
+            },
+            "sqlComparison": {
+                "base": {
+                    "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "modelCount": 4,
+                },
+                "pr": {
+                    "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "modelCount": 4,
+                },
+                "added": [],
+                "removed": [],
+                "modified": [
+                    {
+                        "name": "int_customer_orders",
+                        "changeKinds": ["FILTER_CHANGED"],
+                        "changeSummary": "FILTER_CHANGED: ORDER_STATUS = 'F' → ORDER_STATUS IN ('F', 'O')",
+                        "impactStatus": "COMPILED",
+                    }
+                ],
+                "narrowFrontierSafe": True,
+                "fullRebuildRequired": False,
+            },
+        },
+        run_url="https://frontier.example/runs/11111111-1111-4111-8111-111111111111",
+    )
+    assert "SQL operator changed: FILTER_CHANGED: ORDER_STATUS = 'F' → ORDER_STATUS IN ('F', 'O')" in body
+    assert "Source population matching the changed condition: 12" in body
+    assert "Candidate-affected customers: 12" in body
+    assert "Customer summaries that actually differ: 8" in body
+    assert "Row count: 150,000 → 150,000" in body
+    assert "Targeted repair: safe" in body
+    assert "Full backfill: not required" in body
+    assert "Changed source events:" not in body
+    assert "370" not in body
+    assert "36901" not in body
+    assert "event_001" not in body
+
+
+def test_comment_reports_origin_counts_without_entity_ids() -> None:
+    body = format_pr_comment(
+        {
+            **PASSED_PAYLOAD,
+            "metrics": {
+                **PASSED_PAYLOAD["metrics"],
+                "eventCandidateCount": 3,
+                "sqlChangeCandidateCount": 3,
+                "unionCandidateCount": 6,
+            },
+        },
+        run_url="https://frontier.example/runs/11111111-1111-4111-8111-111111111111",
+    )
+    assert "Candidate keys: 3 event, 3 SQL-change, 6 union" in body
+    assert "370" not in body
+    assert "781" not in body
+    assert "36901" not in body
+
+
 def test_comment_includes_artifact_fingerprints() -> None:
     payload = {
         **PASSED_PAYLOAD,

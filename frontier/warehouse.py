@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -35,6 +36,7 @@ class WarehouseAdapter(Protocol):
 
     warehouse_type: str
     dialect: str
+    last_query_id: str | None
 
     def quote_identifier(self, value: str) -> str: ...
 
@@ -45,6 +47,8 @@ class WarehouseAdapter(Protocol):
     def estimate_query_cost(self, sql: str) -> dict[str, Any]: ...
 
     def get_query_history(self, run_id: str) -> list[dict[str, Any]]: ...
+
+    def get_query_profile(self, query_id: str) -> dict[str, Any]: ...
 
     def close(self) -> None: ...
 
@@ -103,6 +107,13 @@ def sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def sql_literal(value: str) -> str:
+    stripped = value.strip()
+    if re.fullmatch(r"-?\d+", stripped):
+        return stripped
+    return sql_string(stripped)
+
+
 def env_value(*names: str) -> str | None:
     for name in names:
         value = os.environ.get(name)
@@ -130,6 +141,8 @@ class FakeWarehouse:
         self.warehouse_type = normalize_warehouse_type(warehouse_type)
         self.dialect = dialect or self.warehouse_type
         self.relations = relations
+        self.last_query_id: str | None = None
+        self.query_ids: list[str] = []
 
     def quote_identifier(self, value: str) -> str:
         quote = "`" if self.dialect in {"bigquery", "databricks"} else '"'
@@ -137,7 +150,31 @@ class FakeWarehouse:
 
     def execute(self, sql: str) -> list[tuple[Any, ...]]:
         self.executed.append(sql)
+        self.last_query_id = f"fake-qid-{len(self.executed)}"
+        self.query_ids.append(self.last_query_id)
         normalized = " ".join(sql.lower().split())
+        if normalized.startswith(("create ", "drop ", "insert ", "create or replace")):
+            return []
+        if "as frontier_origin_keys" in normalized:
+            matched = self._match_response(normalized)
+            if matched is not None:
+                return matched
+            return self._synthetic_origin_keys()
+        if "as frontier_origin_counts" in normalized:
+            matched = self._match_response(normalized)
+            if matched is not None:
+                return matched
+            keys = self._synthetic_origin_keys()
+            events = {value for value, origin in keys if origin == "event"}
+            sql_change = {value for value, origin in keys if origin == "sql_change"}
+            union = {value for value, _origin in keys}
+            return [(len(events), len(sql_change), len(union))]
+        matched = self._match_response(normalized)
+        if matched is not None:
+            return matched
+        raise ConfigError(f"FakeWarehouse has no response for SQL: {sql}")
+
+    def _match_response(self, normalized: str) -> list[tuple[Any, ...]] | None:
         for needle, rows in self.responses.items():
             token = needle.lower()
             index = normalized.find(token)
@@ -147,7 +184,66 @@ class FakeWarehouse:
             if end < len(normalized) and normalized[end].isdigit():
                 continue
             return rows
-        raise ConfigError(f"FakeWarehouse has no response for SQL: {sql}")
+        return None
+
+    def _synthetic_origin_keys(self) -> list[tuple[Any, ...]]:
+        create = next(
+            (item for item in reversed(self.executed) if item.lower().lstrip().startswith("create or replace table")),
+            "",
+        )
+        keys: list[tuple[Any, ...]] = []
+        seen: set[tuple[str, str]] = set()
+        for match in re.finditer(
+            r"select\s+(-?\d+|'[^']*')\s+as\s+[A-Za-z_][A-Za-z0-9_]*\s*,\s*'(event|sql_change)'\s+as origin",
+            create,
+            flags=re.IGNORECASE,
+        ):
+            raw = match.group(1)
+            value = raw[1:-1] if raw.startswith("'") else raw
+            origin = match.group(2).lower()
+            item = (value, origin)
+            if item not in seen:
+                seen.add(item)
+                keys.append(item)
+        normalized_create = " ".join(create.lower().split())
+        if "as frontier_sql_change_keys" in normalized_create:
+            for needle, rows in self.responses.items():
+                token = needle.lower()
+                if token in {"frontier_origin_keys", "frontier_origin_counts", "full_entity_count"}:
+                    continue
+                if token not in normalized_create:
+                    continue
+                for row in rows:
+                    if not row or row[0] is None:
+                        continue
+                    origin = str(row[1]) if len(row) > 1 and row[1] is not None else "sql_change"
+                    item = (str(row[0]), origin)
+                    if item not in seen:
+                        seen.add(item)
+                        keys.append(item)
+        return keys
+
+    def get_query_profile(self, query_id: str) -> dict[str, Any]:
+        sql = ""
+        for qid, executed in zip(self.query_ids, self.executed):
+            if qid == query_id:
+                sql = executed
+                break
+        lowered = sql.lower()
+        targeted = "frontier_keys" in lowered or "affected_keys" in lowered
+        if targeted:
+            return {
+                "query_id": query_id,
+                "bytes_scanned": 1_000,
+                "partitions_scanned": 1,
+                "rows_produced": 3,
+            }
+        return {
+            "query_id": query_id,
+            "bytes_scanned": 1_000_000,
+            "partitions_scanned": 80,
+            "rows_produced": 150_000,
+        }
 
     def relation_exists(self, relation: str) -> bool:
         if self.relations is None:

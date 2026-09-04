@@ -105,6 +105,7 @@ def test_filter_change_marks_model_modified() -> None:
     assert modified[0]["unsafe"] is False
     assert modified[0]["impactStatus"] == "COMPILED"
     assert "is distinct from" in (modified[0].get("candidateSql") or "").lower()
+    assert "FILTER_CHANGED" in (modified[0].get("changeSummary") or "")
     assert comparison["narrowFrontierSafe"] is True
 
 

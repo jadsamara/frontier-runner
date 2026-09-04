@@ -21,7 +21,7 @@ from frontier.config import (
     write_init_config,
 )
 from frontier.artifacts import require_current_artifacts
-from frontier.compare import compare_manifests, format_compare_report, comparison_for_ingest
+from frontier.compare import compare_manifests, format_compare_report, comparison_for_ingest, compiled_sql_for
 from frontier.github import base_commit_sha, default_external_run_id, env_flag, github_source
 from frontier.dbt_artifacts import (
     format_inspect_report,
@@ -32,14 +32,21 @@ from frontier.dbt_artifacts import (
 from frontier.frontier import (
     frontier_result_to_dict,
     load_change_events_csv,
+    percent_rows_avoided,
     run_frontier,
 )
+from frontier.execute import open_isolated_run, sql_change_impact_queries
 from frontier.hashing import entity_hash_key_from_env, hmac_entity_id
 from frontier.proof import (
     apply_resolved_delete,
     measure_mutation_proof,
+    measure_sql_change_proof,
     proof_validation_results,
     recorded_proof,
+    recorded_sql_change_affected,
+    recorded_sql_change_proof,
+    resolve_deleted_order,
+    sql_change_proof_validation_results,
 )
 from frontier.warehouse import (
     FakeWarehouse,
@@ -49,10 +56,12 @@ from frontier.warehouse import (
     normalize_warehouse_type,
 )
 from frontier.validation import (
+    ValidationResult,
     collect_validation_results,
     evidence_level,
     overall_status,
     sql_change_narrow_frontier_result,
+    SQL_CHANGE_NARROW_FRONTIER,
 )
 
 RUN_FILE_NAME = "frontier-run.json"
@@ -169,6 +178,78 @@ def _wants_blocking(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "blocking", False)) or env_flag("FRONTIER_BLOCKING")
 
 
+def _compiled_model_sql(manifest, name: str, compiled_root: Path | None) -> str | None:
+    try:
+        node = manifest.find_model(name)
+    except ConfigError:
+        return None
+    return compiled_sql_for(node, compiled_root)
+
+
+def _sql_change_present(comparison: dict[str, Any] | None) -> bool:
+    if not comparison:
+        return False
+    return bool(
+        comparison.get("modified") or comparison.get("added") or comparison.get("removed")
+    )
+
+
+def _load_events(args: argparse.Namespace, project_dir: Path, sql_comparison: dict[str, Any] | None) -> list:
+    explicit = bool(getattr(args, "events", None))
+    path = Path(args.events) if args.events else project_dir / "seeds" / "change_events.csv"
+    if _sql_change_present(sql_comparison) and not explicit:
+        return []
+    return load_change_events_csv(
+        path,
+        required=explicit or not _sql_change_present(sql_comparison),
+    )
+
+
+def _sql_change_queries(
+    comparison: dict[str, Any] | None,
+    *,
+    persist: bool,
+) -> tuple[tuple[str, ...], bool]:
+    queries, required = sql_change_impact_queries(comparison)
+    if not persist:
+        return (), False
+    return queries, required
+
+
+def _apply_rebuild_to_comparison(
+    comparison: dict[str, Any] | None,
+    result,
+    validations: list,
+) -> dict[str, Any] | None:
+    if not getattr(result, "full_rebuild_required", False):
+        return comparison
+    if comparison is not None:
+        updated = dict(comparison)
+        updated["fullRebuildRequired"] = True
+        updated["narrowFrontierSafe"] = False
+        return updated
+    validations.append(
+        ValidationResult(
+            test_name=SQL_CHANGE_NARROW_FRONTIER,
+            status="failed",
+            difference_count=1,
+            message="; ".join(result.execution_reasons) or "FULL_REBUILD_REQUIRED",
+        )
+    )
+    return comparison
+
+
+def _print_origin_counts(result) -> None:
+    if result.event_candidate_count is not None:
+        print(f"Event candidates: {result.event_candidate_count}")
+    if result.sql_change_candidate_count is not None:
+        print(f"SQL-change candidates: {result.sql_change_candidate_count}")
+    if result.union_candidate_count is not None:
+        print(f"Union candidates: {result.union_candidate_count}")
+    if result.full_rebuild_required:
+        print("Impact: FULL_REBUILD_REQUIRED")
+
+
 def _write_run_file(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n")
@@ -245,11 +326,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     config = load_frontier_config(_config_path(args, project_dir))
     manifest = load_manifest(_target_dir(project_dir) / "manifest.json")
     run_results = load_run_results(_target_dir(project_dir) / "run_results.json")
-    events_path = Path(args.events) if args.events else project_dir / "seeds" / "change_events.csv"
-    events = load_change_events_csv(events_path)
+    sql_comparison = _load_sql_comparison(
+        args,
+        pr_manifest=manifest,
+        project_dir=project_dir,
+    )
+    events = _load_events(args, project_dir, sql_comparison)
 
     dry_run = _use_dry_run(args)
     warehouse: WarehouseAdapter
+    run_id = args.run_id or default_external_run_id(config.project)
+    persist = not dry_run
     if dry_run:
         warehouse = FakeWarehouse(
             {
@@ -268,12 +355,36 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         print(f"{warehouse.warehouse_type}: " + json.dumps(describe_adapter(warehouse)))
 
+    base_sql = None
+    after_sql = compiled_sql_for(
+        manifest.find_model(config.model.name),
+        _compiled_root_for(_target_dir(project_dir) / "manifest.json"),
+    )
+    base_path = getattr(args, "base_manifest", None)
+    if base_path:
+        base_manifest = load_manifest(Path(base_path).expanduser().resolve())
+        base_sql = _compiled_model_sql(
+            base_manifest,
+            config.model.name,
+            _compiled_root_for(Path(base_path).expanduser().resolve()),
+        )
+
     try:
+        sql_change_queries, sql_change_required = _sql_change_queries(
+            sql_comparison,
+            persist=persist,
+        )
         result = run_frontier(
             config,
             manifest=manifest,
             events=events,
             warehouse=warehouse,
+            run_id=run_id,
+            persist=persist,
+            sql_change_queries=sql_change_queries,
+            sql_change_required=sql_change_required,
+            before_sql=base_sql,
+            after_sql=after_sql,
         )
         validations = collect_validation_results(
             config=config,
@@ -286,21 +397,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     finally:
         warehouse.close()
 
+    sql_comparison = _apply_rebuild_to_comparison(sql_comparison, result, validations)
     output = _emit_run(
         args,
         config=config,
         manifest=manifest,
         result=result,
         validations=validations,
-        sql_comparison=_load_sql_comparison(
-            args,
-            pr_manifest=manifest,
-            project_dir=project_dir,
-        ),
+        sql_comparison=sql_comparison,
     )
     print(f"Full entities: {result.full_entity_count}")
     print(f"Frontier: {result.frontier_entity_count}")
     print(f"Rows avoided: {result.percent_rows_avoided}%")
+    _print_origin_counts(result)
     print("Validation:")
     for item in validations:
         print(f"  - {item.test_name}: {item.status} (differences={item.difference_count})")
@@ -411,22 +520,39 @@ def cmd_prove(args: argparse.Namespace) -> int:
     config = load_frontier_config(_config_path(args, project_dir))
     manifest = load_manifest(_target_dir(project_dir) / "manifest.json")
     run_results = load_run_results(_target_dir(project_dir) / "run_results.json")
-    events_path = Path(args.events) if args.events else project_dir / "seeds" / "change_events.csv"
-    events = load_change_events_csv(events_path)
+    sql_comparison = _load_sql_comparison(
+        args,
+        pr_manifest=manifest,
+        project_dir=project_dir,
+    )
+    events = _load_events(args, project_dir, sql_comparison)
+    sql_change_demo = _sql_change_present(sql_comparison)
 
     dry_run = _use_dry_run(args)
     warehouse: WarehouseAdapter
+    run_id = args.run_id or default_external_run_id(config.project)
+    persist = not dry_run
+    sql_proof = None
+    proof = None
     if dry_run:
         warehouse = FakeWarehouse(
             {
-                "full_entity_count": [(150_000, 3)],
+                "full_entity_count": [(150_000, 3 if not sql_change_demo else 8)],
                 "order_id in (1)": [(36901,)],
                 "order_id in (5)": [(781,)],
                 "difference_count": [(0,)],
             }
         )
         print("Using in-memory warehouse (--dry-run). No live warehouse session.")
-        proof = recorded_proof()
+        if sql_change_demo:
+            sql_proof = recorded_sql_change_proof()
+        else:
+            proof = recorded_proof()
+            events = apply_resolved_delete(
+                events,
+                order_id=proof.deleted_order_id,
+                customer_id=proof.deleted_order_customer_id,
+            )
     else:
         warehouse = connect_warehouse(
             project_dir,
@@ -434,25 +560,97 @@ def cmd_prove(args: argparse.Namespace) -> int:
             target=args.target,
         )
         print(f"{warehouse.warehouse_type}: " + json.dumps(describe_adapter(warehouse)))
-        try:
-            proof = measure_mutation_proof(config, manifest=manifest, warehouse=warehouse)
-        except ConfigError:
-            warehouse.close()
-            raise
+        if not sql_change_demo:
+            try:
+                deleted_order_id, deleted_customer_id = resolve_deleted_order(
+                    manifest,
+                    warehouse,
+                    proof=config.proof,
+                )
+            except ConfigError:
+                warehouse.close()
+                raise
+            events = apply_resolved_delete(
+                events,
+                order_id=deleted_order_id,
+                customer_id=deleted_customer_id,
+            )
 
-    events = apply_resolved_delete(
-        events,
-        order_id=proof.deleted_order_id,
-        customer_id=proof.deleted_order_customer_id,
+    base_sql = None
+    after_sql = compiled_sql_for(
+        manifest.find_model(config.model.name),
+        _compiled_root_for(_target_dir(project_dir) / "manifest.json"),
     )
+    base_path = getattr(args, "base_manifest", None)
+    if base_path:
+        base_manifest = load_manifest(Path(base_path).expanduser().resolve())
+        base_sql = _compiled_model_sql(
+            base_manifest,
+            config.model.name,
+            _compiled_root_for(Path(base_path).expanduser().resolve()),
+        )
 
+    isolated = None
     try:
+        sql_change_queries, sql_change_required = _sql_change_queries(
+            sql_comparison,
+            persist=persist,
+        )
+        if persist:
+            model = manifest.find_model(config.model.name)
+            isolated = open_isolated_run(
+                warehouse,
+                run_id=run_id,
+                entity_key=config.model.key,
+                model_database=model.database,
+                model_schema=model.schema,
+                model_relation=model.relation,
+            )
         result = run_frontier(
             config,
             manifest=manifest,
             events=events,
             warehouse=warehouse,
+            run_id=run_id,
+            persist=persist,
+            sql_change_queries=sql_change_queries,
+            sql_change_required=sql_change_required,
+            before_sql=base_sql,
+            after_sql=after_sql,
+            isolated_run=isolated,
         )
+        if sql_change_demo:
+            if sql_proof is None:
+                if not result.affected_relation or not base_sql or not after_sql:
+                    raise ConfigError("SQL-change proof requires compiled base/PR SQL and affected keys")
+                sql_proof = measure_sql_change_proof(
+                    config,
+                    warehouse=warehouse,
+                    before_sql=base_sql,
+                    after_sql=after_sql,
+                    affected_relation=result.affected_relation,
+                    impact_sql=sql_change_queries[0] if sql_change_queries else None,
+                    candidate_count=result.union_candidate_count,
+                    confirmed_count=len(result.confirmed_keys) if result.confirmed_keys is not None else None,
+                    full_rebuild_required=result.full_rebuild_required,
+                )
+            if dry_run:
+                result.affected_entities = recorded_sql_change_affected(
+                    entity_type=config.model.entity,
+                    entity_key=config.model.key,
+                )
+                result.frontier_entity_count = sql_proof.confirmed_frontier_count
+                result.percent_rows_avoided = percent_rows_avoided(
+                    result.full_entity_count,
+                    sql_proof.confirmed_frontier_count,
+                )
+        elif proof is None:
+            proof = measure_mutation_proof(
+                config,
+                manifest=manifest,
+                warehouse=warehouse,
+                affected_relation=result.affected_relation,
+            )
         validations = collect_validation_results(
             config=config,
             manifest=manifest,
@@ -461,37 +659,65 @@ def cmd_prove(args: argparse.Namespace) -> int:
             result=result,
             warehouse=None if dry_run else warehouse,
         )
-        validations.extend(proof_validation_results(proof))
+        if sql_proof is not None:
+            validations.extend(sql_change_proof_validation_results(sql_proof))
+        else:
+            validations.extend(proof_validation_results(proof))
     finally:
+        if isolated is not None:
+            isolated.cleanup()
         warehouse.close()
 
+    sql_comparison = _apply_rebuild_to_comparison(sql_comparison, result, validations)
+    assessed = sql_proof or proof
+    extra_metrics = {
+        "fullRowsRecomputed": assessed.full_rows_recomputed,
+        "frontierRowsRecomputed": assessed.frontier_rows_recomputed,
+        "missingFrontierEntities": assessed.missing_frontier_entities,
+        "extraFrontierEntities": assessed.extra_frontier_entities,
+        "mismatchedFinalRows": assessed.mismatched_final_rows,
+        "testDurationMs": assessed.test_duration_ms,
+    }
+    if sql_proof is not None:
+        extra_metrics.update(
+            {
+                "frontierEntityCount": sql_proof.confirmed_frontier_count,
+                "percentRowsAvoided": percent_rows_avoided(
+                    sql_proof.full_rows_recomputed,
+                    sql_proof.confirmed_frontier_count,
+                ),
+                "candidateFrontierCount": sql_proof.candidate_frontier_count,
+                "confirmedFrontierCount": sql_proof.confirmed_frontier_count,
+                "sourcePopulationCount": sql_proof.source_population_count,
+                "beforeEntityCount": sql_proof.before_entity_count,
+                "afterEntityCount": sql_proof.after_entity_count,
+            }
+        )
     output = _emit_run(
         args,
         config=config,
         manifest=manifest,
         result=result,
         validations=validations,
-        extra_metrics={
-            "fullRowsRecomputed": proof.full_rows_recomputed,
-            "frontierRowsRecomputed": proof.frontier_rows_recomputed,
-            "missingFrontierEntities": proof.missing_frontier_entities,
-            "extraFrontierEntities": proof.extra_frontier_entities,
-            "mismatchedFinalRows": proof.mismatched_final_rows,
-            "testDurationMs": proof.test_duration_ms,
-        },
-        sql_comparison=_load_sql_comparison(
-            args,
-            pr_manifest=manifest,
-            project_dir=project_dir,
-        ),
+        extra_metrics=extra_metrics,
+        sql_comparison=sql_comparison,
     )
-    print(f"Full rows recomputed: {proof.full_rows_recomputed}")
-    print(f"Frontier rows recomputed: {proof.frontier_rows_recomputed}")
-    print(f"Rows avoided: {proof.rows_avoided}")
-    print(f"Missing frontier entities: {proof.missing_frontier_entities}")
-    print(f"Extra frontier entities: {proof.extra_frontier_entities}")
-    print(f"Mismatched final rows: {proof.mismatched_final_rows}")
-    print(f"Test duration: {proof.test_duration_ms} ms")
+    print(f"Full rows recomputed: {assessed.full_rows_recomputed}")
+    print(f"Frontier rows recomputed: {assessed.frontier_rows_recomputed}")
+    print(f"Rows avoided: {assessed.rows_avoided}")
+    _print_origin_counts(result)
+    if sql_proof is not None:
+        print(f"SQL operator: {((sql_comparison or {}).get('modified') or [{}])[0].get('changeSummary') or 'SQL change'}")
+        print(f"Source population: {sql_proof.source_population_count}")
+        print(f"Candidate-affected: {sql_proof.candidate_frontier_count}")
+        print(f"Confirmed changed summaries: {sql_proof.confirmed_frontier_count}")
+        print(f"Row count: {sql_proof.before_entity_count} → {sql_proof.after_entity_count}")
+        print(f"Targeted repair: {'safe' if sql_proof.targeted_repair_safe else 'not safe'}")
+        print(f"Full backfill: {'required' if sql_proof.full_rebuild_required else 'not required'}")
+    print(f"Missing frontier entities: {assessed.missing_frontier_entities}")
+    print(f"Extra frontier entities: {assessed.extra_frontier_entities}")
+    print(f"Mismatched final rows: {assessed.mismatched_final_rows}")
+    print(f"Test duration: {assessed.test_duration_ms} ms")
     print("Validation:")
     for item in validations:
         print(f"  - {item.test_name}: {item.status} (differences={item.difference_count})")

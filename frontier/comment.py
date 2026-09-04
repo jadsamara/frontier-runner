@@ -68,21 +68,89 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
     headline = f"Frontier impact assessment: {status}"
     if status != "PASSED":
         headline = f"**{headline}**"
+    comparison = payload.get("sqlComparison") or {}
+    modified = comparison.get("modified") or []
+    sql_kinds = list(
+        dict.fromkeys(
+            str(kind)
+            for row in modified
+            for kind in (row.get("changeKinds") or [])
+        )
+    )
+    summaries = [
+        str(row.get("changeSummary"))
+        for row in modified
+        if row.get("changeSummary")
+    ]
+    candidate_count = metrics.get("candidateFrontierCount")
+    if candidate_count is None:
+        candidate_count = metrics.get("unionCandidateCount")
+    confirmed_count = metrics.get("confirmedFrontierCount")
+    source_population = metrics.get("sourcePopulationCount")
+    before_count = metrics.get("beforeEntityCount")
+    after_count = metrics.get("afterEntityCount")
+    full_rebuild = bool(comparison.get("fullRebuildRequired") or comparison.get("narrowFrontierSafe") is False)
+    targeted_safe = (
+        int(metrics.get("mismatchedFinalRows") or 0) == 0
+        and int(metrics.get("missingFrontierEntities") or 0) == 0
+        and not full_rebuild
+    )
 
     lines = [
         COMMENT_MARKER,
         headline,
         "",
         f"Model: {model_name}",
-        f"Changed source events: {len(events)}",
-        (
+    ]
+    if summaries or sql_kinds:
+        lines.append(f"SQL operator changed: {summaries[0] if summaries else ', '.join(sql_kinds)}")
+        if source_population is not None:
+            lines.append(
+                f"Source population matching the changed condition: {_format_count(int(source_population))}"
+            )
+        if candidate_count is not None:
+            lines.append(
+                f"Candidate-affected {_pluralize(entity_type, int(candidate_count))}: "
+                f"{_format_count(int(candidate_count))}"
+            )
+        if confirmed_count is not None:
+            lines.append(
+                f"Customer summaries that actually differ: {_format_count(int(confirmed_count))}"
+            )
+        if before_count is not None and after_count is not None:
+            lines.append(
+                f"Row count: {_format_count(int(before_count))} → {_format_count(int(after_count))}"
+            )
+        lines.append(f"Targeted repair: {'safe' if targeted_safe else 'not safe'}")
+        lines.append(f"Full backfill: {'required' if full_rebuild else 'not required'}")
+    elif events:
+        lines.append(f"Changed source events: {len(events)}")
+        lines.append(
             f"Affected {_pluralize(entity_type, frontier_count)}: "
             f"{_format_count(frontier_count)} of {_format_count(full_count)}"
-        ),
-        f"Rows avoided: {percent_text}",
-        f"Validation differences: {_validation_difference_total(validations)}",
-        f"Evidence: {evidence}",
-    ]
+        )
+    else:
+        lines.append(
+            f"Affected {_pluralize(entity_type, frontier_count)}: "
+            f"{_format_count(frontier_count)} of {_format_count(full_count)}"
+        )
+    lines.extend(
+        [
+            f"Rows avoided: {percent_text}",
+            f"Validation differences: {_validation_difference_total(validations)}",
+            f"Evidence: {evidence}",
+        ]
+    )
+    event_count = metrics.get("eventCandidateCount")
+    sql_count = metrics.get("sqlChangeCandidateCount")
+    union_count = metrics.get("unionCandidateCount")
+    if event_count is not None or sql_count is not None or union_count is not None:
+        lines.append(
+            "Candidate keys: "
+            f"{_format_count(int(event_count or 0))} event, "
+            f"{_format_count(int(sql_count or 0))} SQL-change, "
+            f"{_format_count(int(union_count or 0))} union"
+        )
     comparison = payload.get("sqlComparison") or {}
     if comparison:
         base = comparison.get("base") or {}

@@ -15,16 +15,26 @@ class CursorAdapter:
     warehouse_type: str
     dialect: str
     _connection: Any = None
+    last_query_id: str | None = None
 
     def execute(self, sql: str) -> list[tuple[Any, ...]]:
         connection = self._require_connection()
         cursor = connection.cursor()
         try:
             cursor.execute(sql)
+            self.last_query_id = getattr(cursor, "sfqid", None) or getattr(cursor, "sfqId", None)
+            if self.last_query_id is not None:
+                self.last_query_id = str(self.last_query_id)
+            if cursor.description is None:
+                return []
             rows = cursor.fetchall() or []
             return [tuple(row) for row in rows]
         finally:
             cursor.close()
+
+    def get_query_profile(self, query_id: str) -> dict[str, Any]:
+        del query_id
+        return {}
 
     def close(self) -> None:
         connection = self._connection

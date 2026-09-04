@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from frontier.config import ConfigError, load_frontier_config
@@ -26,6 +28,12 @@ def recorded_warehouse() -> FakeWarehouse:
 
 def test_percent_matches_verified_tpch() -> None:
     assert percent_rows_avoided(150_000, 3) == 99.998
+    assert percent_rows_avoided(150_000, 8) == 99.995
+
+
+def test_change_events_csv_is_optional(tmp_path: Path) -> None:
+    missing = tmp_path / "change_events.csv"
+    assert load_change_events_csv(missing, required=False) == []
 
 
 def test_run_frontier_obtains_verified_metrics() -> None:

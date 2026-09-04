@@ -110,3 +110,16 @@ def test_case_expression_is_expression_changed() -> None:
     )
     assert change.kinds == ("EXPRESSION_CHANGED",)
     assert change.unsafe is False
+
+
+def test_describe_sql_change_explains_filter_equality_to_in() -> None:
+    from frontier.snowflake_sql import describe_sql_change
+
+    summary = describe_sql_change(
+        "select customer_id from orders where order_status = 'F'",
+        "select customer_id from orders where order_status in ('F', 'O')",
+    )
+    assert "FILTER_CHANGED" in summary
+    assert "order_status" in summary.lower() or "ORDER_STATUS" in summary
+    assert "'F'" in summary
+    assert "'O'" in summary

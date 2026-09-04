@@ -399,6 +399,33 @@ def classify_sql_change(base_sql: str, pr_sql: str) -> SqlChangeClassification:
     )
 
 
+def describe_sql_change(base_sql: str, pr_sql: str) -> str:
+    """Human-readable operator summary. Never includes warehouse rows."""
+    change = classify_sql_change(base_sql, pr_sql)
+    if not change.kinds:
+        return "No semantic SQL change"
+    if UNSUPPORTED in change.kinds:
+        reason = "; ".join(change.unsupported_reasons) or "unsupported SQL"
+        return f"UNSUPPORTED: {reason}"[:512]
+    parts: list[str] = []
+    if FILTER_CHANGED in change.kinds and change.base_ir and change.pr_ir:
+        removed = [item for item in change.base_ir.filters if item not in change.pr_ir.filters]
+        added = [item for item in change.pr_ir.filters if item not in change.base_ir.filters]
+        if removed or added:
+            left = " AND ".join(removed) or "(none)"
+            right = " AND ".join(added) or "(none)"
+            parts.append(f"FILTER_CHANGED: {left} → {right}")
+        else:
+            parts.append("FILTER_CHANGED")
+    for kind in change.kinds:
+        if kind == FILTER_CHANGED:
+            continue
+        parts.append(kind)
+    if not parts:
+        parts.extend(change.kinds)
+    return "; ".join(parts)[:512]
+
+
 def narrow_frontier_safe(comparison: dict[str, Any] | None) -> bool:
     if not comparison:
         return True

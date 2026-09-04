@@ -11,8 +11,12 @@ from frontier.proof import (
     mismatched_rows_sql,
     missing_frontier_sql,
     measure_mutation_proof,
+    measure_sql_change_proof,
     proof_validation_results,
     recorded_proof,
+    recorded_sql_change_affected,
+    recorded_sql_change_proof,
+    sql_change_proof_validation_results,
 )
 from frontier.warehouse import FakeWarehouse
 from frontier.validation import evidence_level
@@ -113,6 +117,61 @@ def test_recorded_proof_is_the_verified_shape() -> None:
     assert proof.frontier_rows_recomputed == 3
     assert proof.mismatched_final_rows == 0
     assert proof.percent_rows_avoided == 99.998
+
+
+def test_recorded_sql_change_proof_covers_reference() -> None:
+    proof = recorded_sql_change_proof()
+    assert proof.full_rows_recomputed == 150_000
+    assert proof.candidate_frontier_count == 12
+    assert proof.confirmed_frontier_count == 8
+    assert proof.source_population_count == 12
+    assert proof.extra_frontier_entities == 4
+    assert proof.missing_frontier_entities == 0
+    assert proof.mismatched_final_rows == 0
+    assert proof.targeted_repair_safe is True
+    assert proof.full_rebuild_required is False
+    values = {entity.entity_value for entity in recorded_sql_change_affected()}
+    assert values == {"4", "7", "9", "22", "31", "44", "73", "88"}
+    validations = sql_change_proof_validation_results(proof)
+    assert {item.test_name for item in validations} == {
+        "assert_sql_frontier_covers_reference",
+        "assert_repaired_equals_reference",
+    }
+    assert all(item.status == "passed" for item in validations)
+    assert evidence_level(validations) == "empirically_validated"
+
+
+def test_measure_sql_change_proof_with_fake_warehouse() -> None:
+    config = load_frontier_config(FIXTURES / "frontier.yml")
+    warehouse = FakeWarehouse(
+        {
+            "before_entity_count": [(150_000,)],
+            "after_entity_count": [(150_000,)],
+            "source_population_count": [(12,)],
+            "mismatched_final_rows": [(0,)],
+            "frontier_rows_recomputed": [(12,)],
+            "missing_frontier": [(0,)],
+            "extra_frontier": [(4,)],
+            "confirmed_frontier_count": [(8,)],
+        }
+    )
+    proof = measure_sql_change_proof(
+        config,
+        warehouse=warehouse,
+        before_sql="select customer_id, 1 as total_orders from orders where order_status = 'F'",
+        after_sql="select customer_id, 1 as total_orders from orders where order_status in ('F', 'O')",
+        affected_relation="DATA_AGENT_DEV.DBT_CI.FRONTIER_TEST_AFFECTED_KEYS",
+        impact_sql="select customer_id from orders where order_status in ('O')",
+    )
+    assert proof.candidate_frontier_count == 12
+    assert proof.confirmed_frontier_count == 8
+    assert proof.source_population_count == 12
+    assert proof.before_entity_count == 150_000
+    assert proof.after_entity_count == 150_000
+    assert proof.missing_frontier_entities == 0
+    assert proof.extra_frontier_entities == 4
+    assert proof.mismatched_final_rows == 0
+    assert proof.targeted_repair_safe is True
 
 
 def test_jaffle_shop_overlays_do_not_write_sample_data() -> None:

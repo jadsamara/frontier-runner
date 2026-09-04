@@ -4,13 +4,14 @@ import csv
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import sqlglot
 from sqlglot import exp
 
 from frontier.config import ConfigError, FrontierConfig
 from frontier.dbt_artifacts import Manifest
+from frontier.execute import IsolatedRun, ORIGIN_SQL_CHANGE, SQL_CHANGE_REASON, merge_unique_keys, open_isolated_run
 from frontier.hashing import entity_type_from_key, hmac_entity_id
 from frontier.warehouse import WarehouseAdapter
 
@@ -45,6 +46,14 @@ class FrontierResult:
     affected_entities: list[AffectedEntity]
     frontier_sql: str
     metrics_sql: str
+    affected_relation: str | None = None
+    confirmed_keys: tuple[str, ...] | None = None
+    execution_reasons: tuple[str, ...] = ()
+    event_candidate_count: int | None = None
+    sql_change_candidate_count: int | None = None
+    union_candidate_count: int | None = None
+    full_rebuild_required: bool = False
+    targeted_query_id: str | None = None
 
 
 def percent_rows_avoided(full_entity_count: int, frontier_entity_count: int) -> float:
@@ -55,9 +64,11 @@ def percent_rows_avoided(full_entity_count: int, frontier_entity_count: int) -> 
     return round((1 - frontier_entity_count / full_entity_count) * 100, 3)
 
 
-def load_change_events_csv(path: Path) -> list[ChangeEvent]:
+def load_change_events_csv(path: Path, *, required: bool = True) -> list[ChangeEvent]:
     if not path.is_file():
-        raise ConfigError(f"Missing change events file: {path}")
+        if required:
+            raise ConfigError(f"Missing change events file: {path}")
+        return []
     events: list[ChangeEvent] = []
     with path.open(newline="") as handle:
         reader = csv.DictReader(handle)
@@ -235,21 +246,7 @@ def current_frontier_metrics_sql(
     dialect: str = "snowflake",
 ) -> str:
     model = manifest.find_model(model_name)
-    try:
-        frontier = manifest.find_model("frontier_affected_customers")
-        frontier_rel = frontier.relation
-    except ConfigError:
-        frontier_rel = None
-
-    full = model.relation
-    if frontier_rel:
-        sql = (
-            "select\n"
-            f"    (select count(*) from {full}) as full_entity_count,\n"
-            f"    (select count(*) from {frontier_rel}) as frontier_entity_count"
-        )
-    else:
-        sql = f"select count(*) as full_entity_count from {full}"
+    sql = f"select count(*) as full_entity_count from {model.relation}"
     sqlglot.parse_one(sql, dialect=dialect)
     return sql
 
@@ -260,6 +257,14 @@ def run_frontier(
     manifest: Manifest,
     events: list[ChangeEvent],
     warehouse: WarehouseAdapter,
+    run_id: str | None = None,
+    persist: bool = False,
+    extra_keys: Iterable[str] = (),
+    sql_change_queries: Iterable[str] = (),
+    sql_change_required: bool = False,
+    before_sql: str | None = None,
+    after_sql: str | None = None,
+    isolated_run: IsolatedRun | None = None,
 ) -> FrontierResult:
     affected, frontier_sql = resolve_affected_entities(
         config,
@@ -267,30 +272,160 @@ def run_frontier(
         manifest=manifest,
         warehouse=warehouse,
     )
-    metrics_sql = current_frontier_metrics_sql(
-        manifest,
-        config.model.name,
-        dialect=warehouse.dialect,
-    )
-    metric_rows = warehouse.execute(metrics_sql)
-    if not metric_rows:
-        raise ConfigError("Frontier metrics query returned no rows")
-    row = metric_rows[0]
-    full_entity_count = int(row[0])
-    if len(row) > 1 and row[1] is not None:
-        frontier_entity_count = int(row[1])
-    else:
-        frontier_entity_count = len(affected)
-    percent = percent_rows_avoided(full_entity_count, frontier_entity_count)
-    return FrontierResult(
-        full_entity_count=full_entity_count,
-        frontier_entity_count=frontier_entity_count,
-        percent_rows_avoided=percent,
-        change_events=events,
-        affected_entities=affected,
-        frontier_sql=frontier_sql,
-        metrics_sql=metrics_sql,
-    )
+    extra = [str(value).strip() for value in extra_keys if str(value).strip()]
+    if extra:
+        known = {entity.entity_value for entity in affected}
+        for value in extra:
+            if value in known:
+                continue
+            affected.append(
+                AffectedEntity(
+                    entity_type=config.model.entity,
+                    entity_key=config.model.key,
+                    entity_value=value,
+                    reason="Candidate source key",
+                )
+            )
+            known.add(value)
+
+    queries = [str(query).strip() for query in sql_change_queries if str(query).strip()]
+    sql_differs = bool(before_sql and after_sql and before_sql.strip() != after_sql.strip())
+    required = bool(sql_change_required or (sql_differs and persist))
+    session = isolated_run
+    owns_session = False
+    affected_relation: str | None = None
+    confirmed_keys: tuple[str, ...] | None = None
+    execution_reasons: list[str] = []
+    event_candidate_count: int | None = None
+    sql_change_candidate_count: int | None = None
+    union_candidate_count: int | None = None
+    full_rebuild_required = False
+    targeted_query_id: str | None = None
+    model = manifest.find_model(config.model.name)
+    try:
+        if persist:
+            if not run_id and session is None:
+                raise ConfigError("run id is required to persist isolated affected keys")
+            if session is None:
+                session = open_isolated_run(
+                    warehouse,
+                    run_id=run_id or "",
+                    entity_key=config.model.key,
+                    model_database=model.database,
+                    model_schema=model.schema,
+                    model_relation=model.relation,
+                )
+                owns_session = True
+            keys = merge_unique_keys(
+                (entity.entity_value for entity in affected),
+                extra,
+            )
+            if required and not queries:
+                full_rebuild_required = True
+                execution_reasons.append("SQL impact query unavailable")
+            else:
+                try:
+                    materialized = session.materialize(keys, sql_change_queries=queries)
+                except Exception:
+                    if required:
+                        full_rebuild_required = True
+                        execution_reasons.append("SQL impact query failed")
+                    else:
+                        raise
+                else:
+                    affected_relation = materialized.relation
+                    event_candidate_count = materialized.event_candidate_count
+                    sql_change_candidate_count = materialized.sql_change_candidate_count
+                    union_candidate_count = materialized.union_candidate_count
+                    known = {entity.entity_value: entity for entity in affected}
+                    for value, origin in materialized.origin_keys:
+                        if value in known:
+                            continue
+                        reason = (
+                            SQL_CHANGE_REASON
+                            if origin == ORIGIN_SQL_CHANGE
+                            else _direct_reason(config)
+                        )
+                        known[value] = AffectedEntity(
+                            entity_type=config.model.entity,
+                            entity_key=config.model.key,
+                            entity_value=value,
+                            reason=reason,
+                        )
+                    affected = list(known.values())
+                    if sql_differs:
+                        confirmed_keys = session.confirm(
+                            before_sql=before_sql or "",
+                            after_sql=after_sql or "",
+                        )
+                        targeted_query_id = (
+                            str(session.last_targeted_query_id)
+                            if session.last_targeted_query_id
+                            else None
+                        )
+                        if confirmed_keys is None:
+                            execution_reasons.append("targeted before/after comparison failed")
+                        else:
+                            confirmed_set = set(confirmed_keys)
+                            affected = [
+                                entity
+                                for entity in affected
+                                if entity.entity_value in confirmed_set
+                            ]
+                            for value in confirmed_keys:
+                                if value in {entity.entity_value for entity in affected}:
+                                    continue
+                                affected.append(
+                                    AffectedEntity(
+                                        entity_type=config.model.entity,
+                                        entity_key=config.model.key,
+                                        entity_value=value,
+                                        reason="Confirmed targeted row change",
+                                    )
+                                )
+
+        unique: dict[str, AffectedEntity] = {}
+        for entity in affected:
+            unique.setdefault(entity.entity_value, entity)
+        affected = sorted(unique.values(), key=lambda item: entity_sort_key(item.entity_value))
+
+        metrics_sql = current_frontier_metrics_sql(
+            manifest,
+            config.model.name,
+            dialect=warehouse.dialect,
+        )
+        metric_rows = warehouse.execute(metrics_sql)
+        if not metric_rows:
+            raise ConfigError("Frontier metrics query returned no rows")
+        row = metric_rows[0]
+        full_entity_count = int(row[0])
+        if full_rebuild_required:
+            frontier_entity_count = full_entity_count
+        elif len(row) > 1 and row[1] is not None:
+            frontier_entity_count = int(row[1])
+        else:
+            frontier_entity_count = len(affected)
+        percent = percent_rows_avoided(full_entity_count, frontier_entity_count)
+        return FrontierResult(
+            full_entity_count=full_entity_count,
+            frontier_entity_count=frontier_entity_count,
+            percent_rows_avoided=percent,
+            change_events=events,
+            affected_entities=affected,
+            frontier_sql=frontier_sql,
+            metrics_sql=metrics_sql,
+            affected_relation=affected_relation,
+            confirmed_keys=confirmed_keys,
+            execution_reasons=tuple(execution_reasons),
+            event_candidate_count=event_candidate_count,
+            sql_change_candidate_count=sql_change_candidate_count,
+            union_candidate_count=union_candidate_count,
+            full_rebuild_required=full_rebuild_required,
+            targeted_query_id=targeted_query_id,
+        )
+    finally:
+        if owns_session and session is not None:
+            session.cleanup()
 
 
 def hash_entity_id(
@@ -391,6 +526,15 @@ def frontier_result_to_dict(
             "fullEntityCount": result.full_entity_count,
             "frontierEntityCount": result.frontier_entity_count,
             "percentRowsAvoided": result.percent_rows_avoided,
+            **(
+                {
+                    "eventCandidateCount": result.event_candidate_count,
+                    "sqlChangeCandidateCount": result.sql_change_candidate_count,
+                    "unionCandidateCount": result.union_candidate_count,
+                }
+                if result.union_candidate_count is not None
+                else {}
+            ),
         },
         "changeEvents": change_events,
         "affectedEntities": [

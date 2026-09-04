@@ -37,7 +37,17 @@ python3 -m frontier upload /path/to/jaffle_shop
 
 Entity IDs in `frontier-run.json` are HMAC-SHA-256 hashed with `FRONTIER_ENTITY_HASH_KEY` unless `--include-entity-ids` is set. The key is required for hashed output; there is no plain SHA-256 fallback.
 
-`frontier prove` measures the mutation-repair experiment (full vs frontier rows recomputed, missing/extra frontier entities, mismatched final rows, and EXCEPT duration) after the jaffle-shop overlay models have been built. Customer CI must call `prove`, not `run`.
+`frontier prove` measures a SQL-change or mutation-repair experiment.
+When `--base-manifest` shows modified, added, or removed SQL, the default
+`seeds/change_events.csv` is ignored: the assessment is the compiled SQL
+diff, not a hand-edited event list. Isolated affected keys are written to
+`DBT_CI.FRONTIER_<run_id>_AFFECTED_KEYS` with separate event and
+SQL-change origins. The M14 impact query runs in Snowflake and is unioned
+for execution. Targeted SQL pushes the key join into source CTEs before
+aggregates. Hand-written `frontier_affected_customers` / repaired models
+are not required for a SQL-change proof. When base and PR SQL differ, a
+missing or failed impact query is `FULL_REBUILD_REQUIRED` rather than an
+event-only frontier. Customer CI must call `prove`, not `run`.
 
 `frontier record-failure` writes a failed assessment without reading `target/manifest.json` or `run_results.json`. Use it when dbt build fails so CI cannot upload stale artifacts.
 

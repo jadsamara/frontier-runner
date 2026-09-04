@@ -92,3 +92,19 @@ def test_sql_change_validation_fails_closed_without_empty_affected_set() -> None
     assert rebuild.status == "failed"
     assert "RECURSIVE_CTE" in (rebuild.message or "")
     assert "FILTER_CHANGED" in (rebuild.message or "")
+
+
+def test_sql_change_assessment_skips_event_validations() -> None:
+    config = load_frontier_config(FIXTURES / "frontier.yml")
+    manifest = load_manifest(FIXTURES / "manifest.json")
+    warehouse = FakeWarehouse({"full_entity_count": [(150_000, 8)]})
+    result = run_frontier(config, manifest=manifest, events=[], warehouse=warehouse)
+    validations = collect_validation_results(
+        config=config,
+        manifest=manifest,
+        run_results=load_run_results(FIXTURES / "run_results.json"),
+        events=[],
+        result=result,
+        warehouse=warehouse,
+    )
+    assert validations == []

@@ -72,6 +72,8 @@ def collect_validation_results(
     warehouse: WarehouseAdapter | None = None,
 ) -> list[ValidationResult]:
     collected: list[ValidationResult] = []
+    if not events:
+        return collected
 
     resolve = event_resolution_result(events, result, config)
     recorded = run_results.by_name("assert_frontier_events_resolve")
@@ -186,7 +188,13 @@ def evidence_level(results: list[ValidationResult]) -> str:
         "assert_no_extra_frontier_entities",
         "assert_repaired_equals_reference",
     }
+    sql_proof_tests = {
+        "assert_sql_frontier_covers_reference",
+        "assert_repaired_equals_reference",
+    }
     if all_passed and proof_tests.issubset(names):
+        return "empirically_validated"
+    if all_passed and sql_proof_tests.issubset(names):
         return "empirically_validated"
     if (
         all_passed

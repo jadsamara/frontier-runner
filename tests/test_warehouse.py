@@ -19,7 +19,7 @@ from frontier.warehouse import (
     split_relation_parts,
 )
 
-CORE_MODULES = ("frontier.py", "proof.py", "validation.py")
+CORE_MODULES = ("frontier.py", "proof.py", "validation.py", "execute.py")
 
 
 def test_supported_types_follow_adapter_order() -> None:
@@ -68,6 +68,9 @@ def test_fake_warehouse_implements_adapter() -> None:
     assert warehouse.relation_exists("db.schema.table") is True
     assert warehouse.estimate_query_cost("select 1")["estimated"] is False
     assert warehouse.get_query_history("run-1") == []
+    assert warehouse.last_query_id == "fake-qid-1"
+    profile = warehouse.get_query_profile(warehouse.last_query_id)
+    assert profile["query_id"] == warehouse.last_query_id
     warehouse.close()
 
 
@@ -103,3 +106,14 @@ def test_core_modules_do_not_import_snowflake_client() -> None:
         assert "import frontier.snowflake\n" not in text
         assert "snowflake.connector" not in text
         assert "from frontier.warehouse import" in text
+
+
+def test_snowflake_adapter_reads_query_profile_from_history() -> None:
+    source = Path(__file__).resolve().parents[1] / "frontier" / "adapters" / "snowflake.py"
+    text = source.read_text()
+    assert "def get_query_profile" in text
+    assert "bytes_scanned" in text
+    assert "partitions_scanned" in text
+    assert "information_schema.query_history()" in text
+    assert SnowflakeAdapter().last_query_id is None
+    assert SnowflakeAdapter().get_query_profile("") == {}
