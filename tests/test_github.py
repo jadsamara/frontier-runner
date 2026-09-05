@@ -132,3 +132,44 @@ def test_reference_customer_workflow_uses_prove_and_pinned_runner() -> None:
     assert "DATA_AGENT_DEV" in text
     assert "DBT_CI" in text
 
+
+REFERENCE_CDC_WORKFLOW = SAAS_ROOT / "docs" / "data-agent-pipeline-cdc-workflow.yml"
+
+
+def test_cdc_reference_workflow_is_manual_and_separated() -> None:
+    if not REFERENCE_CDC_WORKFLOW.is_file():
+        pytest.skip("SaaS docs are not present in a standalone runner checkout")
+    text = REFERENCE_CDC_WORKFLOW.read_text()
+    import yaml
+
+    doc = yaml.safe_load(text)
+    triggers = doc.get("on") or doc.get(True)
+    assert "workflow_dispatch" in triggers
+    assert "schedule" not in triggers
+    assert 'cron: "*/15 * * * *"' in text
+    assert doc["concurrency"]["group"] == "frontier-cdc-${{ github.repository }}"
+    assert doc["concurrency"]["cancel-in-progress"] is False
+    step_runs = "\n".join(
+        str(step.get("run") or "") for step in doc["jobs"]["frontier-cdc"]["steps"]
+    )
+    assert "dbt build" not in step_runs
+    assert "frontier cdc status" in text
+    assert "frontier cdc consume" in text
+    assert "frontier cdc prove" in text
+    assert "frontier cdc upload" in text
+    steps = {step["name"]: step for step in doc["jobs"]["frontier-cdc"]["steps"]}
+    snowflake_steps = ("Create dbt profile", "CDC status", "CDC consume", "CDC prove")
+    for name in snowflake_steps:
+        env = steps[name].get("env") or {}
+        assert "SNOWFLAKE_PASSWORD" in env
+        assert "FRONTIER_API_KEY" not in env
+        assert "GITHUB_TOKEN" not in env
+    upload_env = steps["CDC upload"].get("env") or {}
+    assert "FRONTIER_API_KEY" in upload_env
+    assert "FRONTIER_API_URL" in upload_env
+    assert "SNOWFLAKE_PASSWORD" not in upload_env
+    assert "GITHUB_TOKEN" not in upload_env
+    assert "github.token" not in text
+    assert "FRONTIER_RUNNER_REF" in text
+    assert "pip install ./runner" not in text
+

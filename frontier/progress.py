@@ -25,9 +25,15 @@ def failure_status(error: BaseException) -> str:
     return f"failed:{type(error).__name__}"
 
 
-def log_step(message: str, *, duration_ms: int | None = None, status: str | None = None) -> None:
-    """Flush a prove progress line. Never include secrets or entity IDs."""
-    parts = [f"prove: {message}"]
+def log_step(
+    message: str,
+    *,
+    duration_ms: int | None = None,
+    status: str | None = None,
+    prefix: str = "prove",
+) -> None:
+    """Flush a progress line. Never include secrets or entity IDs."""
+    parts = [f"{prefix}: {message}"]
     if status:
         parts.append(status)
     if duration_ms is not None:

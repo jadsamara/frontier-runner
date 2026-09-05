@@ -29,6 +29,11 @@ python3 -m frontier compare /path/to/jaffle_shop --base-manifest /path/to/base/m
 python3 -m frontier run /path/to/jaffle_shop
 python3 -m frontier prove /path/to/jaffle_shop --base-manifest /path/to/base/manifest.json
 python3 -m frontier upload /path/to/jaffle_shop
+python3 -m frontier cdc inspect /path/to/jaffle_shop --target dev
+python3 -m frontier cdc status /path/to/jaffle_shop --target dev
+python3 -m frontier cdc consume /path/to/jaffle_shop --target dev
+python3 -m frontier cdc prove /path/to/jaffle_shop --target dev
+python3 -m frontier cdc upload /path/to/jaffle_shop --target dev
 ```
 
 `python3 -m frontier` always works. After `pyenv rehash`, `frontier` works the same way.
@@ -58,6 +63,8 @@ missing or failed impact query is `FULL_REBUILD_REQUIRED` rather than an
 event-only frontier. Customer CI must call `prove`, not `run`.
 
 `frontier record-failure` writes a failed assessment without reading `target/manifest.json` or `run_results.json`. Use it when dbt build fails so CI cannot upload stale artifacts.
+
+`frontier cdc inspect|status|consume|prove|upload` reads `frontier-cdc.yml` in the dbt project. Inspect prints stream mappings. Status calls `SYSTEM$STREAM_HAS_DATA` without consuming. Consume copies pending Snowflake stream rows into `DATA_AGENT_DEV.FRONTIER_CDC` control tables inside a transaction, then normalizes a DELETE/INSERT `METADATA$ISUPDATE=TRUE` pair into one UPDATE. A plain SELECT is never treated as consumption. `cdc prove` claims the oldest CAPTURED or FAILED batch, routes events to target keys from the YAML mapping, materializes `DBT_DEV.FRONTIER_<batch_id>_AFFECTED_KEYS`, and runs targeted compiled `customer_summary` SQL against current source state. The existing mart is the pre-change baseline. Completion requires routing and validation, not merely stream consumption. A candidate no-op is a successful conservative assessment. Default prove is assessment-only; `--apply` is required to mutate the mart. `cdc upload` sends aggregate CDC evidence to SaaS without recapturing or reproving. If a previous COMPLETED batch was not applied, a later prove fails with `BASELINE_STALE`. Logs include stream name, batch id, counts, status, and duration — never entity IDs, row contents, or credentials. Do not upload raw CDC keys to SaaS.
 
 `frontier compare` reads compiled SQL from the base-branch and PR manifests (and `target/compiled` / `target-base/compiled` when `compiled_code` is missing), classifies semantic changes with a restricted Snowflake parser (sqlglot), and compiles supported diffs into a candidate-key impact query. Alias and formatting changes are ignored. Grain changes, unknown UDFs, empty compiled SQL, and other unsupported SQL return `FULL_REBUILD_REQUIRED` instead of an empty candidate set. `frontier prove` confirms and repairs using the production model whose compiled SQL actually changed, not a downstream mart that only `ref()`s it. The comparison does not send warehouse rows to SaaS. `inspect`, `run`, and `prove` accept `--base-manifest` so artifact fingerprints, change kinds, and impact status are stored on the uploaded assessment.
 

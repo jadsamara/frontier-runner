@@ -1,0 +1,23 @@
+version: 1
+provider: snowflake_stream
+
+sources:
+  - source_model: stg_orders
+    base_relation: DATA_AGENT_DEV.FRONTIER_CDC.ORDERS
+    stream_relation: DATA_AGENT_DEV.FRONTIER_CDC.ORDERS_STREAM
+    primary_key: O_ORDERKEY
+    target_entity: customer
+    target_key: O_CUSTKEY
+    require_before_image_for:
+      - DELETE
+      - KEY_CHANGE
+
+  - source_model: stg_customers
+    base_relation: DATA_AGENT_DEV.FRONTIER_CDC.CUSTOMER
+    stream_relation: DATA_AGENT_DEV.FRONTIER_CDC.CUSTOMER_STREAM
+    primary_key: C_CUSTKEY
+    target_entity: customer
+    target_key: C_CUSTKEY
+    require_before_image_for:
+      - DELETE
+      - KEY_CHANGE

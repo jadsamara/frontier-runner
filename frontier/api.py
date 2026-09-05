@@ -77,6 +77,8 @@ def build_ingest_payload(
     sql_comparison: dict[str, Any] | None = None,
     run_mode: str | None = None,
     candidate_set_origin: str | None = None,
+    assessment_type: str | None = None,
+    cdc: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "externalRunId": external_run_id,
@@ -110,6 +112,10 @@ def build_ingest_payload(
         payload["runMode"] = run_mode
     if candidate_set_origin:
         payload["candidateSetOrigin"] = candidate_set_origin
+    if assessment_type:
+        payload["assessmentType"] = assessment_type
+    if cdc:
+        payload["cdc"] = cdc
     assert_payload_has_no_secrets(payload)
     assert_no_raw_rows(payload)
     return payload

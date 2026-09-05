@@ -153,7 +153,7 @@ class FakeWarehouse:
         self.last_query_id = f"fake-qid-{len(self.executed)}"
         self.query_ids.append(self.last_query_id)
         normalized = " ".join(sql.lower().split())
-        if normalized.startswith(("create ", "drop ", "insert ", "create or replace")):
+        if normalized.startswith(("create ", "drop ", "insert ", "delete ", "merge ", "create or replace")):
             return []
         if "as frontier_origin_keys" in normalized:
             matched = self._match_response(normalized)
@@ -169,6 +169,11 @@ class FakeWarehouse:
             sql_change = {value for value, origin in keys if origin == "sql_change"}
             union = {value for value, _origin in keys}
             return [(len(events), len(sql_change), len(union))]
+        if "as frontier_cdc_full_count" in normalized:
+            matched = self._match_response(normalized)
+            if matched is not None:
+                return matched
+            return [(150_000,)]
         matched = self._match_response(normalized)
         if matched is not None:
             return matched

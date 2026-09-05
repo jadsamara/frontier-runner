@@ -61,6 +61,11 @@ from frontier.progress import (
     failure_status,
     log_step,
 )
+from frontier.cdc.config import cdc_config_path, load_cdc_config
+from frontier.cdc.consume import consume_all, project_name_for
+from frontier.cdc.prove import prove_batch
+from frontier.cdc.store import SnowflakeCdcStore
+from frontier.cdc.upload import upload_cdc_batch
 from frontier.proof import (
     apply_resolved_delete,
     measure_mutation_proof,
@@ -1321,6 +1326,206 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     _add_base_manifest(parser)
 
 
+def _cdc_path(args: argparse.Namespace, project_dir: Path) -> Path:
+    return cdc_config_path(project_dir, getattr(args, "cdc_config", None))
+
+
+def cmd_cdc_inspect(args: argparse.Namespace) -> int:
+    project_dir = _project_dir(args)
+    config = load_cdc_config(_cdc_path(args, project_dir))
+    print(f"CDC provider: {config.provider}", flush=True)
+    print(f"Sources: {len(config.sources)}", flush=True)
+    for source in config.sources:
+        print(f"- {source.source_model}", flush=True)
+        print(f"  stream: {source.stream_name}", flush=True)
+        print(f"  base: {source.base_relation}", flush=True)
+        print(f"  stream_relation: {source.stream_relation}", flush=True)
+        print(f"  primary_key: {source.primary_key}", flush=True)
+        print(f"  target_entity: {source.target_entity}", flush=True)
+        print(f"  target_key: {source.target_key}", flush=True)
+        required = ",".join(source.require_before_image_for) or "(none)"
+        print(f"  require_before_image_for: {required}", flush=True)
+    return 0
+
+
+def cmd_cdc_status(args: argparse.Namespace) -> int:
+    project_dir = _project_dir(args)
+    config = load_cdc_config(_cdc_path(args, project_dir))
+    warehouse = connect_warehouse(
+        project_dir,
+        profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
+        target=getattr(args, "target", None),
+    )
+    try:
+        store = SnowflakeCdcStore(warehouse, config)
+        log_step("status started", prefix="cdc")
+        for source in config.sources:
+            pending = store.stream_has_data(source.stream_relation)
+            state = "pending" if pending else "empty"
+            print(f"{source.stream_name}: {state}", flush=True)
+        log_step("status completed", prefix="cdc", status="ok")
+    finally:
+        warehouse.close()
+    return 0
+
+
+def cmd_cdc_consume(args: argparse.Namespace) -> int:
+    project_dir = _project_dir(args)
+    config = load_cdc_config(_cdc_path(args, project_dir))
+    warehouse = connect_warehouse(
+        project_dir,
+        profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
+        target=getattr(args, "target", None),
+    )
+    started = time.perf_counter()
+    log_step("consume started", prefix="cdc")
+    try:
+        store = SnowflakeCdcStore(warehouse, config)
+        results = consume_all(
+            config,
+            store=store,
+            project_name=project_name_for(project_dir),
+        )
+    except Exception as error:
+        log_step(
+            "consume completed",
+            prefix="cdc",
+            duration_ms=elapsed_ms(started),
+            status=failure_status(error),
+        )
+        warehouse.close()
+        raise
+    warehouse.close()
+    log_step("consume completed", prefix="cdc", duration_ms=elapsed_ms(started), status="ok")
+    for result in results:
+        counts = result.operation_counts
+        print(
+            f"{result.stream_name}: {result.status} "
+            f"batch={result.batch_id or '-'} "
+            f"raw={result.raw_record_count} logical={result.logical_event_count} "
+            f"inserts={counts['inserts']} updates={counts['updates']} "
+            f"deletes={counts['deletes']}",
+            flush=True,
+        )
+    return 0
+
+
+def cmd_cdc_prove(args: argparse.Namespace) -> int:
+    project_dir = _project_dir(args)
+    require_current_artifacts(_target_dir(project_dir))
+    cdc_config = load_cdc_config(_cdc_path(args, project_dir))
+    frontier_config = load_frontier_config(_config_path(args, project_dir))
+    manifest = load_manifest(_target_dir(project_dir) / "manifest.json")
+    warehouse = connect_warehouse(
+        project_dir,
+        profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
+        target=getattr(args, "target", None),
+    )
+    started = time.perf_counter()
+    log_step("prove started", prefix="cdc")
+    try:
+        store = SnowflakeCdcStore(warehouse, cdc_config)
+        result = prove_batch(
+            store=store,
+            warehouse=warehouse,
+            cdc_config=cdc_config,
+            frontier_config=frontier_config,
+            manifest=manifest,
+            compiled_root=_compiled_root_for(_target_dir(project_dir) / "manifest.json"),
+            project_name=project_name_for(project_dir),
+            batch_id=getattr(args, "batch_id", None),
+            apply=bool(getattr(args, "apply", False)),
+            output_dir=_target_dir(project_dir),
+        )
+    except Exception as error:
+        log_step(
+            "prove completed",
+            prefix="cdc",
+            duration_ms=elapsed_ms(started),
+            status=failure_status(error),
+        )
+        warehouse.close()
+        raise
+    warehouse.close()
+    log_step(
+        "prove completed",
+        prefix="cdc",
+        duration_ms=elapsed_ms(started),
+        status=result.status,
+    )
+    if result.status == "NO_BATCH":
+        print("no CAPTURED batch available", flush=True)
+        return 0
+    print(f"logical events: {result.logical_event_count}", flush=True)
+    print(f"event-derived candidates: {result.event_candidate_count}", flush=True)
+    print(f"SQL-change candidates: {result.sql_change_candidate_count}", flush=True)
+    print(f"union candidates: {result.union_candidate_count}", flush=True)
+    print(f"confirmed changes: {result.confirmed_change_count}", flush=True)
+    print(f"candidate no-ops: {result.no_op_count}", flush=True)
+    print(f"missed events: {result.missed_event_count}", flush=True)
+    print(f"validation: {result.validation}", flush=True)
+    print(f"batch: {result.status}", flush=True)
+    if result.evidence:
+        print("evidence: " + ", ".join(result.evidence), flush=True)
+    if result.repair_path:
+        print(f"repair artifact: {result.repair_path}", flush=True)
+    return 0
+
+
+def cmd_cdc_upload(args: argparse.Namespace) -> int:
+    project_dir = _project_dir(args)
+    require_current_artifacts(_target_dir(project_dir))
+    cdc_config = load_cdc_config(_cdc_path(args, project_dir))
+    frontier_config = load_frontier_config(_config_path(args, project_dir))
+    manifest = load_manifest(_target_dir(project_dir) / "manifest.json")
+    warehouse = connect_warehouse(
+        project_dir,
+        profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
+        target=getattr(args, "target", None),
+    )
+    api_url = args.api_url or os.environ.get("FRONTIER_API_URL") or frontier_config.api_url
+    api_key, api_key_source = api_key_from_env()
+    print(
+        f"Uploading CDC assessment to {api_url} "
+        f"as {redact_api_key(api_key)} ({api_key_source})",
+        flush=True,
+    )
+    started = time.perf_counter()
+    log_step("upload started", prefix="cdc")
+    try:
+        store = SnowflakeCdcStore(warehouse, cdc_config)
+        result = upload_cdc_batch(
+            store=store,
+            warehouse=warehouse,
+            cdc_config=cdc_config,
+            frontier_config=frontier_config,
+            manifest=manifest,
+            project_name=project_name_for(project_dir),
+            api_url=api_url,
+            api_key=api_key,
+            batch_id=getattr(args, "batch_id", None),
+        )
+    except Exception as error:
+        log_step(
+            "upload completed",
+            prefix="cdc",
+            duration_ms=elapsed_ms(started),
+            status=failure_status(error),
+        )
+        warehouse.close()
+        raise
+    warehouse.close()
+    http_status = result.get("httpStatus")
+    created = result.get("created")
+    print(f"HTTP {http_status}", flush=True)
+    print(f"created: {str(created).lower() if isinstance(created, bool) else created}", flush=True)
+    print("assessment type: cdc", flush=True)
+    print(f"batch: {result.get('batchId')}", flush=True)
+    print(f"batch upload status: {(result.get('uploadStatus') or '').lower()}", flush=True)
+    print(f"run: {result.get('id')}", flush=True)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="frontier",
@@ -1414,6 +1619,60 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not post or update a GitHub pull request comment after upload",
     )
     upload.set_defaults(func=cmd_upload)
+
+    cdc = sub.add_parser("cdc", help="Inspect, status, consume, prove, and upload Snowflake CDC streams")
+    cdc_sub = cdc.add_subparsers(dest="cdc_command", required=True)
+    cdc_inspect = cdc_sub.add_parser("inspect", help="Print configured CDC streams without consuming them")
+    _add_project_dir(cdc_inspect)
+    cdc_inspect.add_argument("--cdc-config", help="Path to frontier-cdc.yml")
+    cdc_inspect.add_argument("--target", help="dbt target name")
+    cdc_inspect.set_defaults(func=cmd_cdc_inspect)
+
+    cdc_status = cdc_sub.add_parser("status", help="Report whether configured streams have pending data")
+    _add_project_dir(cdc_status)
+    cdc_status.add_argument("--cdc-config", help="Path to frontier-cdc.yml")
+    cdc_status.add_argument("--config", help="Path to frontier.yml")
+    cdc_status.add_argument("--profiles", help="dbt profiles.yml (default: ~/.dbt/profiles.yml)")
+    cdc_status.add_argument("--target", help="dbt target name")
+    cdc_status.set_defaults(func=cmd_cdc_status)
+
+    cdc_consume = cdc_sub.add_parser("consume", help="Durably capture pending stream records")
+    _add_project_dir(cdc_consume)
+    cdc_consume.add_argument("--cdc-config", help="Path to frontier-cdc.yml")
+    cdc_consume.add_argument("--config", help="Path to frontier.yml")
+    cdc_consume.add_argument("--profiles", help="dbt profiles.yml (default: ~/.dbt/profiles.yml)")
+    cdc_consume.add_argument("--target", help="dbt target name")
+    cdc_consume.set_defaults(func=cmd_cdc_consume)
+
+    cdc_prove = cdc_sub.add_parser(
+        "prove",
+        help="Route a captured CDC batch and run targeted proof",
+    )
+    _add_project_dir(cdc_prove)
+    cdc_prove.add_argument("--cdc-config", help="Path to frontier-cdc.yml")
+    cdc_prove.add_argument("--config", help="Path to frontier.yml")
+    cdc_prove.add_argument("--profiles", help="dbt profiles.yml (default: ~/.dbt/profiles.yml)")
+    cdc_prove.add_argument("--target", help="dbt target name")
+    cdc_prove.add_argument("--batch-id", help="Captured batch to prove (default: oldest CAPTURED or FAILED)")
+    cdc_prove.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the repair to the target mart (default: assessment only)",
+    )
+    cdc_prove.set_defaults(func=cmd_cdc_prove)
+
+    cdc_upload = cdc_sub.add_parser(
+        "upload",
+        help="Upload a completed CDC assessment to Frontier SaaS without re-running proof",
+    )
+    _add_project_dir(cdc_upload)
+    cdc_upload.add_argument("--cdc-config", help="Path to frontier-cdc.yml")
+    cdc_upload.add_argument("--config", help="Path to frontier.yml")
+    cdc_upload.add_argument("--profiles", help="dbt profiles.yml (default: ~/.dbt/profiles.yml)")
+    cdc_upload.add_argument("--target", help="dbt target name")
+    cdc_upload.add_argument("--batch-id", help="Completed batch to upload (default: newest COMPLETED not yet uploaded)")
+    cdc_upload.add_argument("--api-url", help="Frontier API origin")
+    cdc_upload.set_defaults(func=cmd_cdc_upload)
     return parser
 
 
