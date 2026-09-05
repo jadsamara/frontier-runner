@@ -29,6 +29,7 @@ from frontier.compare import (
     comparison_for_ingest,
     compiled_sql_pair_for_sql_change,
     format_compare_report,
+    sql_change_reference_relation,
     stamp_impact_execution,
 )
 from frontier.github import base_commit_sha, default_external_run_id, env_flag, github_source
@@ -918,6 +919,8 @@ def cmd_prove(args: argparse.Namespace) -> int:
             log_step("targeted head execution completed", status="skipped:dry-run")
             log_step("confirmation started")
             log_step("confirmation completed", status="skipped:dry-run")
+            log_step("SQL-change proof started")
+            log_step("SQL-change proof completed", status="skipped:dry-run")
             log_step("cleanup started")
             log_step("cleanup completed", status="skipped:dry-run")
             _print_phase(PHASE_IMPACT, skipped="dry-run")
@@ -970,26 +973,53 @@ def cmd_prove(args: argparse.Namespace) -> int:
         if sql_change_demo:
             if sql_proof is None:
                 if rebuild_recommended:
+                    log_step("SQL-change proof started")
                     sql_proof = recommended_sql_change_proof(
                         full_entity_count=result.full_entity_count,
                         candidate_count=discovered_candidates or 0,
                         changed_source_row_count=discovered_source_rows or 0,
                     )
+                    log_step("SQL-change proof completed", status="skipped:FULL_REBUILD_RECOMMENDED")
                 else:
                     if not result.affected_relation or not base_sql or not after_sql:
                         raise ConfigError("SQL-change proof requires compiled base/PR SQL and affected keys")
-                    sql_proof = measure_sql_change_proof(
-                        config,
-                        warehouse=warehouse,
-                        before_sql=base_sql,
-                        after_sql=after_sql,
-                        affected_relation=result.affected_relation,
-                        impact_sql=sql_change_queries[0] if sql_change_queries else None,
-                        candidate_count=result.union_candidate_count,
-                        confirmed_count=len(result.confirmed_keys) if result.confirmed_keys is not None else None,
-                        full_rebuild_required=result.full_rebuild_required,
-                        targeted_before_relation=isolated.targeted_base_relation if isolated else None,
-                        targeted_after_relation=isolated.targeted_head_relation if isolated else None,
+                    confirmed_count = result.confirmed_count
+                    if confirmed_count is None and result.confirmed_keys is not None:
+                        confirmed_count = len(result.confirmed_keys)
+                    log_step("SQL-change proof started")
+                    started = time.perf_counter()
+                    try:
+                        sql_proof = measure_sql_change_proof(
+                            config,
+                            warehouse=warehouse,
+                            before_sql=base_sql,
+                            after_sql=after_sql,
+                            affected_relation=result.affected_relation,
+                            impact_sql=sql_change_queries[0] if sql_change_queries else None,
+                            candidate_count=result.union_candidate_count,
+                            confirmed_count=confirmed_count,
+                            full_rebuild_required=result.full_rebuild_required,
+                            targeted_before_relation=isolated.targeted_base_relation if isolated else None,
+                            targeted_after_relation=isolated.targeted_head_relation if isolated else None,
+                            reference_relation=sql_change_reference_relation(
+                                target_name=config.model.name,
+                                pr_manifest=manifest,
+                                sql_comparison=sql_comparison,
+                            ),
+                            full_entity_count=result.full_entity_count,
+                            changed_source_row_count=discovered_source_rows,
+                        )
+                    except Exception as error:
+                        log_step(
+                            "SQL-change proof completed",
+                            duration_ms=elapsed_ms(started),
+                            status=failure_status(error),
+                        )
+                        raise
+                    log_step(
+                        "SQL-change proof completed",
+                        duration_ms=elapsed_ms(started),
+                        status="ok",
                     )
             if dry_run:
                 result.affected_entities = recorded_sql_change_affected(
@@ -1013,18 +1043,29 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 warehouse=warehouse,
                 affected_relation=result.affected_relation,
             )
-        validations = collect_validation_results(
-            config=config,
-            manifest=manifest,
-            run_results=run_results,
-            events=events,
-            result=result,
-            warehouse=None if dry_run else warehouse,
-        )
-        if sql_proof is not None and not rebuild_recommended:
-            validations.extend(sql_change_proof_validation_results(sql_proof))
-        elif proof is not None:
-            validations.extend(proof_validation_results(proof))
+        log_step("validation started")
+        started = time.perf_counter()
+        try:
+            validations = collect_validation_results(
+                config=config,
+                manifest=manifest,
+                run_results=run_results,
+                events=events,
+                result=result,
+                warehouse=None if dry_run else warehouse,
+            )
+            if sql_proof is not None and not rebuild_recommended:
+                validations.extend(sql_change_proof_validation_results(sql_proof))
+            elif proof is not None:
+                validations.extend(proof_validation_results(proof))
+        except Exception as error:
+            log_step(
+                "validation completed",
+                duration_ms=elapsed_ms(started),
+                status=failure_status(error),
+            )
+            raise
+        log_step("validation completed", duration_ms=elapsed_ms(started), status="ok")
     finally:
         if isolated is not None:
             isolated.cleanup()

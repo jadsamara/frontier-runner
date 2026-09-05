@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -13,6 +14,7 @@ from frontier.config import ConfigError, FrontierConfig
 from frontier.dbt_artifacts import Manifest
 from frontier.execute import IsolatedRun, ORIGIN_SQL_CHANGE, SQL_CHANGE_REASON, merge_unique_keys, open_isolated_run
 from frontier.hashing import entity_type_from_key, hmac_entity_id
+from frontier.progress import elapsed_ms, failure_status, log_step
 from frontier.warehouse import WarehouseAdapter
 
 REF_PATTERN = re.compile(r"\{\{\s*ref\(\s*['\"]([^'\"]+)['\"]\s*\)\s*\}\}")
@@ -48,6 +50,7 @@ class FrontierResult:
     metrics_sql: str
     affected_relation: str | None = None
     confirmed_keys: tuple[str, ...] | None = None
+    confirmed_count: int | None = None
     execution_reasons: tuple[str, ...] = ()
     event_candidate_count: int | None = None
     sql_change_candidate_count: int | None = None
@@ -370,7 +373,7 @@ def run_frontier(
                         )
                         if confirmed_keys is None:
                             execution_reasons.append("targeted before/after comparison failed")
-                        else:
+                        elif confirmed_keys:
                             confirmed_set = set(confirmed_keys)
                             affected = [
                                 entity
@@ -399,7 +402,18 @@ def run_frontier(
             config.model.name,
             dialect=warehouse.dialect,
         )
-        metric_rows = warehouse.execute(metrics_sql)
+        log_step("frontier metrics started")
+        started = time.perf_counter()
+        try:
+            metric_rows = warehouse.execute(metrics_sql)
+        except Exception as error:
+            log_step(
+                "frontier metrics completed",
+                duration_ms=elapsed_ms(started),
+                status=failure_status(error),
+            )
+            raise
+        log_step("frontier metrics completed", duration_ms=elapsed_ms(started), status="ok")
         if not metric_rows:
             raise ConfigError("Frontier metrics query returned no rows")
         row = metric_rows[0]
@@ -421,6 +435,7 @@ def run_frontier(
             metrics_sql=metrics_sql,
             affected_relation=affected_relation,
             confirmed_keys=confirmed_keys,
+            confirmed_count=session.confirmed_count if session is not None else None,
             execution_reasons=tuple(execution_reasons),
             event_candidate_count=event_candidate_count,
             sql_change_candidate_count=sql_change_candidate_count,

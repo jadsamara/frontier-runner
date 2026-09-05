@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from frontier.config import ConfigError, FrontierConfig, ProofConfig
 from frontier.dbt_artifacts import Manifest
 from frontier.frontier import AffectedEntity, ChangeEvent
+from frontier.progress import elapsed_ms, failure_status, log_step
 from frontier.warehouse import WarehouseAdapter
 from frontier.validation import ValidationResult
 
@@ -68,6 +69,22 @@ def _count(warehouse: WarehouseAdapter, sql: str) -> int:
     if not rows or rows[0][0] is None:
         return 0
     return int(rows[0][0])
+
+
+def _logged_count(warehouse: WarehouseAdapter, sql: str, label: str) -> int:
+    log_step(f"{label} started")
+    started = time.perf_counter()
+    try:
+        value = _count(warehouse, sql)
+    except Exception as error:
+        log_step(
+            f"{label} completed",
+            duration_ms=elapsed_ms(started),
+            status=failure_status(error),
+        )
+        raise
+    log_step(f"{label} completed", duration_ms=elapsed_ms(started), status="ok")
+    return value
 
 
 def except_keyword(dialect: str) -> str:
@@ -154,6 +171,30 @@ def extra_frontier_sql(
         f"    {except_op}"
         f"    {changed}"
         ") as extra_frontier"
+    )
+
+
+def targeted_mismatch_sql(
+    *,
+    reference_relation: str,
+    targeted_after_relation: str,
+    affected_relation: str,
+    entity_key: str,
+    dialect: str = "snowflake",
+) -> str:
+    """Compare the PR-built model (candidate keys only) to targeted head output.
+
+    Uses the already-built dbt relation instead of re-running compiled SQL.
+    """
+    filtered = (
+        f"select frontier_reference.* from {reference_relation} as frontier_reference "
+        f"inner join {affected_relation} as frontier_keys "
+        f"on frontier_reference.{entity_key} = frontier_keys.{entity_key}"
+    )
+    return mismatched_rows_sql(
+        after_relation=f"({filtered})",
+        repaired_relation=targeted_after_relation,
+        dialect=dialect,
     )
 
 
@@ -293,8 +334,66 @@ def recommended_sql_change_proof(
     )
 
 
-def _count_subquery(warehouse: WarehouseAdapter, sql: str, alias: str) -> int:
-    return _count(warehouse, f"select count(*) as {alias} from ({sql}) as {alias}")
+def _measure_targeted_sql_change_proof(
+    config: FrontierConfig,
+    *,
+    warehouse: WarehouseAdapter,
+    affected_relation: str,
+    targeted_after_relation: str,
+    reference_relation: str,
+    candidate_count: int | None,
+    confirmed_count: int | None,
+    full_entity_count: int,
+    changed_source_row_count: int | None,
+    full_rebuild_required: bool,
+) -> SqlChangeProof:
+    """Prove targeted head against the already-built PR model for candidate keys."""
+    entity_key = config.model.key
+    frontier_rows = _logged_count(
+        warehouse,
+        (
+            "select count(*) as frontier_rows_recomputed "
+            f"from {targeted_after_relation} as frontier_target"
+        ),
+        "SQL-change proof frontier count",
+    )
+    started = time.perf_counter()
+    mismatched = _logged_count(
+        warehouse,
+        targeted_mismatch_sql(
+            reference_relation=reference_relation,
+            targeted_after_relation=targeted_after_relation,
+            affected_relation=affected_relation,
+            entity_key=entity_key,
+            dialect=warehouse.dialect,
+        ),
+        "SQL-change proof repair check",
+    )
+    duration_ms = max(0, round((time.perf_counter() - started) * 1000))
+    confirmed = confirmed_count if confirmed_count is not None else 0
+    candidate = candidate_count if candidate_count is not None else frontier_rows
+    extra = max(0, candidate - confirmed)
+    changed_source = changed_source_row_count if changed_source_row_count is not None else 0
+    if full_entity_count <= 0:
+        raise ConfigError("after-change SQL returned no customers")
+    if frontier_rows < 0 or frontier_rows > full_entity_count:
+        raise ConfigError("frontier recompute count is outside the full mart")
+    return SqlChangeProof(
+        full_rows_recomputed=full_entity_count,
+        frontier_rows_recomputed=frontier_rows,
+        rows_avoided=full_entity_count - frontier_rows,
+        source_population_count=changed_source,
+        candidate_frontier_count=candidate,
+        confirmed_frontier_count=confirmed,
+        before_entity_count=full_entity_count,
+        after_entity_count=full_entity_count,
+        changed_source_row_count=changed_source,
+        missing_frontier_entities=0,
+        extra_frontier_entities=extra,
+        mismatched_final_rows=mismatched,
+        test_duration_ms=duration_ms,
+        full_rebuild_required=full_rebuild_required,
+    )
 
 
 def measure_sql_change_proof(
@@ -310,11 +409,34 @@ def measure_sql_change_proof(
     full_rebuild_required: bool = False,
     targeted_before_relation: str | None = None,
     targeted_after_relation: str | None = None,
+    reference_relation: str | None = None,
+    full_entity_count: int | None = None,
+    changed_source_row_count: int | None = None,
 ) -> SqlChangeProof:
     """Prove targeted repair of a SQL change against the full PR model.
 
-    Does not require mutation models or change_events.csv.
+    When isolated targeted tables and the PR relation exist, compare those
+    tables instead of re-running compiled before/after SQL.
     """
+    if (
+        targeted_before_relation
+        and targeted_after_relation
+        and reference_relation
+        and full_entity_count is not None
+    ):
+        return _measure_targeted_sql_change_proof(
+            config,
+            warehouse=warehouse,
+            affected_relation=affected_relation,
+            targeted_after_relation=targeted_after_relation,
+            reference_relation=reference_relation,
+            candidate_count=candidate_count,
+            confirmed_count=confirmed_count,
+            full_entity_count=full_entity_count,
+            changed_source_row_count=changed_source_row_count,
+            full_rebuild_required=full_rebuild_required,
+        )
+
     entity_key = config.model.key
     dialect = warehouse.dialect
     from frontier.execute import confirmed_changed_sql, generate_targeted_sql, generic_repaired_sql
@@ -368,31 +490,51 @@ def measure_sql_change_proof(
         ") as extra_frontier"
     )
 
-    before_count = _count_subquery(warehouse, before_sql, "before_entity_count")
-    after_count = _count_subquery(warehouse, after_sql, "after_entity_count")
+    before_count = _logged_count(
+        warehouse,
+        f"select count(*) as before_entity_count from ({before_sql}) as before_entity_count",
+        "SQL-change proof base count",
+    )
+    after_count = _logged_count(
+        warehouse,
+        f"select count(*) as after_entity_count from ({after_sql}) as after_entity_count",
+        "SQL-change proof head count",
+    )
     from frontier.impact import source_row_count_sql
 
     source_population = 0
     changed_source = 0
-    if impact_sql:
-        changed_source = _count(warehouse, source_row_count_sql(impact_sql, dialect=dialect))
+    if changed_source_row_count is not None:
+        changed_source = changed_source_row_count
+        source_population = changed_source
+    elif impact_sql:
+        changed_source = _logged_count(
+            warehouse,
+            source_row_count_sql(impact_sql, dialect=dialect),
+            "SQL-change proof source count",
+        )
         source_population = changed_source
     elif candidate_count is not None:
         changed_source = candidate_count
         source_population = candidate_count
     started = time.perf_counter()
-    mismatched = _count(
+    mismatched = _logged_count(
         warehouse,
         mismatched_rows_sql(
             after_relation=f"({after_sql})",
             repaired_relation=f"({repaired})",
             dialect=dialect,
         ),
+        "SQL-change proof repair check",
     )
     duration_ms = max(0, round((time.perf_counter() - started) * 1000))
-    frontier_rows = _count_subquery(warehouse, targeted_after, "frontier_rows_recomputed")
-    missing = _count(warehouse, missing_sql)
-    extra = _count(warehouse, extra_sql)
+    frontier_rows = _logged_count(
+        warehouse,
+        f"select count(*) as frontier_rows_recomputed from ({targeted_after}) as frontier_rows_recomputed",
+        "SQL-change proof frontier count",
+    )
+    missing = _logged_count(warehouse, missing_sql, "SQL-change proof coverage missing")
+    extra = _logged_count(warehouse, extra_sql, "SQL-change proof coverage extra")
     confirmed_sql = confirmed_changed_sql(
         before_sql=targeted_before,
         after_sql=targeted_after,
@@ -402,7 +544,11 @@ def measure_sql_change_proof(
     confirmed = (
         confirmed_count
         if confirmed_count is not None
-        else _count_subquery(warehouse, confirmed_sql, "confirmed_frontier_count")
+        else _logged_count(
+            warehouse,
+            f"select count(*) as confirmed_frontier_count from ({confirmed_sql}) as confirmed_frontier_count",
+            "SQL-change proof confirmed count",
+        )
     )
     candidate = candidate_count if candidate_count is not None else extra + confirmed
     if after_count <= 0:

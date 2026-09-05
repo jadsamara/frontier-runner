@@ -99,6 +99,38 @@ def compiled_sql_pair_for_sql_change(
     return fallback
 
 
+def sql_change_reference_relation(
+    *,
+    target_name: str,
+    pr_manifest: Manifest,
+    sql_comparison: dict[str, Any] | None = None,
+) -> str | None:
+    """Already-built PR relation for the production model whose SQL changed."""
+    names: list[str] = []
+    for row in (sql_comparison or {}).get("modified") or []:
+        name = str(row.get("name") or "")
+        if (
+            is_sql_change_impact_model(
+                name,
+                tags=tuple(row.get("tags") or ()),
+                target_name=target_name,
+            )
+            and name not in names
+        ):
+            names.append(name)
+    if target_name and target_name not in names:
+        names.append(target_name)
+    for name in names:
+        try:
+            node = pr_manifest.find_model(name)
+        except ConfigError:
+            continue
+        relation = (node.relation or "").strip()
+        if relation:
+            return relation
+    return None
+
+
 def model_sql_fingerprint(
     node: DbtNode,
     *,

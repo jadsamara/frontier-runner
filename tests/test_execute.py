@@ -402,6 +402,27 @@ def test_unsupported_confirmation_is_not_an_empty_set() -> None:
     assert confirmed is None
 
 
+def test_confirm_counts_without_returning_entity_ids() -> None:
+    warehouse = FakeWarehouse({"confirmed_frontier_count": [(8,)]})
+    session = IsolatedRun(
+        warehouse=warehouse,
+        relation="DATA_AGENT_DEV.DBT_CI.FRONTIER_RUN_AFFECTED_KEYS",
+        database="DATA_AGENT_DEV",
+        schema="DBT_CI",
+        run_id="run",
+        entity_key="customer_id",
+    )
+    confirmed = session.confirm(
+        before_sql="select customer_id, 1 as total_orders from stg_orders where order_status = 'F'",
+        after_sql="select customer_id, 1 as total_orders from stg_orders where order_status in ('F', 'O')",
+    )
+    assert confirmed == ()
+    assert session.confirmed_count == 8
+    executed = "\n".join(warehouse.executed).lower()
+    assert "confirmed_frontier_count" in executed
+    assert "create or replace table" in executed
+
+
 def test_cleanup_runs_on_success_and_failure() -> None:
     warehouse = FakeWarehouse({"full_entity_count": [(150_000,)]})
     session = IsolatedRun(

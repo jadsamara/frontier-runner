@@ -18,6 +18,7 @@ from frontier.proof import (
     recorded_sql_change_affected,
     recorded_sql_change_proof,
     sql_change_proof_validation_results,
+    targeted_mismatch_sql,
 )
 from frontier.warehouse import FakeWarehouse
 from frontier.validation import evidence_level
@@ -203,6 +204,70 @@ def test_measure_sql_change_proof_with_fake_warehouse() -> None:
     assert proof.targeted_repair_safe is True
 
 
+def test_measure_sql_change_proof_uses_targeted_tables_not_full_recompute() -> None:
+    config = load_frontier_config(FIXTURES / "frontier.yml")
+    before_sql = (
+        "select customer_id, 1 as total_orders from DATA_AGENT_DEV.DBT_CI.stg_orders "
+        "where order_status = 'F'"
+    )
+    after_sql = (
+        "select customer_id, 1 as total_orders from DATA_AGENT_DEV.DBT_CI.stg_orders "
+        "where order_status in ('F', 'O')"
+    )
+    warehouse = FakeWarehouse(
+        {
+            "frontier_rows_recomputed": [(99_621,)],
+            "mismatched_final_rows": [(0,)],
+        }
+    )
+    proof = measure_sql_change_proof(
+        config,
+        warehouse=warehouse,
+        before_sql=before_sql,
+        after_sql=after_sql,
+        affected_relation="DATA_AGENT_DEV.DBT_CI.FRONTIER_TEST_AFFECTED_KEYS",
+        impact_sql="select distinct customer_id from DATA_AGENT_DEV.DBT_CI.stg_orders where order_status = 'O'",
+        candidate_count=99_621,
+        confirmed_count=99_621,
+        targeted_before_relation="DATA_AGENT_DEV.DBT_CI.FRONTIER_TEST_TARGET_BASE",
+        targeted_after_relation="DATA_AGENT_DEV.DBT_CI.FRONTIER_TEST_TARGET_HEAD",
+        reference_relation="DATA_AGENT_DEV.DBT_CI.int_customer_orders",
+        full_entity_count=150_000,
+        changed_source_row_count=732_044,
+    )
+    executed = "\n".join(warehouse.executed)
+    assert before_sql not in executed
+    assert after_sql not in executed
+    assert "stg_orders" not in executed.lower()
+    assert "int_customer_orders" in executed.lower()
+    assert "frontier_test_target_head" in executed.lower()
+    assert "frontier_test_affected_keys" in executed.lower()
+    assert proof.changed_source_row_count == 732_044
+    assert proof.candidate_frontier_count == 99_621
+    assert proof.confirmed_frontier_count == 99_621
+    assert proof.frontier_rows_recomputed == 99_621
+    assert proof.full_rows_recomputed == 150_000
+    assert proof.extra_frontier_entities == 0
+    assert proof.missing_frontier_entities == 0
+    assert proof.mismatched_final_rows == 0
+    assert proof.percent_rows_avoided == 33.586
+
+
+def test_targeted_mismatch_sql_joins_pr_relation() -> None:
+    sql = targeted_mismatch_sql(
+        reference_relation="DATA_AGENT_DEV.DBT_CI.int_customer_orders",
+        targeted_after_relation="DATA_AGENT_DEV.DBT_CI.FRONTIER_TEST_TARGET_HEAD",
+        affected_relation="DATA_AGENT_DEV.DBT_CI.FRONTIER_TEST_AFFECTED_KEYS",
+        entity_key="customer_id",
+    )
+    lowered = sql.lower()
+    assert "int_customer_orders" in lowered
+    assert "frontier_test_target_head" in lowered
+    assert "inner join" in lowered
+    assert "stg_orders" not in lowered
+    assert sql.count("except") == 2
+
+
 def test_measure_sql_change_proof_separates_source_rows_from_candidates() -> None:
     config = load_frontier_config(FIXTURES / "frontier.yml")
     warehouse = FakeWarehouse(
@@ -226,6 +291,7 @@ def test_measure_sql_change_proof_separates_source_rows_from_candidates() -> Non
         impact_sql="select distinct customer_id from DATA_AGENT_DEV.DBT_CI.STG_ORDERS where order_status in ('O')",
         candidate_count=99_621,
         confirmed_count=99_621,
+        changed_source_row_count=732_044,
     )
     assert proof.changed_source_row_count == 732_044
     assert proof.source_population_count == 732_044

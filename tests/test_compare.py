@@ -6,6 +6,7 @@ from frontier.compare import (
     compare_manifests,
     compiled_sql_for,
     compiled_sql_pair_for_sql_change,
+    sql_change_reference_relation,
     stamp_impact_execution,
 )
 from frontier.dbt_artifacts import DbtNode, Manifest
@@ -305,6 +306,17 @@ def test_compiled_sql_pair_prefers_changed_production_model() -> None:
         },
     )
     assert pair == (before, after)
+    relation = sql_change_reference_relation(
+        target_name="customer_summary",
+        pr_manifest=pr,
+        sql_comparison={
+            "modified": [
+                {"name": "frontier_customer_orders_target"},
+                {"name": "int_customer_orders"},
+            ]
+        },
+    )
+    assert relation and "int_customer_orders" in relation
 
 
 def test_compare_does_not_compile_demo_or_mutation_models() -> None:

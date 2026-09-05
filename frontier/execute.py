@@ -606,6 +606,7 @@ class IsolatedRun:
     last_targeted_query_id: str | None = None
     targeted_base_relation: str | None = None
     targeted_head_relation: str | None = None
+    confirmed_count: int | None = None
     phase_timings: dict[str, int] = field(default_factory=dict)
 
     def __enter__(self) -> IsolatedRun:
@@ -648,11 +649,17 @@ class IsolatedRun:
         )
         self._created.append(self.relation)
         query_id = getattr(self.warehouse, "last_query_id", None)
-        origin_keys = tuple(
-            (str(row[0]), str(row[1]) if len(row) > 1 and row[1] is not None else ORIGIN_EVENT)
-            for row in self.warehouse.execute(origin_keys_sql(self.relation, self.entity_key))
-            if row and row[0] is not None
-        )
+        event_values = [str(value).strip() for value in values if str(value).strip()]
+        origin_keys: tuple[tuple[str, str], ...] = ()
+        if event_values:
+            origin_keys = tuple(
+                (
+                    str(row[0]),
+                    str(row[1]) if len(row) > 1 and row[1] is not None else ORIGIN_EVENT,
+                )
+                for row in self.warehouse.execute(origin_keys_sql(self.relation, self.entity_key))
+                if row and row[0] is not None
+            )
         count_rows = self.warehouse.execute(origin_count_sql(self.relation, self.entity_key))
         event_count = 0
         sql_count = 0
@@ -756,7 +763,11 @@ class IsolatedRun:
                 entity_key=self.entity_key,
                 dialect=dialect_name,
             )
-            rows = self.warehouse.execute(sql)
+            count_sql = (
+                "select count(*) as confirmed_frontier_count "
+                f"from ({sql}) as frontier_confirmed"
+            )
+            rows = self.warehouse.execute(count_sql)
         except Exception as error:
             duration = elapsed_ms(started)
             self.phase_timings["confirmation"] = duration
@@ -768,6 +779,7 @@ class IsolatedRun:
             if isinstance(error, (ConfigError, SqlglotError)):
                 return None
             raise
+        self.confirmed_count = int(rows[0][0]) if rows and rows[0][0] is not None else 0
         self.phase_timings["confirmation"] = elapsed_ms(started)
         log_step(
             "confirmation completed",
@@ -775,7 +787,7 @@ class IsolatedRun:
             status="ok",
         )
         self.last_targeted_query_id = getattr(self.warehouse, "last_query_id", None)
-        return tuple(str(row[0]) for row in rows if row and row[0] is not None)
+        return ()
 
     def cleanup(self) -> None:
         if self._cleaned:

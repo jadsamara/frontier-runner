@@ -190,8 +190,13 @@ def test_prove_dry_run_sql_change_without_events(dbt_project: Path, monkeypatch,
     assert "prove: targeted head execution started" in captured.out
     assert "prove: confirmation started" in captured.out
     assert "prove: confirmation completed skipped:dry-run" in captured.out
+    assert "prove: SQL-change proof started" in captured.out
+    assert "prove: SQL-change proof completed skipped:dry-run" in captured.out
     assert "prove: cleanup started" in captured.out
     assert "prove: cleanup completed skipped:dry-run" in captured.out
+    assert "prove: frontier metrics started" in captured.out
+    assert "prove: validation started" in captured.out
+    assert "prove: validation completed" in captured.out
     assert "prove: upload started" in captured.out
     assert "prove: upload completed" in captured.out
     prove_marks = [
@@ -206,7 +211,10 @@ def test_prove_dry_run_sql_change_without_events(dbt_project: Path, monkeypatch,
         "prove: candidate materialization started",
         "prove: targeted base execution started",
         "prove: confirmation started",
+        "prove: SQL-change proof started",
         "prove: cleanup started",
+        "prove: frontier metrics started",
+        "prove: validation started",
         "prove: upload started",
     ]
     positions = [captured.out.index(mark) for mark in prove_marks]
