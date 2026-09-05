@@ -323,7 +323,10 @@ def format_compare_report(comparison: dict[str, Any]) -> str:
                 lines.append("    unsafe: narrow frontier is not allowed")
             impact_status = row.get("impactStatus")
             if impact_status:
-                lines.append(f"    impact: {impact_status}")
+                lines.append(f"    impact compilation: {impact_status}")
+            execution = row.get("impactExecution")
+            if execution:
+                lines.append(f"    impact execution: {execution}")
             reasons = row.get("impactReasons") or []
             if reasons:
                 lines.append(f"    impact reasons: {', '.join(str(reason) for reason in reasons)}")
@@ -347,6 +350,40 @@ def format_compare_report(comparison: dict[str, Any]) -> str:
 
 
 _INGEST_STRIP_KEYS = ("candidateSql", "parameterizedSql", "parameters")
+
+IMPACT_EXECUTION_EXECUTED = "EXECUTED"
+IMPACT_EXECUTION_NOT_EVALUATED = "NOT_EVALUATED"
+IMPACT_EXECUTION_FAILED = "FAILED"
+
+
+def stamp_impact_execution(
+    comparison: dict[str, Any] | None,
+    *,
+    run_mode: str,
+    full_rebuild_required: bool,
+    sql_change_executed: bool,
+) -> dict[str, Any] | None:
+    """Record whether compiled impact SQL ran in the warehouse.
+
+    COMPILED is the predicate compiler. EXECUTED means Snowflake (or the
+    configured adapter) actually ran the candidate query.
+    """
+    if not comparison:
+        return comparison
+    if full_rebuild_required:
+        default = IMPACT_EXECUTION_FAILED
+    elif run_mode == "live" and sql_change_executed:
+        default = IMPACT_EXECUTION_EXECUTED
+    else:
+        default = IMPACT_EXECUTION_NOT_EVALUATED
+    copied = json.loads(json.dumps(comparison))
+    for group in ("added", "removed", "modified"):
+        for row in copied.get(group) or []:
+            if row.get("impactStatus") == FULL_REBUILD_REQUIRED:
+                row["impactExecution"] = IMPACT_EXECUTION_FAILED
+            elif row.get("impactStatus") or row.get("changeKinds"):
+                row["impactExecution"] = default
+    return copied
 
 
 def comparison_for_ingest(comparison: dict[str, Any] | None) -> dict[str, Any] | None:

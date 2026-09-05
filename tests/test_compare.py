@@ -6,6 +6,7 @@ from frontier.compare import (
     compare_manifests,
     compiled_sql_for,
     compiled_sql_pair_for_sql_change,
+    stamp_impact_execution,
 )
 from frontier.dbt_artifacts import DbtNode, Manifest
 from frontier.sql_fingerprint import sql_fingerprint
@@ -302,4 +303,47 @@ def test_compiled_sql_pair_prefers_changed_production_model() -> None:
         },
     )
     assert pair == (before, after)
+
+
+def test_stamp_impact_execution_separates_compiler_from_warehouse() -> None:
+    comparison = {
+        "modified": [
+            {"name": "int_customer_orders", "impactStatus": "COMPILED", "changeKinds": ["FILTER_CHANGED"]},
+        ]
+    }
+    live = stamp_impact_execution(
+        comparison,
+        run_mode="live",
+        full_rebuild_required=False,
+        sql_change_executed=True,
+    )
+    assert live is not None
+    assert live["modified"][0]["impactStatus"] == "COMPILED"
+    assert live["modified"][0]["impactExecution"] == "EXECUTED"
+
+    fixture = stamp_impact_execution(
+        comparison,
+        run_mode="fixture",
+        full_rebuild_required=False,
+        sql_change_executed=True,
+    )
+    assert fixture is not None
+    assert fixture["modified"][0]["impactExecution"] == "NOT_EVALUATED"
+
+    rebuild = stamp_impact_execution(
+        {
+            "modified": [
+                {
+                    "name": "int_customer_orders",
+                    "impactStatus": "FULL_REBUILD_REQUIRED",
+                    "changeKinds": ["FILTER_CHANGED"],
+                }
+            ]
+        },
+        run_mode="live",
+        full_rebuild_required=True,
+        sql_change_executed=False,
+    )
+    assert rebuild is not None
+    assert rebuild["modified"][0]["impactExecution"] == "FAILED"
 

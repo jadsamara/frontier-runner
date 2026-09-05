@@ -26,6 +26,7 @@ from frontier.compare import (
     comparison_for_ingest,
     compiled_sql_pair_for_sql_change,
     format_compare_report,
+    stamp_impact_execution,
 )
 from frontier.github import base_commit_sha, default_external_run_id, env_flag, github_source
 from frontier.dbt_artifacts import (
@@ -258,6 +259,15 @@ def _sql_change_queries(
     return queries, required
 
 
+def _stamp_sql_comparison(args: argparse.Namespace, comparison: dict[str, Any] | None, result) -> dict[str, Any] | None:
+    return stamp_impact_execution(
+        comparison,
+        run_mode=_run_mode(args),
+        full_rebuild_required=bool(getattr(result, "full_rebuild_required", False)),
+        sql_change_executed=getattr(result, "sql_change_candidate_count", None) is not None,
+    )
+
+
 def _apply_rebuild_to_comparison(
     comparison: dict[str, Any] | None,
     result,
@@ -324,6 +334,12 @@ def _emit_run(
     metrics = dict(details["metrics"])
     if extra_metrics:
         metrics.update(extra_metrics)
+    sql_comparison = stamp_impact_execution(
+        sql_comparison,
+        run_mode=_run_mode(args),
+        full_rebuild_required=bool(getattr(result, "full_rebuild_required", False)),
+        sql_change_executed=getattr(result, "sql_change_candidate_count", None) is not None,
+    )
     sql_check = sql_change_narrow_frontier_result(sql_comparison)
     if sql_check is not None:
         validations.append(sql_check)
@@ -438,7 +454,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     finally:
         warehouse.close()
 
-    sql_comparison = _apply_rebuild_to_comparison(sql_comparison, result, validations)
+    sql_comparison = _stamp_sql_comparison(
+        args,
+        _apply_rebuild_to_comparison(sql_comparison, result, validations),
+        result,
+    )
     output = _emit_run(
         args,
         config=config,
@@ -712,7 +732,11 @@ def cmd_prove(args: argparse.Namespace) -> int:
             isolated.cleanup()
         warehouse.close()
 
-    sql_comparison = _apply_rebuild_to_comparison(sql_comparison, result, validations)
+    sql_comparison = _stamp_sql_comparison(
+        args,
+        _apply_rebuild_to_comparison(sql_comparison, result, validations),
+        result,
+    )
     assessed = sql_proof or proof
     extra_metrics = {
         "fullRowsRecomputed": assessed.full_rows_recomputed,
@@ -757,6 +781,24 @@ def cmd_prove(args: argparse.Namespace) -> int:
         operator = kinds[0] if kinds else "SQL change"
         print(f"Run mode: {'fixture' if dry_run else 'live'}")
         print(f"SQL operator: {operator}")
+        compilations = list(
+            dict.fromkeys(
+                str(row.get("impactStatus"))
+                for row in ((sql_comparison or {}).get("modified") or [])
+                if row.get("impactStatus")
+            )
+        )
+        executions = list(
+            dict.fromkeys(
+                str(row.get("impactExecution"))
+                for row in ((sql_comparison or {}).get("modified") or [])
+                if row.get("impactExecution")
+            )
+        )
+        if compilations:
+            print(f"Impact compilation: {', '.join(compilations)}")
+        if executions:
+            print(f"Impact execution: {', '.join(executions)}")
         print(f"Changed source rows: {sql_proof.changed_source_row_count}")
         print(f"Candidate customers: {sql_proof.candidate_frontier_count}")
         print(f"Event-derived candidates: {result.event_candidate_count or 0}")

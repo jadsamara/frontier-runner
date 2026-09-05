@@ -149,6 +149,9 @@ def test_comment_explains_sql_change_without_entity_ids() -> None:
     assert "Row count: 150,000 → 150,000" in body
     assert "Targeted repair: safe" in body
     assert "Full backfill: not required" in body
+    assert "Impact compilation: COMPILED" in body
+    assert "Impact execution: NOT_EVALUATED" in body
+    assert "Impact status:" not in body
     assert "Changed source events:" not in body
     assert "370" not in body
     assert "36901" not in body
@@ -186,6 +189,7 @@ def test_comment_reports_live_sql_change_warehouse_counts() -> None:
                         "name": "int_customer_orders",
                         "changeKinds": ["FILTER_CHANGED"],
                         "impactStatus": "COMPILED",
+                        "impactExecution": "EXECUTED",
                     }
                 ],
                 "narrowFrontierSafe": True,
@@ -201,6 +205,9 @@ def test_comment_reports_live_sql_change_warehouse_counts() -> None:
     assert "Candidate customers: 99,621" in body
     assert "Event-derived candidates: 0" in body
     assert "Rows avoided: 33.586%" in body
+    assert "Impact compilation: COMPILED" in body
+    assert "Impact execution: EXECUTED" in body
+    assert "Impact status:" not in body
     assert "12" not in body
 
 
@@ -251,7 +258,8 @@ def test_comment_includes_artifact_fingerprints() -> None:
     body = format_pr_comment(payload, run_url="https://frontier.example/runs/1")
     assert "SQL models changed: 1 modified, 0 added, 0 removed" in body
     assert "SQL change kinds: FILTER_CHANGED" in body
-    assert "Impact status: COMPILED" in body
+    assert "Impact compilation: COMPILED" in body
+    assert "Impact status: COMPILED" not in body
     assert "Narrow frontier: not allowed" not in body
     assert "Base artifact: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in body
     assert "PR artifact: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" in body

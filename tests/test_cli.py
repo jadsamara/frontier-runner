@@ -164,6 +164,8 @@ def test_prove_dry_run_sql_change_without_events(dbt_project: Path, monkeypatch,
     assert "Row count: 150000 → 150000" in captured.out or "Row count: 150,000 → 150,000" in captured.out
     assert "Targeted repair: safe" in captured.out
     assert "Full backfill: not required" in captured.out
+    assert "Impact compilation: COMPILED" in captured.out
+    assert "Impact execution: NOT_EVALUATED" in captured.out
     assert "customer_summary_repaired" not in captured.out
     assert "frontier_affected_customers" not in captured.out
     payload = json.loads((dbt_project / "target" / "frontier-run.json").read_text())
@@ -177,6 +179,8 @@ def test_prove_dry_run_sql_change_without_events(dbt_project: Path, monkeypatch,
     assert payload["metrics"]["sourcePopulationCount"] == 12
     assert payload["metrics"]["changedSourceRowCount"] == 12
     assert payload["metrics"]["eventCandidateCount"] == 0
+    assert payload["sqlComparison"]["modified"][0]["impactStatus"] == "COMPILED"
+    assert payload["sqlComparison"]["modified"][0]["impactExecution"] == "NOT_EVALUATED"
     assert payload["sqlComparison"]["modified"][0]["name"] == "int_customer_orders"
     assert payload["sqlComparison"]["modified"][0]["changeKinds"] == ["FILTER_CHANGED"]
     assert "FILTER_CHANGED" in (payload["sqlComparison"]["modified"][0].get("changeSummary") or "")

@@ -191,7 +191,27 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
             )
         )
         if statuses:
-            lines.append(f"Impact status: {', '.join(statuses)}")
+            lines.append(f"Impact compilation: {', '.join(statuses)}")
+        executions = list(
+            dict.fromkeys(
+                str(row.get("impactExecution"))
+                for row in (
+                    *(comparison.get("modified") or []),
+                    *(comparison.get("added") or []),
+                    *(comparison.get("removed") or []),
+                )
+                if row.get("impactExecution")
+            )
+        )
+        if not executions:
+            if payload.get("runMode") == "fixture":
+                executions = ["NOT_EVALUATED"]
+            elif full_rebuild:
+                executions = ["FAILED"]
+            elif payload.get("runMode") == "live" and statuses:
+                executions = ["EXECUTED"]
+        if executions and statuses:
+            lines.append(f"Impact execution: {', '.join(executions)}")
         reasons = list(
             dict.fromkeys(
                 str(reason)

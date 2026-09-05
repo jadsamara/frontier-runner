@@ -6,6 +6,7 @@ from frontier.config import load_frontier_config
 from frontier.dbt_artifacts import DbtNode, Manifest
 from frontier.frontier import ChangeEvent, load_change_events_csv
 from frontier.proof import (
+    MutationProof,
     apply_resolved_delete,
     extra_frontier_sql,
     mismatched_rows_sql,
@@ -71,8 +72,12 @@ def test_coverage_sql_compares_changed_customers_to_frontier() -> None:
     )
     assert "missing_frontier_entities" in missing
     assert "extra_frontier_entities" in extra
-    assert "except" in missing
-    assert "except" in extra
+    assert missing.count("except") >= 3
+    assert extra.count("except") >= 3
+    assert "union" in missing
+    assert "union" in extra
+    assert "select * from after_mart" in missing
+    assert "select * from before_mart" in missing
 
 
 def test_measure_mutation_proof_with_fake_warehouse() -> None:
@@ -98,6 +103,28 @@ def test_measure_mutation_proof_with_fake_warehouse() -> None:
     assert proof.deleted_order_customer_id == "781"
     validations = proof_validation_results(proof)
     assert all(item.status == "passed" for item in validations)
+    assert evidence_level(validations) == "empirically_validated"
+
+
+def test_extra_frontier_candidates_do_not_fail_proof() -> None:
+    proof = recorded_proof()
+    proof_with_noop = MutationProof(
+        full_rows_recomputed=proof.full_rows_recomputed,
+        frontier_rows_recomputed=proof.frontier_rows_recomputed,
+        rows_avoided=proof.rows_avoided,
+        missing_frontier_entities=0,
+        extra_frontier_entities=1,
+        mismatched_final_rows=0,
+        test_duration_ms=proof.test_duration_ms,
+        deleted_order_id=proof.deleted_order_id,
+        deleted_order_customer_id=proof.deleted_order_customer_id,
+    )
+    validations = proof_validation_results(proof_with_noop)
+    by_name = {item.test_name: item for item in validations}
+    assert by_name["assert_changed_customers_in_frontier"].status == "passed"
+    assert by_name["assert_no_extra_frontier_entities"].status == "passed"
+    assert by_name["assert_no_extra_frontier_entities"].difference_count == 1
+    assert "no-ops" in (by_name["assert_no_extra_frontier_entities"].message or "")
     assert evidence_level(validations) == "empirically_validated"
 
 
@@ -229,4 +256,9 @@ def test_jaffle_shop_overlays_do_not_write_sample_data() -> None:
     assert "frontier_affected_customers" in repaired
     assert "frontier_customer_summary_target_after" in repaired
     assert except_test.count("except") == 2
+    coverage = (JAFFLE_SHOP / "tests" / "assert_changed_customers_in_frontier.sql").read_text()
+    extra = (JAFFLE_SHOP / "tests" / "assert_no_extra_frontier_entities.sql").read_text()
+    assert "customer_summary_after" in coverage
+    assert "severity='warn'" in extra.replace(" ", "") or "severity='warn'" in extra
+    assert "severity='error'" not in extra
     assert (Path("/Users/jad/Desktop/data_agent_pipeline/jaffle_shop/models/staging/stg_orders.sql").read_text().count("source('tpch'")) == 1
