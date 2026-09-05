@@ -117,3 +117,24 @@ def test_snowflake_adapter_reads_query_profile_from_history() -> None:
     assert "information_schema.query_history()" in text
     assert SnowflakeAdapter().last_query_id is None
     assert SnowflakeAdapter().get_query_profile("") == {}
+
+
+def test_snowflake_connect_kwargs_include_bounded_timeouts() -> None:
+    from frontier.adapters.snowflake import SnowflakeConnectConfig
+
+    config = SnowflakeConnectConfig(
+        account="xy12345",
+        user="ci_user",
+        database="DATA_AGENT_DEV",
+        schema="DBT_CI",
+        warehouse="SNOWFLAKE_LEARNING_WH",
+        password="super-secret-password",
+    )
+    kwargs = config.connect_kwargs()
+    assert kwargs["login_timeout"] == 30
+    assert kwargs["network_timeout"] == 60
+    assert kwargs["socket_timeout"] == 60
+    assert kwargs["session_parameters"]["STATEMENT_TIMEOUT_IN_SECONDS"] == 300
+    assert "password" in kwargs
+    assert "********" in repr(config)
+    assert "super-secret-password" not in repr(config)

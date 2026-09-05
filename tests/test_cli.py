@@ -168,6 +168,50 @@ def test_prove_dry_run_sql_change_without_events(dbt_project: Path, monkeypatch,
     assert "Impact execution: NOT_EVALUATED" in captured.out
     assert "artifact comparison:" in captured.out
     assert "SQL-change candidates: 12" in captured.out
+    assert "prove: compare started" in captured.out
+    assert "prove: compare completed" in captured.out
+    assert "prove: canonical predicate selection started" in captured.out
+    assert "prove: canonical predicate selection completed" in captured.out
+    assert "prove: targeted SQL generation started" in captured.out
+    assert "prove: targeted SQL generation completed" in captured.out
+    assert "prove: Snowflake connector import started" in captured.out
+    assert "prove: Snowflake connector import completed skipped:dry-run" in captured.out
+    assert "prove: Snowflake connection started" in captured.out
+    assert "prove: Snowflake connected skipped:dry-run" in captured.out
+    assert "prove: impact query submission started" in captured.out
+    assert "prove: impact query submitted skipped:dry-run" in captured.out
+    assert "prove: impact query completed skipped:dry-run" in captured.out
+    assert "prove: candidate count calculated" in captured.out
+    assert "prove: threshold decision started" in captured.out
+    assert "prove: threshold decision completed skipped:dry-run" in captured.out
+    assert "prove: candidate materialization started" in captured.out
+    assert "prove: candidate materialization completed skipped:dry-run" in captured.out
+    assert "prove: targeted base execution started" in captured.out
+    assert "prove: targeted head execution started" in captured.out
+    assert "prove: confirmation started" in captured.out
+    assert "prove: confirmation completed skipped:dry-run" in captured.out
+    assert "prove: cleanup started" in captured.out
+    assert "prove: cleanup completed skipped:dry-run" in captured.out
+    assert "prove: upload started" in captured.out
+    assert "prove: upload completed" in captured.out
+    prove_marks = [
+        "prove: compare started",
+        "prove: canonical predicate selection started",
+        "prove: targeted SQL generation started",
+        "prove: Snowflake connector import started",
+        "prove: Snowflake connection started",
+        "prove: impact query submission started",
+        "prove: candidate count calculated",
+        "prove: threshold decision started",
+        "prove: candidate materialization started",
+        "prove: targeted base execution started",
+        "prove: confirmation started",
+        "prove: cleanup started",
+        "prove: upload started",
+    ]
+    positions = [captured.out.index(mark) for mark in prove_marks]
+    assert positions == sorted(positions)
+    assert "super-secret-password" not in captured.out
     assert "customer_summary_repaired" not in captured.out
     assert "frontier_affected_customers" not in captured.out
     payload = json.loads((dbt_project / "target" / "frontier-run.json").read_text())

@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from frontier.adapters.base import CursorAdapter
 from frontier.config import ConfigError, redact
+from frontier.progress import elapsed_ms, env_int, failure_status, log_step
 from frontier.warehouse import (
     env_value,
     load_dbt_profile_output,
     quote_identifier,
     sql_string,
 )
+
+
+DEFAULT_LOGIN_TIMEOUT_SECONDS = 30
+DEFAULT_NETWORK_TIMEOUT_SECONDS = 60
+DEFAULT_QUERY_TIMEOUT_SECONDS = 300
 
 
 @dataclass
@@ -35,11 +42,26 @@ class SnowflakeConnectConfig:
         )
 
     def connect_kwargs(self) -> dict[str, Any]:
+        login_timeout = env_int("FRONTIER_SNOWFLAKE_LOGIN_TIMEOUT", DEFAULT_LOGIN_TIMEOUT_SECONDS)
+        network_timeout = env_int(
+            "FRONTIER_SNOWFLAKE_NETWORK_TIMEOUT",
+            DEFAULT_NETWORK_TIMEOUT_SECONDS,
+        )
+        query_timeout = env_int(
+            "FRONTIER_SNOWFLAKE_QUERY_TIMEOUT",
+            DEFAULT_QUERY_TIMEOUT_SECONDS,
+        )
         kwargs: dict[str, Any] = {
             "account": self.account,
             "user": self.user,
             "database": self.database,
             "schema": self.schema,
+            "login_timeout": login_timeout,
+            "network_timeout": network_timeout,
+            "socket_timeout": network_timeout,
+            "session_parameters": {
+                "STATEMENT_TIMEOUT_IN_SECONDS": query_timeout,
+            },
         }
         if self.warehouse:
             kwargs["warehouse"] = self.warehouse
@@ -174,13 +196,36 @@ def load_snowflake_config(
 
 
 def open_warehouse(config: SnowflakeConnectConfig) -> SnowflakeAdapter:
+    started = time.perf_counter()
+    log_step("Snowflake connector import started")
     try:
         import snowflake.connector
     except ImportError as error:
+        log_step(
+            "Snowflake connector import completed",
+            duration_ms=elapsed_ms(started),
+            status=failure_status(error),
+        )
         raise ConfigError(
             "Install frontier-runner[snowflake] to open a Snowflake session",
         ) from error
-    connection = snowflake.connector.connect(**config.connect_kwargs())
+    log_step(
+        "Snowflake connector import completed",
+        duration_ms=elapsed_ms(started),
+        status="ok",
+    )
+    started = time.perf_counter()
+    log_step("Snowflake connection started")
+    try:
+        connection = snowflake.connector.connect(**config.connect_kwargs())
+    except Exception as error:
+        log_step(
+            "Snowflake connected",
+            duration_ms=elapsed_ms(started),
+            status=failure_status(error),
+        )
+        raise
+    log_step("Snowflake connected", duration_ms=elapsed_ms(started), status="ok")
     return SnowflakeAdapter(connection, config=config)
 
 

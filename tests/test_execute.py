@@ -203,6 +203,56 @@ def test_sql_change_impact_queries_keep_one_canonical_predicate() -> None:
     assert queries == (sql,)
 
 
+def test_canonical_predicate_selection_terminates_for_equivalent_macro_consumers() -> None:
+    """Four macro consumers with equivalent predicates collapse to one query."""
+    from frontier.sql_fingerprint import sql_fingerprint
+
+    variants = (
+        "select distinct o.customer_id from stg_orders as o "
+        "where (o.order_status = 'F') is distinct from (o.order_status in ('F', 'O'))",
+        "SELECT DISTINCT o.customer_id FROM stg_orders AS o "
+        "WHERE (o.order_status = 'F') IS DISTINCT FROM (o.order_status IN ('F', 'O'))",
+        "select distinct o.customer_id from stg_orders as o where "
+        "(o.order_status='F') is distinct from (o.order_status in ('F','O'))",
+        "select distinct o.customer_id from stg_orders as o\n"
+        "where (o.order_status = 'F') is distinct from (o.order_status in ('F', 'O'))",
+    )
+    names = (
+        "int_customer_orders",
+        "customer_summary",
+        "orders_mart",
+        "customer_orders_wide",
+    )
+    fingerprints = {sql_fingerprint(sql) for sql in variants}
+    assert len(fingerprints) == 1
+    modified = [
+        {
+            "name": name,
+            "changeKinds": ["FILTER_CHANGED"],
+            "impactStatus": "COMPILED",
+            "candidateSql": sql,
+            "downstream": [{"name": f"down_{index}"} for _ in range(index + 1)],
+        }
+        for index, (name, sql) in enumerate(zip(names, variants, strict=True))
+    ]
+    queries, required = sql_change_impact_queries({"modified": modified})
+    assert required is True
+    assert len(queries) == 1
+    assert sql_fingerprint(queries[0]) == next(iter(fingerprints))
+    extra = [
+        {
+            "name": f"consumer_{index}",
+            "impactStatus": "COMPILED",
+            "candidateSql": variants[index % len(variants)],
+            "downstream": [{"name": f"leaf_{index}"}],
+        }
+        for index in range(16)
+    ]
+    again, again_required = sql_change_impact_queries({"modified": extra})
+    assert again_required is True
+    assert len(again) == 1
+
+
 def test_sql_change_candidate_discovery_never_references_affected_keys() -> None:
     from frontier.impact import compile_impact_query, discovery_counts_sql
     from frontier.execute import discovery_sql_is_unrestricted

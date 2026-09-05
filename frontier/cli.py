@@ -45,9 +45,21 @@ from frontier.frontier import (
     percent_rows_avoided,
     run_frontier,
 )
-from frontier.execute import open_isolated_run, sql_change_impact_queries
+from frontier.execute import (
+    affected_keys_relation,
+    generate_targeted_sql,
+    isolated_location,
+    open_isolated_run,
+    sql_change_impact_queries,
+)
 from frontier.hashing import entity_hash_key_from_env, hmac_entity_id
 from frontier.impact import evaluate_discovery_counts
+from frontier.progress import (
+    configure_stdio,
+    elapsed_ms,
+    failure_status,
+    log_step,
+)
 from frontier.proof import (
     apply_resolved_delete,
     measure_mutation_proof,
@@ -87,15 +99,11 @@ PHASE_CONFIRM = "confirmation"
 PHASE_UPLOAD = "upload"
 
 
-def _elapsed_ms(started: float) -> int:
-    return max(0, round((time.perf_counter() - started) * 1000))
-
-
 def _print_phase(name: str, duration_ms: int | None = None, *, skipped: str | None = None) -> None:
     if skipped:
-        print(f"{name}: skipped ({skipped})")
+        print(f"{name}: skipped ({skipped})", flush=True)
         return
-    print(f"{name}: {duration_ms} ms")
+    print(f"{name}: {duration_ms} ms", flush=True)
 
 
 def _project_dir(args: argparse.Namespace) -> Path:
@@ -618,21 +626,81 @@ def cmd_record_failure(args: argparse.Namespace) -> int:
     return 0
 
 
+def _generate_targeted_sql_pair(
+    *,
+    before_sql: str,
+    after_sql: str,
+    entity_key: str,
+    run_id: str,
+    model_database: str | None,
+    model_schema: str | None,
+    dialect: str = "snowflake",
+) -> None:
+    database, schema = isolated_location(
+        model_database=model_database,
+        model_schema=model_schema,
+    )
+    relation = affected_keys_relation(run_id, database=database, schema=schema)
+    generate_targeted_sql(
+        before_sql,
+        entity_key=entity_key,
+        affected_relation=relation,
+        dialect=dialect,
+    )
+    generate_targeted_sql(
+        after_sql,
+        entity_key=entity_key,
+        affected_relation=relation,
+        dialect=dialect,
+    )
+
+
 def cmd_prove(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
     require_current_artifacts(_target_dir(project_dir))
     config = load_frontier_config(_config_path(args, project_dir))
     manifest = load_manifest(_target_dir(project_dir) / "manifest.json")
     run_results = load_run_results(_target_dir(project_dir) / "run_results.json")
+    run_id = args.run_id or default_external_run_id(config.project)
+    log_step("compare started")
     started = time.perf_counter()
-    sql_comparison = _load_sql_comparison(
-        args,
-        pr_manifest=manifest,
-        project_dir=project_dir,
-    )
-    _print_phase(PHASE_ARTIFACT, _elapsed_ms(started))
+    try:
+        sql_comparison = _load_sql_comparison(
+            args,
+            pr_manifest=manifest,
+            project_dir=project_dir,
+        )
+    except Exception as error:
+        log_step(
+            "compare completed",
+            duration_ms=elapsed_ms(started),
+            status=failure_status(error),
+        )
+        raise
+    log_step("compare completed", duration_ms=elapsed_ms(started), status="ok")
+    _print_phase(PHASE_ARTIFACT, elapsed_ms(started))
     events = _load_events(args, project_dir, sql_comparison)
     sql_change_demo = _sql_change_present(sql_comparison)
+
+    log_step("canonical predicate selection started")
+    started = time.perf_counter()
+    try:
+        selected_queries, sql_change_required = sql_change_impact_queries(
+            sql_comparison,
+            target_name=config.model.name,
+        )
+    except Exception as error:
+        log_step(
+            "canonical predicate selection completed",
+            duration_ms=elapsed_ms(started),
+            status=failure_status(error),
+        )
+        raise
+    log_step(
+        "canonical predicate selection completed",
+        duration_ms=elapsed_ms(started),
+        status=f"ok queries={len(selected_queries)}",
+    )
 
     dry_run = _use_dry_run(args)
     if dry_run and os.environ.get("GITHUB_ACTIONS") == "true":
@@ -641,11 +709,53 @@ def cmd_prove(args: argparse.Namespace) -> int:
             "Customer CI must execute against DATA_AGENT_DEV.DBT_CI."
         )
     warehouse: WarehouseAdapter
-    run_id = args.run_id or default_external_run_id(config.project)
     persist = not dry_run
+    sql_change_queries = selected_queries if persist else ()
     sql_proof = None
     proof = None
+    base_sql, after_sql = _proof_sql_pair(
+        args,
+        config=config,
+        manifest=manifest,
+        project_dir=project_dir,
+        sql_comparison=sql_comparison,
+    )
+    log_step("targeted SQL generation started")
+    started = time.perf_counter()
+    if base_sql and after_sql:
+        try:
+            model = manifest.find_model(config.model.name)
+            _generate_targeted_sql_pair(
+                before_sql=base_sql,
+                after_sql=after_sql,
+                entity_key=config.model.key,
+                run_id=run_id,
+                model_database=model.database,
+                model_schema=model.schema,
+            )
+        except Exception as error:
+            log_step(
+                "targeted SQL generation completed",
+                duration_ms=elapsed_ms(started),
+                status=failure_status(error),
+            )
+        else:
+            log_step(
+                "targeted SQL generation completed",
+                duration_ms=elapsed_ms(started),
+                status="ok",
+            )
+    else:
+        log_step(
+            "targeted SQL generation completed",
+            duration_ms=elapsed_ms(started),
+            status="skipped",
+        )
     if dry_run:
+        log_step("Snowflake connector import started")
+        log_step("Snowflake connector import completed", status="skipped:dry-run")
+        log_step("Snowflake connection started")
+        log_step("Snowflake connected", status="skipped:dry-run")
         warehouse = FakeWarehouse(
             {
                 "full_entity_count": [(150_000, 3 if not sql_change_demo else 12)],
@@ -654,15 +764,9 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 "difference_count": [(0,)],
             }
         )
-        print("Using in-memory warehouse (--dry-run). No live warehouse session.")
+        print("Using in-memory warehouse (--dry-run). No live warehouse session.", flush=True)
         if sql_change_demo:
             sql_proof = recorded_sql_change_proof()
-            print(f"SQL-change candidates: {sql_proof.candidate_frontier_count}")
-            _print_phase(PHASE_IMPACT, skipped="dry-run")
-            _print_phase(PHASE_MATERIALIZE, skipped="dry-run")
-            _print_phase(PHASE_TARGET_BASE, skipped="dry-run")
-            _print_phase(PHASE_TARGET_HEAD, skipped="dry-run")
-            _print_phase(PHASE_CONFIRM, skipped="dry-run")
         else:
             proof = recorded_proof()
             events = apply_resolved_delete(
@@ -676,7 +780,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
             profiles_path=Path(args.profiles).expanduser() if args.profiles else None,
             target=args.target,
         )
-        print(f"{warehouse.warehouse_type}: " + json.dumps(describe_adapter(warehouse)))
+        print(f"{warehouse.warehouse_type}: " + json.dumps(describe_adapter(warehouse)), flush=True)
         if not sql_change_demo:
             try:
                 deleted_order_id, deleted_customer_id = resolve_deleted_order(
@@ -693,40 +797,53 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 customer_id=deleted_customer_id,
             )
 
-    base_sql, after_sql = _proof_sql_pair(
-        args,
-        config=config,
-        manifest=manifest,
-        project_dir=project_dir,
-        sql_comparison=sql_comparison,
-    )
-
     isolated = None
     rebuild_recommended = False
     discovered_source_rows: int | None = None
     discovered_candidates: int | None = None
     try:
-        sql_change_queries, sql_change_required = _sql_change_queries(
-            sql_comparison,
-            persist=persist,
-            target_name=config.model.name,
-        )
         if persist and sql_change_demo and sql_change_queries:
+            log_step("impact query submission started")
             started = time.perf_counter()
-            discovered_source_rows, discovered_candidates = evaluate_discovery_counts(
-                sql_change_queries[0],
-                config.model.key,
-                warehouse,
+            log_step("impact query submitted")
+            try:
+                discovered_source_rows, discovered_candidates = evaluate_discovery_counts(
+                    sql_change_queries[0],
+                    config.model.key,
+                    warehouse,
+                )
+            except Exception as error:
+                log_step(
+                    "impact query completed",
+                    duration_ms=elapsed_ms(started),
+                    status=failure_status(error),
+                )
+                raise
+            log_step(
+                "impact query completed",
+                duration_ms=elapsed_ms(started),
+                status="ok",
             )
-            _print_phase(PHASE_IMPACT, _elapsed_ms(started))
-            print(f"SQL-change candidates: {discovered_candidates}")
-            print(f"Changed source rows: {discovered_source_rows}")
+            _print_phase(PHASE_IMPACT, elapsed_ms(started))
+            log_step(f"candidate count calculated {discovered_candidates}")
+            print(f"SQL-change candidates: {discovered_candidates}", flush=True)
+            print(f"Changed source rows: {discovered_source_rows}", flush=True)
+            log_step("threshold decision started")
+            started = time.perf_counter()
             metrics_sql = current_frontier_metrics_sql(
                 manifest,
                 config.model.name,
                 dialect=warehouse.dialect,
             )
-            metric_rows = warehouse.execute(metrics_sql)
+            try:
+                metric_rows = warehouse.execute(metrics_sql)
+            except Exception as error:
+                log_step(
+                    "threshold decision completed",
+                    duration_ms=elapsed_ms(started),
+                    status=failure_status(error),
+                )
+                raise
             full_count = int(metric_rows[0][0]) if metric_rows else 0
             threshold = sql_change_rebuild_recommended_pct(config)
             rebuild_recommended = should_recommend_rebuild(
@@ -736,17 +853,78 @@ def cmd_prove(args: argparse.Namespace) -> int:
             )
             if rebuild_recommended:
                 share = discovered_candidates / full_count * 100 if full_count else 0
+                log_step(
+                    "threshold decision completed",
+                    duration_ms=elapsed_ms(started),
+                    status="FULL_REBUILD_RECOMMENDED",
+                )
                 print(
                     f"Candidate set is {share:.1f}% of "
                     f"{full_count} entities (threshold {threshold:g}%). "
-                    "FULL_REBUILD_RECOMMENDED; skipping targeted proof."
+                    "FULL_REBUILD_RECOMMENDED; skipping targeted proof.",
+                    flush=True,
                 )
+                log_step("candidate materialization started")
+                log_step(
+                    "candidate materialization completed",
+                    status="skipped:FULL_REBUILD_RECOMMENDED",
+                )
+                log_step("targeted base execution started")
+                log_step(
+                    "targeted base execution completed",
+                    status="skipped:FULL_REBUILD_RECOMMENDED",
+                )
+                log_step("targeted head execution started")
+                log_step(
+                    "targeted head execution completed",
+                    status="skipped:FULL_REBUILD_RECOMMENDED",
+                )
+                log_step("confirmation started")
+                log_step("confirmation completed", status="skipped:FULL_REBUILD_RECOMMENDED")
                 _print_phase(PHASE_MATERIALIZE, skipped="FULL_REBUILD_RECOMMENDED")
                 _print_phase(PHASE_TARGET_BASE, skipped="FULL_REBUILD_RECOMMENDED")
                 _print_phase(PHASE_TARGET_HEAD, skipped="FULL_REBUILD_RECOMMENDED")
                 _print_phase(PHASE_CONFIRM, skipped="FULL_REBUILD_RECOMMENDED")
+            else:
+                log_step(
+                    "threshold decision completed",
+                    duration_ms=elapsed_ms(started),
+                    status="targeted-proof",
+                )
         elif persist and sql_change_demo and sql_change_required and not sql_change_queries:
+            log_step("impact query submission started")
+            log_step("impact query submitted", status="skipped")
+            log_step("impact query completed", status="skipped:impact SQL unavailable")
+            log_step("candidate count calculated 0", status="skipped")
+            log_step("threshold decision completed", status="skipped:impact SQL unavailable")
             _print_phase(PHASE_IMPACT, skipped="impact SQL unavailable")
+        elif sql_change_demo:
+            log_step("impact query submission started")
+            log_step("impact query submitted", status="skipped:dry-run")
+            log_step("impact query completed", status="skipped:dry-run")
+            candidate_count = sql_proof.candidate_frontier_count if sql_proof else 0
+            log_step(
+                f"candidate count calculated {candidate_count}",
+                status="skipped:dry-run",
+            )
+            print(f"SQL-change candidates: {candidate_count}", flush=True)
+            log_step("threshold decision started")
+            log_step("threshold decision completed", status="skipped:dry-run")
+            log_step("candidate materialization started")
+            log_step("candidate materialization completed", status="skipped:dry-run")
+            log_step("targeted base execution started")
+            log_step("targeted base execution completed", status="skipped:dry-run")
+            log_step("targeted head execution started")
+            log_step("targeted head execution completed", status="skipped:dry-run")
+            log_step("confirmation started")
+            log_step("confirmation completed", status="skipped:dry-run")
+            log_step("cleanup started")
+            log_step("cleanup completed", status="skipped:dry-run")
+            _print_phase(PHASE_IMPACT, skipped="dry-run")
+            _print_phase(PHASE_MATERIALIZE, skipped="dry-run")
+            _print_phase(PHASE_TARGET_BASE, skipped="dry-run")
+            _print_phase(PHASE_TARGET_HEAD, skipped="dry-run")
+            _print_phase(PHASE_CONFIRM, skipped="dry-run")
         if persist and not rebuild_recommended:
             model = manifest.find_model(config.model.name)
             isolated = open_isolated_run(
@@ -850,6 +1028,9 @@ def cmd_prove(args: argparse.Namespace) -> int:
     finally:
         if isolated is not None:
             isolated.cleanup()
+        elif not dry_run:
+            log_step("cleanup started")
+            log_step("cleanup completed", status="skipped")
         warehouse.close()
 
     sql_comparison = _stamp_sql_comparison(
@@ -947,7 +1128,9 @@ def cmd_prove(args: argparse.Namespace) -> int:
     print("Validation:")
     for item in validations:
         print(f"  - {item.test_name}: {item.status} (differences={item.difference_count})")
-    print(f"Wrote {output}")
+    print(f"Wrote {output}", flush=True)
+    log_step("upload started")
+    log_step("upload completed", status="skipped:run `frontier upload`")
     _print_phase(PHASE_UPLOAD, skipped="run `frontier upload`")
     if overall_status(validations) != "passed":
         print(
@@ -1019,11 +1202,22 @@ def cmd_upload(args: argparse.Namespace) -> int:
     api_key, api_key_source = api_key_from_env()
     print(
         f"Uploading {payload.get('externalRunId')} to {api_url} "
-        f"as {redact_api_key(api_key)} ({api_key_source})"
+        f"as {redact_api_key(api_key)} ({api_key_source})",
+        flush=True,
     )
+    log_step("upload started")
     started = time.perf_counter()
-    response = upload_run(payload, api_url=api_url, api_key=api_key)
-    _print_phase(PHASE_UPLOAD, _elapsed_ms(started))
+    try:
+        response = upload_run(payload, api_url=api_url, api_key=api_key)
+    except Exception as error:
+        log_step(
+            "upload completed",
+            duration_ms=elapsed_ms(started),
+            status=failure_status(error),
+        )
+        raise
+    log_step("upload completed", duration_ms=elapsed_ms(started), status="ok")
+    _print_phase(PHASE_UPLOAD, elapsed_ms(started))
     status = response.pop("_httpStatus", None)
     print(json.dumps({"httpStatus": status, **response}, indent=2))
     run_id = response.get("id")
@@ -1183,12 +1377,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    configure_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
     except ConfigError as error:
-        print(f"error: {error}", file=sys.stderr)
+        print(f"error: {error}", file=sys.stderr, flush=True)
         return 1
 
 

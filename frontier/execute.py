@@ -11,6 +11,7 @@ from sqlglot import exp
 from sqlglot.errors import SqlglotError
 
 from frontier.config import ConfigError
+from frontier.progress import elapsed_ms, failure_status, log_step
 from frontier.sql_fingerprint import sql_fingerprint
 from frontier.warehouse import WarehouseAdapter, sql_literal, split_relation_parts
 
@@ -592,10 +593,6 @@ class IsolatedExecution:
     query_id: str | None = None
 
 
-def _elapsed_ms(started: float) -> int:
-    return max(0, round((time.perf_counter() - started) * 1000))
-
-
 @dataclass
 class IsolatedRun:
     warehouse: WarehouseAdapter
@@ -631,9 +628,24 @@ class IsolatedRun:
             values,
             sql_change_queries=sql_change_queries,
         )
+        log_step("candidate materialization started")
         started = time.perf_counter()
-        self.warehouse.execute(sql)
-        self.phase_timings["candidate materialization"] = _elapsed_ms(started)
+        try:
+            self.warehouse.execute(sql)
+        except Exception as error:
+            self.phase_timings["candidate materialization"] = elapsed_ms(started)
+            log_step(
+                "candidate materialization completed",
+                duration_ms=self.phase_timings["candidate materialization"],
+                status=failure_status(error),
+            )
+            raise
+        self.phase_timings["candidate materialization"] = elapsed_ms(started)
+        log_step(
+            "candidate materialization completed",
+            duration_ms=self.phase_timings["candidate materialization"],
+            status="ok",
+        )
         self._created.append(self.relation)
         query_id = getattr(self.warehouse, "last_query_id", None)
         origin_keys = tuple(
@@ -685,42 +697,107 @@ class IsolatedRun:
                 affected_relation=self.relation,
                 dialect=dialect_name,
             )
-            base_relation = targeted_phase_relation(self.relation, "base")
-            head_relation = targeted_phase_relation(self.relation, "head")
-            started = time.perf_counter()
+        except Exception as error:
+            log_step("targeted base execution started")
+            log_step("targeted base execution completed", status=failure_status(error))
+            if isinstance(error, (ConfigError, SqlglotError)):
+                return None
+            raise
+        base_relation = targeted_phase_relation(self.relation, "base")
+        head_relation = targeted_phase_relation(self.relation, "head")
+        log_step("targeted base execution started")
+        started = time.perf_counter()
+        try:
             self.warehouse.execute(create_table_as_sql(base_relation, targeted_before))
-            self._created.append(base_relation)
-            self.targeted_base_relation = base_relation
-            self.phase_timings["targeted base execution"] = _elapsed_ms(started)
-            started = time.perf_counter()
+        except Exception as error:
+            duration = elapsed_ms(started)
+            self.phase_timings["targeted base execution"] = duration
+            log_step(
+                "targeted base execution completed",
+                duration_ms=duration,
+                status=failure_status(error),
+            )
+            raise
+        self._created.append(base_relation)
+        self.targeted_base_relation = base_relation
+        self.phase_timings["targeted base execution"] = elapsed_ms(started)
+        log_step(
+            "targeted base execution completed",
+            duration_ms=self.phase_timings["targeted base execution"],
+            status="ok",
+        )
+        log_step("targeted head execution started")
+        started = time.perf_counter()
+        try:
             self.warehouse.execute(create_table_as_sql(head_relation, targeted_after))
-            self._created.append(head_relation)
-            self.targeted_head_relation = head_relation
-            self.phase_timings["targeted head execution"] = _elapsed_ms(started)
+        except Exception as error:
+            duration = elapsed_ms(started)
+            self.phase_timings["targeted head execution"] = duration
+            log_step(
+                "targeted head execution completed",
+                duration_ms=duration,
+                status=failure_status(error),
+            )
+            raise
+        self._created.append(head_relation)
+        self.targeted_head_relation = head_relation
+        self.phase_timings["targeted head execution"] = elapsed_ms(started)
+        log_step(
+            "targeted head execution completed",
+            duration_ms=self.phase_timings["targeted head execution"],
+            status="ok",
+        )
+        log_step("confirmation started")
+        started = time.perf_counter()
+        try:
             sql = confirmed_changed_sql(
                 before_sql=f"select * from {base_relation}",
                 after_sql=f"select * from {head_relation}",
                 entity_key=self.entity_key,
                 dialect=dialect_name,
             )
-            started = time.perf_counter()
             rows = self.warehouse.execute(sql)
-            self.phase_timings["confirmation"] = _elapsed_ms(started)
-            self.last_targeted_query_id = getattr(self.warehouse, "last_query_id", None)
-        except (ConfigError, SqlglotError):
-            return None
+        except Exception as error:
+            duration = elapsed_ms(started)
+            self.phase_timings["confirmation"] = duration
+            log_step(
+                "confirmation completed",
+                duration_ms=duration,
+                status=failure_status(error),
+            )
+            if isinstance(error, (ConfigError, SqlglotError)):
+                return None
+            raise
+        self.phase_timings["confirmation"] = elapsed_ms(started)
+        log_step(
+            "confirmation completed",
+            duration_ms=self.phase_timings["confirmation"],
+            status="ok",
+        )
+        self.last_targeted_query_id = getattr(self.warehouse, "last_query_id", None)
         return tuple(str(row[0]) for row in rows if row and row[0] is not None)
 
     def cleanup(self) -> None:
         if self._cleaned:
             return
-        relations = list(dict.fromkeys([*self._created, self.relation]))
-        for relation in reversed(relations):
-            try:
-                self.warehouse.execute(drop_relation_sql(relation))
-            except Exception:
-                continue
-        self._cleaned = True
+        log_step("cleanup started")
+        started = time.perf_counter()
+        try:
+            relations = list(dict.fromkeys([*self._created, self.relation]))
+            for relation in reversed(relations):
+                try:
+                    self.warehouse.execute(drop_relation_sql(relation))
+                except Exception:
+                    continue
+            self._cleaned = True
+        except Exception as error:
+            log_step(
+                "cleanup completed",
+                duration_ms=elapsed_ms(started),
+                status=failure_status(error),
+            )
+            raise
+        log_step("cleanup completed", duration_ms=elapsed_ms(started), status="ok")
 
 
 def open_isolated_run(
