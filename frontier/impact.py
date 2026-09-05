@@ -8,6 +8,8 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.errors import SqlglotError
 
+from frontier.config import ConfigError
+from frontier.execute import discovery_sql_is_unrestricted
 from frontier.snowflake_sql import (
     AGGREGATE_CHANGED,
     EXPRESSION_CHANGED,
@@ -866,6 +868,11 @@ def compile_impact_query(
         tree = exp.union(tree, extra, distinct=True)
 
     candidate_sql = _render(tree)
+    if not discovery_sql_is_unrestricted(candidate_sql):
+        return _rebuild(
+            "candidate discovery joined an affected-key relation",
+            entity_key=entity_key,
+        )
     parameterized_tree, params = _parameterize(tree)
     parameterized_sql = _render(parameterized_tree)
     return ImpactCompileResult(
@@ -878,6 +885,63 @@ def compile_impact_query(
         query_fingerprint=sql_fingerprint(candidate_sql, dialect=DIALECT),
         candidate_set_state=CANDIDATE_SET_NOT_EVALUATED,
     )
+
+
+def discovery_counts_sql(
+    candidate_sql: str,
+    entity_key: str,
+    *,
+    dialect: str = DIALECT,
+) -> str:
+    """Count source rows and distinct entity keys in one scan of the impact SQL.
+
+    Does not join frontier_affected_customers or an isolated keys table.
+    """
+    if not entity_key or not _IDENT.fullmatch(entity_key):
+        raise ConfigError("entity key is not a confirmed identifier")
+    if not discovery_sql_is_unrestricted(candidate_sql):
+        raise ConfigError("candidate discovery referenced an affected-key relation")
+    parsed = sqlglot.parse_one(candidate_sql, dialect=dialect)
+    if parsed is None:
+        raise SqlglotError("impact SQL could not be parsed")
+    tree = parsed.copy()
+
+    def strip_distinct(node: exp.Expression) -> None:
+        if isinstance(node, exp.Select):
+            node.set("distinct", None)
+        if isinstance(node, exp.Union):
+            node.set("distinct", False)
+            if node.this is not None:
+                strip_distinct(node.this)
+            if node.expression is not None:
+                strip_distinct(node.expression)
+
+    strip_distinct(tree)
+    inner = _render(tree)
+    sql = (
+        "select count(*) as changed_source_row_count, "
+        f"count(distinct {entity_key}) as sql_change_candidate_count "
+        f"from ({inner}) as frontier_discovery"
+    )
+    if not discovery_sql_is_unrestricted(sql):
+        raise ConfigError("candidate discovery referenced an affected-key relation")
+    return sql
+
+
+def evaluate_discovery_counts(
+    candidate_sql: str,
+    entity_key: str,
+    warehouse: WarehouseAdapter,
+) -> tuple[int, int]:
+    """Return (changed_source_row_count, distinct_candidate_count)."""
+    sql = discovery_counts_sql(candidate_sql, entity_key, dialect=warehouse.dialect)
+    rows = warehouse.execute(sql)
+    if not rows or rows[0][0] is None:
+        return 0, 0
+    row = rows[0]
+    changed = int(row[0] or 0)
+    candidates = int(row[1] or 0) if len(row) > 1 else 0
+    return changed, candidates
 
 
 def source_row_count_sql(candidate_sql: str, *, dialect: str = DIALECT) -> str:

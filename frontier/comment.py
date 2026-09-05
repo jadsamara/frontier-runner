@@ -87,11 +87,13 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
     event_candidates = metrics.get("eventCandidateCount")
     before_count = metrics.get("beforeEntityCount")
     after_count = metrics.get("afterEntityCount")
+    recommended = bool(comparison.get("fullRebuildRecommended"))
     full_rebuild = bool(comparison.get("fullRebuildRequired") or comparison.get("narrowFrontierSafe") is False)
     targeted_safe = (
         int(metrics.get("mismatchedFinalRows") or 0) == 0
         and int(metrics.get("missingFrontierEntities") or 0) == 0
         and not full_rebuild
+        and not recommended
     )
     run_mode = payload.get("runMode")
     origin = payload.get("candidateSetOrigin")
@@ -126,8 +128,13 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
             lines.append(
                 f"Row count: {_format_count(int(before_count))} → {_format_count(int(after_count))}"
             )
-        lines.append(f"Targeted repair: {'safe' if targeted_safe else 'not safe'}")
-        lines.append(f"Full backfill: {'required' if full_rebuild else 'not required'}")
+        lines.append(f"Targeted repair: {'skipped' if recommended else ('safe' if targeted_safe else 'not safe')}")
+        if full_rebuild:
+            lines.append("Full backfill: required")
+        elif recommended:
+            lines.append("Full backfill: recommended")
+        else:
+            lines.append("Full backfill: not required")
     elif events:
         lines.append(f"Changed source events: {len(events)}")
         lines.append(
@@ -183,6 +190,8 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
             lines.append("Narrow frontier: not allowed")
         if comparison.get("fullRebuildRequired"):
             lines.append("Impact: full rebuild required")
+        elif comparison.get("fullRebuildRecommended"):
+            lines.append("Impact: full rebuild recommended")
         statuses = list(
             dict.fromkeys(
                 str(row.get("impactStatus"))

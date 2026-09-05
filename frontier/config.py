@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -80,6 +81,11 @@ class ProofConfig:
 
 
 @dataclass(frozen=True)
+class SqlChangeConfig:
+    rebuild_recommended_pct: float = 75.0
+
+
+@dataclass(frozen=True)
 class FrontierConfig:
     project: str
     environment: str
@@ -87,6 +93,7 @@ class FrontierConfig:
     relations: dict[str, RelationConfig]
     upload: UploadConfig = field(default_factory=UploadConfig)
     proof: ProofConfig = field(default_factory=ProofConfig)
+    sql_change: SqlChangeConfig = field(default_factory=SqlChangeConfig)
     api_url: str = "http://127.0.0.1:3000"
     path: Path | None = None
 
@@ -192,6 +199,23 @@ def load_frontier_config(path: Path) -> FrontierConfig:
         deleted_order=str(proof_raw.get("deleted_order") or defaults.deleted_order).strip(),
     )
 
+    sql_change_raw = raw.get("sql_change") or {}
+    if sql_change_raw is None:
+        sql_change_raw = {}
+    if not isinstance(sql_change_raw, dict):
+        raise ConfigError("sql_change must be a mapping")
+    sql_change_defaults = SqlChangeConfig()
+    pct_raw = sql_change_raw.get(
+        "rebuild_recommended_pct",
+        sql_change_defaults.rebuild_recommended_pct,
+    )
+    try:
+        rebuild_pct = float(pct_raw)
+    except (TypeError, ValueError) as error:
+        raise ConfigError("sql_change.rebuild_recommended_pct must be a number") from error
+    if rebuild_pct <= 0 or rebuild_pct > 100:
+        raise ConfigError("sql_change.rebuild_recommended_pct must be in (0, 100]")
+
     return FrontierConfig(
         project=project,
         environment=environment,
@@ -202,6 +226,7 @@ def load_frontier_config(path: Path) -> FrontierConfig:
             hash_entity_ids=bool(upload_raw.get("hash_entity_ids", False)),
         ),
         proof=proof,
+        sql_change=SqlChangeConfig(rebuild_recommended_pct=rebuild_pct),
         api_url=str(api_raw.get("url") or "http://127.0.0.1:3000").rstrip("/"),
         path=path,
     )
@@ -229,6 +254,9 @@ relations:
         select customer_id
         from {{ ref('stg_orders') }}
         where order_id in ({{ changed_values }})
+
+sql_change:
+  rebuild_recommended_pct: 75
 """
 
 
@@ -237,3 +265,29 @@ def write_init_config(path: Path, *, force: bool = False) -> Path:
         raise ConfigError(f"{path} already exists (pass --force to overwrite)")
     path.write_text(INIT_FRONTIER_YML)
     return path
+
+
+def sql_change_rebuild_recommended_pct(config: FrontierConfig) -> float:
+    raw = (os.environ.get("FRONTIER_SQL_CHANGE_REBUILD_PCT") or "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError as error:
+            raise ConfigError(
+                "FRONTIER_SQL_CHANGE_REBUILD_PCT must be a number in (0, 100]",
+            ) from error
+    else:
+        value = config.sql_change.rebuild_recommended_pct
+    if value <= 0 or value > 100:
+        raise ConfigError("sql_change rebuild threshold must be in (0, 100]")
+    return value
+
+
+def should_recommend_rebuild(
+    candidate_count: int,
+    full_entity_count: int,
+    pct: float,
+) -> bool:
+    if full_entity_count <= 0 or candidate_count < 0:
+        return False
+    return candidate_count * 100 >= pct * full_entity_count

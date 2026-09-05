@@ -45,7 +45,15 @@ diff, not a hand-edited event list. Isolated affected keys are written to
 SQL-change origins. The M14 impact query runs in Snowflake and is unioned
 for execution. Targeted SQL pushes the key join into source CTEs before
 aggregates. Hand-written `frontier_affected_customers` / repaired models
-are not required for a SQL-change proof. When base and PR SQL differ, a
+are not required for a SQL-change proof. Impact compilation skips models
+tagged `frontier_demo` / `frontier_mutation` and `*_after` overlays unless
+they are the configured target. Candidate discovery never joins
+`frontier_affected_customers` or the isolated keys table; equivalent
+predicates from multiple consumers collapse to one query. When candidates
+exceed `sql_change.rebuild_recommended_pct` of the full entity set
+(default 75, or `FRONTIER_SQL_CHANGE_REBUILD_PCT`), the assessment is
+`FULL_REBUILD_RECOMMENDED` instead of an inefficient targeted proof.
+When base and PR SQL differ, a
 missing or failed impact query is `FULL_REBUILD_REQUIRED` rather than an
 event-only frontier. Customer CI must call `prove`, not `run`.
 

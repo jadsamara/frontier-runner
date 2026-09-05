@@ -166,6 +166,8 @@ def test_prove_dry_run_sql_change_without_events(dbt_project: Path, monkeypatch,
     assert "Full backfill: not required" in captured.out
     assert "Impact compilation: COMPILED" in captured.out
     assert "Impact execution: NOT_EVALUATED" in captured.out
+    assert "artifact comparison:" in captured.out
+    assert "SQL-change candidates: 12" in captured.out
     assert "customer_summary_repaired" not in captured.out
     assert "frontier_affected_customers" not in captured.out
     payload = json.loads((dbt_project / "target" / "frontier-run.json").read_text())

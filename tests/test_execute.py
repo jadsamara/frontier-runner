@@ -160,6 +160,181 @@ def test_sql_change_impact_queries_skip_handwritten_frontier_models() -> None:
     assert queries == (production,)
 
 
+def test_sql_change_impact_queries_keep_one_canonical_predicate() -> None:
+    sql = (
+        "select distinct o.customer_id from data_agent_dev.dbt_ci.stg_orders as o "
+        "where (o.order_status = 'F') is distinct from (o.order_status in ('F', 'O'))"
+    )
+    queries, required = sql_change_impact_queries(
+        {
+            "modified": [
+                {
+                    "name": "customer_summary",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "impactStatus": "COMPILED",
+                    "candidateSql": sql,
+                    "downstream": [],
+                },
+                {
+                    "name": "int_customer_orders",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "impactStatus": "COMPILED",
+                    "candidateSql": sql,
+                    "downstream": [{"name": "customer_summary"}, {"name": "orders_summary"}],
+                },
+                {
+                    "name": "customer_orders_mart",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "impactStatus": "COMPILED",
+                    "candidateSql": sql,
+                    "downstream": [{"name": "dashboard"}],
+                },
+                {
+                    "name": "orders_enriched",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "impactStatus": "COMPILED",
+                    "candidateSql": sql,
+                    "downstream": [{"name": "a"}],
+                },
+            ]
+        }
+    )
+    assert required is True
+    assert queries == (sql,)
+
+
+def test_sql_change_candidate_discovery_never_references_affected_keys() -> None:
+    from frontier.impact import compile_impact_query, discovery_counts_sql
+    from frontier.execute import discovery_sql_is_unrestricted
+
+    compiled = compile_impact_query(
+        "select status, customer_id from orders where status = 'F'",
+        "select status, customer_id from orders where status in ('F', 'O')",
+        entity_key="customer_id",
+    )
+    assert compiled.candidate_sql is not None
+    sql = compiled.candidate_sql.lower()
+    assert "frontier_affected_customers" not in sql
+    assert "affected_keys" not in sql
+    assert discovery_sql_is_unrestricted(compiled.candidate_sql)
+    counts = discovery_counts_sql(compiled.candidate_sql, "customer_id").lower()
+    assert "frontier_affected_customers" not in counts
+    assert "affected_keys" not in counts
+    assert "frontier_discovery" in counts
+
+    run_keys = "DATA_AGENT_DEV.DBT_CI.FRONTIER_JAFFLE_SHOP_PR_AFFECTED_KEYS"
+    forbidden = (
+        "select distinct o.customer_id from data_agent_dev.dbt_ci.stg_orders as o "
+        "inner join data_agent_dev.dbt_ci.frontier_affected_customers as f "
+        "on o.customer_id = f.customer_id"
+    )
+    queries, required = sql_change_impact_queries(
+        {
+            "modified": [
+                {
+                    "name": "int_customer_orders",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "impactStatus": "COMPILED",
+                    "candidateSql": forbidden,
+                }
+            ]
+        }
+    )
+    assert required is True
+    assert queries == ()
+
+    keyed = (
+        "select distinct customer_id from stg_orders "
+        f"inner join {run_keys} as k on stg_orders.customer_id = k.customer_id"
+    )
+    assert discovery_sql_is_unrestricted(keyed, affected_relation=run_keys) is False
+    keyed_queries, keyed_required = sql_change_impact_queries(
+        {
+            "modified": [
+                {
+                    "name": "int_customer_orders",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "impactStatus": "COMPILED",
+                    "candidateSql": keyed,
+                }
+            ]
+        }
+    )
+    assert keyed_required is True
+    assert keyed_queries == ()
+
+
+def test_sql_change_impact_queries_skip_tagged_demo_models() -> None:
+    production = "select distinct customer_id from stg_orders where order_status in ('O')"
+    demo = (
+        "select distinct o.customer_id from stg_orders as o "
+        "inner join frontier_affected_customers as f on o.customer_id = f.customer_id"
+    )
+    queries, required = sql_change_impact_queries(
+        {
+            "modified": [
+                {
+                    "name": "customer_orders_demo",
+                    "tags": ["frontier_demo"],
+                    "impactStatus": "COMPILED",
+                    "candidateSql": demo,
+                    "downstream": [{"name": "x"}, {"name": "y"}, {"name": "z"}],
+                },
+                {
+                    "name": "int_customer_orders",
+                    "impactStatus": "COMPILED",
+                    "candidateSql": production,
+                    "downstream": [],
+                },
+            ]
+        }
+    )
+    assert required is True
+    assert queries == (production,)
+
+
+def test_demo_only_sql_changes_do_not_require_impact_execution() -> None:
+    queries, required = sql_change_impact_queries(
+        {
+            "modified": [
+                {
+                    "name": "frontier_customer_orders_target",
+                    "tags": ["frontier_demo"],
+                    "impactStatus": "COMPILED",
+                    "candidateSql": (
+                        "select distinct o.customer_id from stg_orders as o "
+                        "inner join frontier_affected_customers as f "
+                        "on o.customer_id = f.customer_id"
+                    ),
+                }
+            ]
+        }
+    )
+    assert required is False
+    assert queries == ()
+
+
+def test_demo_only_sql_changes_do_not_require_impact_execution() -> None:
+    queries, required = sql_change_impact_queries(
+        {
+            "modified": [
+                {
+                    "name": "frontier_customer_orders_target",
+                    "tags": ["frontier_demo"],
+                    "impactStatus": "COMPILED",
+                    "candidateSql": (
+                        "select distinct o.customer_id from stg_orders as o "
+                        "inner join frontier_affected_customers as f "
+                        "on o.customer_id = f.customer_id"
+                    ),
+                }
+            ]
+        }
+    )
+    assert required is False
+    assert queries == ()
+
+
 def test_unsupported_confirmation_is_not_an_empty_set() -> None:
     warehouse = FakeWarehouse({})
     session = IsolatedRun(

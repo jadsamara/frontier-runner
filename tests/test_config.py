@@ -17,6 +17,19 @@ def test_load_example_config(dbt_project: Path) -> None:
     assert config.upload.include_entity_ids is False
     assert config.proof.after_mart == "customer_summary_after"
     assert config.proof.repaired_mart == "customer_summary_repaired"
+    assert config.sql_change.rebuild_recommended_pct == 75.0
+
+
+def test_rebuild_recommended_threshold(monkeypatch) -> None:
+    from frontier.config import should_recommend_rebuild, sql_change_rebuild_recommended_pct
+
+    assert should_recommend_rebuild(99_621, 150_000, 50.0) is True
+    assert should_recommend_rebuild(99_621, 150_000, 75.0) is False
+    assert should_recommend_rebuild(112_500, 150_000, 75.0) is True
+    config = load_frontier_config(Path(__file__).parent / "fixtures" / "frontier.yml")
+    assert sql_change_rebuild_recommended_pct(config) == 75.0
+    monkeypatch.setenv("FRONTIER_SQL_CHANGE_REBUILD_PCT", "40")
+    assert sql_change_rebuild_recommended_pct(config) == 40.0
 
 
 def test_init_writes_example(tmp_path: Path) -> None:

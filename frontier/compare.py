@@ -73,7 +73,14 @@ def compiled_sql_pair_for_sql_change(
     names: list[str] = []
     for row in (sql_comparison or {}).get("modified") or []:
         name = str(row.get("name") or "")
-        if is_sql_change_impact_model(name) and name not in names:
+        if (
+            is_sql_change_impact_model(
+                name,
+                tags=tuple(row.get("tags") or ()),
+                target_name=target_name,
+            )
+            and name not in names
+        ):
             names.append(name)
     if target_name and target_name not in names:
         names.append(target_name)
@@ -131,6 +138,7 @@ def _model_payload(
     unsupported_reasons: list[str] | None = None,
     impact: dict[str, Any] | None = None,
     change_summary: str | None = None,
+    tags: tuple[str, ...] | list[str] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "uniqueId": unique_id,
@@ -139,6 +147,8 @@ def _model_payload(
         "prFingerprint": pr_fingerprint,
         "downstream": downstream,
     }
+    if tags:
+        payload["tags"] = list(tags)
     if change_kinds:
         payload["changeKinds"] = change_kinds
     if unsafe is not None:
@@ -170,6 +180,7 @@ def compare_manifests(
     pr_commit_sha: str | None = None,
     entity_key: str | None = None,
     confirmed_keys: Iterable[str] | None = None,
+    target_name: str | None = None,
 ) -> SqlComparison:
     dialect = sql_dialect(pr.adapter_type or base.adapter_type)
     base_models = base.models()
@@ -210,7 +221,16 @@ def compare_manifests(
                     base_fingerprint=None,
                     pr_fingerprint=pr_prints[unique_id],
                     downstream=_downstream_payload(pr, unique_id),
-                    impact=added_removed_impact,
+                    tags=node.tags,
+                    impact=(
+                        added_removed_impact
+                        if is_sql_change_impact_model(
+                            node.name,
+                            tags=node.tags,
+                            target_name=target_name,
+                        )
+                        else None
+                    ),
                 )
             )
             continue
@@ -221,12 +241,21 @@ def compare_manifests(
         classification = classify_sql_change(base_sql, pr_sql)
         if not classification.kinds:
             continue
-        impact = compile_impact_query(
-            base_sql,
-            pr_sql,
-            entity_key=entity_key or "",
-            confirmed_keys=confirmed_keys or (),
-            classification=classification,
+        compile_impact = is_sql_change_impact_model(
+            node.name,
+            tags=node.tags,
+            target_name=target_name,
+        )
+        impact = (
+            compile_impact_query(
+                base_sql,
+                pr_sql,
+                entity_key=entity_key or "",
+                confirmed_keys=confirmed_keys or (),
+                classification=classification,
+            )
+            if compile_impact
+            else None
         )
         modified.append(
             _model_payload(
@@ -236,10 +265,11 @@ def compare_manifests(
                 pr_fingerprint=pr_prints[unique_id],
                 downstream=_downstream_payload(pr, unique_id),
                 change_kinds=list(classification.kinds),
-                unsafe=classification.unsafe,
+                unsafe=classification.unsafe if compile_impact else None,
                 unsupported_reasons=list(classification.unsupported_reasons) or None,
-                impact=impact.to_payload(include_sql=True),
+                impact=impact.to_payload(include_sql=True) if impact is not None else None,
                 change_summary=describe_sql_change(base_sql, pr_sql),
+                tags=node.tags,
             )
         )
 
@@ -254,7 +284,16 @@ def compare_manifests(
                 base_fingerprint=base_prints[unique_id],
                 pr_fingerprint=None,
                 downstream=_downstream_payload(base, unique_id),
-                impact=added_removed_impact,
+                tags=node.tags,
+                impact=(
+                    added_removed_impact
+                    if is_sql_change_impact_model(
+                        node.name,
+                        tags=node.tags,
+                        target_name=target_name,
+                    )
+                    else None
+                ),
             )
         )
 
@@ -271,17 +310,30 @@ def compare_manifests(
     if pr_commit_sha:
         pr_side["commitSha"] = pr_commit_sha
 
-    full_rebuild = any(
-        row.get("impactStatus") == FULL_REBUILD_REQUIRED
+    impact_rows = [
+        row
         for row in (*added, *removed, *modified)
-    )
+        if is_sql_change_impact_model(
+            str(row.get("name") or ""),
+            tags=tuple(row.get("tags") or ()),
+            target_name=target_name,
+        )
+    ]
+    full_rebuild = any(row.get("impactStatus") == FULL_REBUILD_REQUIRED for row in impact_rows)
     payload = {
         "base": base_side,
         "pr": pr_side,
         "added": added,
         "removed": removed,
         "modified": modified,
-        "narrowFrontierSafe": narrow_frontier_safe({"modified": modified}),
+        "narrowFrontierSafe": narrow_frontier_safe({"modified": [
+            row for row in modified
+            if is_sql_change_impact_model(
+                str(row.get("name") or ""),
+                tags=tuple(row.get("tags") or ()),
+                target_name=target_name,
+            )
+        ]}),
         "fullRebuildRequired": full_rebuild,
     }
     return SqlComparison(payload)
@@ -346,10 +398,12 @@ def format_compare_report(comparison: dict[str, Any]) -> str:
         )
     if comparison.get("fullRebuildRequired"):
         lines.append("Full rebuild required: yes")
+    if comparison.get("fullRebuildRecommended"):
+        lines.append("Full rebuild recommended: yes")
     return "\n".join(lines)
 
 
-_INGEST_STRIP_KEYS = ("candidateSql", "parameterizedSql", "parameters")
+_INGEST_STRIP_KEYS = ("candidateSql", "parameterizedSql", "parameters", "tags")
 
 IMPACT_EXECUTION_EXECUTED = "EXECUTED"
 IMPACT_EXECUTION_NOT_EVALUATED = "NOT_EVALUATED"

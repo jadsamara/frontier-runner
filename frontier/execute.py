@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -10,6 +11,7 @@ from sqlglot import exp
 from sqlglot.errors import SqlglotError
 
 from frontier.config import ConfigError
+from frontier.sql_fingerprint import sql_fingerprint
 from frontier.warehouse import WarehouseAdapter, sql_literal, split_relation_parts
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -23,6 +25,12 @@ _SNOWFLAKE_NAME_LIMIT = 255
 ORIGIN_EVENT = "event"
 ORIGIN_SQL_CHANGE = "sql_change"
 SQL_CHANGE_REASON = "SQL change candidate"
+
+DEMO_IMPACT_TAGS = frozenset({"frontier_demo", "frontier_mutation"})
+_DISCOVERY_FORBIDDEN = re.compile(
+    r"frontier_affected_customers|affected_keys|frontier_keys",
+    re.IGNORECASE,
+)
 
 HANDWRITTEN_FRONTIER_MODELS = (
     "frontier_affected_customers",
@@ -38,15 +46,26 @@ _HANDWRITTEN_FRONTIER_MODEL_NAMES = frozenset(
 )
 
 
-def is_sql_change_impact_model(name: str) -> bool:
+def is_sql_change_impact_model(
+    name: str,
+    *,
+    tags: Iterable[str] = (),
+    target_name: str | None = None,
+) -> bool:
     """Production models whose impact SQL may run against the warehouse.
 
-    Mutation overlays and handwritten Frontier demo models join
-    frontier_affected_customers. Using them as the live candidate query
-    counts the seed table instead of STG_ORDERS.
+    Models tagged frontier_demo / frontier_mutation, mutation overlays, and
+    handwritten Frontier demo models join frontier_affected_customers. Using
+    them as the live candidate query counts the seed table instead of
+    STG_ORDERS. The configured target is always eligible.
     """
     lowered = (name or "").strip().lower()
     if not lowered:
+        return False
+    if target_name and lowered == target_name.strip().lower():
+        return True
+    tagset = {str(tag).strip().lower() for tag in tags if str(tag).strip()}
+    if tagset & DEMO_IMPACT_TAGS:
         return False
     if lowered in _HANDWRITTEN_FRONTIER_MODEL_NAMES:
         return False
@@ -55,6 +74,19 @@ def is_sql_change_impact_model(name: str) -> bool:
     if lowered.endswith(("_after", "_repaired", "_mutated")):
         return False
     if lowered in {"change_events_resolved", "mutation_deleted_order"}:
+        return False
+    return True
+
+
+def discovery_sql_is_unrestricted(sql: str, *, affected_relation: str | None = None) -> bool:
+    """True when candidate discovery does not join demo or isolated key tables."""
+    text = (sql or "").strip()
+    if not text:
+        return False
+    if _DISCOVERY_FORBIDDEN.search(text):
+        return False
+    relation = (affected_relation or "").strip()
+    if relation and relation.lower() in text.lower():
         return False
     return True
 
@@ -132,6 +164,15 @@ def qualify_relation(database: str, schema: str, table: str) -> str:
 
 def affected_keys_relation(run_id: str, *, database: str, schema: str) -> str:
     return qualify_relation(database, schema, isolated_table_name(run_id, _AFFECTED_SUFFIX))
+
+
+def targeted_phase_relation(keys_relation: str, phase: str) -> str:
+    """Warehouse table for targeted base or head output (not used in discovery)."""
+    suffix = "TARGET_BASE" if phase == "base" else "TARGET_HEAD"
+    relation = (keys_relation or "").strip()
+    if relation.upper().endswith("AFFECTED_KEYS"):
+        return relation[: -len("AFFECTED_KEYS")] + suffix
+    return f"{relation}_{suffix}"
 
 
 def create_schema_sql(database: str, schema: str) -> str:
@@ -216,6 +257,14 @@ def origin_keys_sql(relation: str, entity_key: str) -> str:
 
 def drop_relation_sql(relation: str) -> str:
     return f"drop table if exists {relation}"
+
+
+def create_table_as_sql(relation: str, select_sql: str) -> str:
+    query = (select_sql or "").strip().rstrip(";")
+    if not query:
+        raise ConfigError("empty SQL for isolated table")
+    assert_not_prod(relation=relation)
+    return f"create or replace table {relation} as {query}"
 
 
 def _reject_mutating_sql(root: exp.Expression) -> None:
@@ -370,38 +419,71 @@ def profile_shows_reduction(full: dict[str, Any], targeted: dict[str, Any]) -> b
 
 def sql_change_impact_queries(
     comparison: dict[str, Any] | None,
+    *,
+    target_name: str | None = None,
 ) -> tuple[tuple[str, ...], bool]:
-    """Return impact SQL to execute in-warehouse, and whether SQL change requires it.
+    """Return the canonical impact SQL to execute, and whether SQL change requires it.
 
-    When base and PR SQL differ, callers must execute these queries (or fail
-    closed with FULL_REBUILD_REQUIRED). Missing or unsafe candidate SQL is
-    never treated as an empty extra-key list.
+    Demo/mutation models are ignored. Equivalent predicates from multiple
+    macro consumers are collapsed to one query. Discovery SQL that joins
+    frontier_affected_customers or an affected-keys table is rejected.
     """
     if not comparison:
         return (), False
-    added = list(comparison.get("added") or [])
-    removed = list(comparison.get("removed") or [])
+    added = [
+        row
+        for row in (comparison.get("added") or [])
+        if is_sql_change_impact_model(
+            str(row.get("name") or ""),
+            tags=tuple(row.get("tags") or ()),
+            target_name=target_name,
+        )
+    ]
+    removed = [
+        row
+        for row in (comparison.get("removed") or [])
+        if is_sql_change_impact_model(
+            str(row.get("name") or ""),
+            tags=tuple(row.get("tags") or ()),
+            target_name=target_name,
+        )
+    ]
     modified = list(comparison.get("modified") or [])
-    required = bool(added or removed or modified)
+    eligible = [
+        row
+        for row in modified
+        if is_sql_change_impact_model(
+            str(row.get("name") or ""),
+            tags=tuple(row.get("tags") or ()),
+            target_name=target_name,
+        )
+    ]
+    required = bool(added or removed or eligible)
     if not required:
         return (), False
     if added or removed:
         return (), True
     if comparison.get("fullRebuildRequired") or comparison.get("narrowFrontierSafe") is False:
         return (), True
-    queries: list[str] = []
-    for row in modified:
-        if not is_sql_change_impact_model(str(row.get("name") or "")):
-            continue
+    ranked: list[tuple[int, str, str]] = []
+    for row in eligible:
+        name = str(row.get("name") or "")
         if row.get("unsafe") or row.get("impactStatus") == "FULL_REBUILD_REQUIRED":
             return (), True
         sql = str(row.get("candidateSql") or "").strip()
-        if not sql:
+        if not sql or not discovery_sql_is_unrestricted(sql):
             return (), True
-        queries.append(sql)
-    if not queries:
+        ranked.append((len(row.get("downstream") or []), name, sql))
+    if not ranked:
         return (), True
-    return tuple(queries), True
+    best_by_fp: dict[str, tuple[int, str, str]] = {}
+    for downstream_n, name, sql in ranked:
+        fingerprint = sql_fingerprint(sql)
+        previous = best_by_fp.get(fingerprint)
+        if previous is None or downstream_n > previous[0]:
+            best_by_fp[fingerprint] = (downstream_n, name, sql)
+    chosen = max(best_by_fp.values(), key=lambda item: (item[0], item[1]))
+    return (chosen[2],), True
 
 
 def generate_targeted_sql(
@@ -510,6 +592,10 @@ class IsolatedExecution:
     query_id: str | None = None
 
 
+def _elapsed_ms(started: float) -> int:
+    return max(0, round((time.perf_counter() - started) * 1000))
+
+
 @dataclass
 class IsolatedRun:
     warehouse: WarehouseAdapter
@@ -521,6 +607,9 @@ class IsolatedRun:
     _created: list[str] = field(default_factory=list)
     _cleaned: bool = False
     last_targeted_query_id: str | None = None
+    targeted_base_relation: str | None = None
+    targeted_head_relation: str | None = None
+    phase_timings: dict[str, int] = field(default_factory=dict)
 
     def __enter__(self) -> IsolatedRun:
         return self
@@ -542,7 +631,9 @@ class IsolatedRun:
             values,
             sql_change_queries=sql_change_queries,
         )
+        started = time.perf_counter()
         self.warehouse.execute(sql)
+        self.phase_timings["candidate materialization"] = _elapsed_ms(started)
         self._created.append(self.relation)
         query_id = getattr(self.warehouse, "last_query_id", None)
         origin_keys = tuple(
@@ -594,13 +685,27 @@ class IsolatedRun:
                 affected_relation=self.relation,
                 dialect=dialect_name,
             )
+            base_relation = targeted_phase_relation(self.relation, "base")
+            head_relation = targeted_phase_relation(self.relation, "head")
+            started = time.perf_counter()
+            self.warehouse.execute(create_table_as_sql(base_relation, targeted_before))
+            self._created.append(base_relation)
+            self.targeted_base_relation = base_relation
+            self.phase_timings["targeted base execution"] = _elapsed_ms(started)
+            started = time.perf_counter()
+            self.warehouse.execute(create_table_as_sql(head_relation, targeted_after))
+            self._created.append(head_relation)
+            self.targeted_head_relation = head_relation
+            self.phase_timings["targeted head execution"] = _elapsed_ms(started)
             sql = confirmed_changed_sql(
-                before_sql=targeted_before,
-                after_sql=targeted_after,
+                before_sql=f"select * from {base_relation}",
+                after_sql=f"select * from {head_relation}",
                 entity_key=self.entity_key,
                 dialect=dialect_name,
             )
+            started = time.perf_counter()
             rows = self.warehouse.execute(sql)
+            self.phase_timings["confirmation"] = _elapsed_ms(started)
             self.last_targeted_query_id = getattr(self.warehouse, "last_query_id", None)
         except (ConfigError, SqlglotError):
             return None

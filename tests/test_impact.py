@@ -42,6 +42,13 @@ def test_filter_change_compiles_is_distinct_from() -> None:
     again = compile_impact_query(FILTER_BASE, FILTER_PR, entity_key="customer_id")
     assert again.candidate_sql == result.candidate_sql
     assert again.query_fingerprint == result.query_fingerprint
+    from frontier.impact import discovery_counts_sql
+
+    discovery = discovery_counts_sql(result.candidate_sql or "", "customer_id").lower()
+    assert "changed_source_row_count" in discovery
+    assert "sql_change_candidate_count" in discovery
+    assert "frontier_affected_customers" not in discovery
+    assert "affected_keys" not in discovery
 
 
 def test_source_row_count_sql_does_not_project_join_keys() -> None:

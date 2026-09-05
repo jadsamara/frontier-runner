@@ -26,6 +26,7 @@ class SqlChangeProof:
     mismatched_final_rows: int
     test_duration_ms: int
     full_rebuild_required: bool = False
+    full_rebuild_recommended: bool = False
 
     @property
     def percent_rows_avoided(self) -> float:
@@ -39,6 +40,7 @@ class SqlChangeProof:
             self.mismatched_final_rows == 0
             and self.missing_frontier_entities == 0
             and not self.full_rebuild_required
+            and not self.full_rebuild_recommended
         )
 
 
@@ -264,6 +266,33 @@ def recorded_sql_change_proof(*, test_duration_ms: int = 1) -> SqlChangeProof:
     )
 
 
+def recommended_sql_change_proof(
+    *,
+    full_entity_count: int,
+    candidate_count: int,
+    changed_source_row_count: int,
+) -> SqlChangeProof:
+    """Counts-only proof when the candidate set is too large for targeted repair."""
+    frontier = min(candidate_count, full_entity_count)
+    return SqlChangeProof(
+        full_rows_recomputed=full_entity_count,
+        frontier_rows_recomputed=frontier,
+        rows_avoided=full_entity_count - frontier,
+        source_population_count=changed_source_row_count,
+        candidate_frontier_count=candidate_count,
+        confirmed_frontier_count=0,
+        before_entity_count=full_entity_count,
+        after_entity_count=full_entity_count,
+        changed_source_row_count=changed_source_row_count,
+        missing_frontier_entities=0,
+        extra_frontier_entities=0,
+        mismatched_final_rows=0,
+        test_duration_ms=0,
+        full_rebuild_required=False,
+        full_rebuild_recommended=True,
+    )
+
+
 def _count_subquery(warehouse: WarehouseAdapter, sql: str, alias: str) -> int:
     return _count(warehouse, f"select count(*) as {alias} from ({sql}) as {alias}")
 
@@ -279,6 +308,8 @@ def measure_sql_change_proof(
     candidate_count: int | None = None,
     confirmed_count: int | None = None,
     full_rebuild_required: bool = False,
+    targeted_before_relation: str | None = None,
+    targeted_after_relation: str | None = None,
 ) -> SqlChangeProof:
     """Prove targeted repair of a SQL change against the full PR model.
 
@@ -288,18 +319,22 @@ def measure_sql_change_proof(
     dialect = warehouse.dialect
     from frontier.execute import confirmed_changed_sql, generate_targeted_sql, generic_repaired_sql
 
-    targeted_before = generate_targeted_sql(
-        before_sql,
-        entity_key=entity_key,
-        affected_relation=affected_relation,
-        dialect=dialect,
-    )
-    targeted_after = generate_targeted_sql(
-        after_sql,
-        entity_key=entity_key,
-        affected_relation=affected_relation,
-        dialect=dialect,
-    )
+    if targeted_before_relation and targeted_after_relation:
+        targeted_before = f"select * from {targeted_before_relation}"
+        targeted_after = f"select * from {targeted_after_relation}"
+    else:
+        targeted_before = generate_targeted_sql(
+            before_sql,
+            entity_key=entity_key,
+            affected_relation=affected_relation,
+            dialect=dialect,
+        )
+        targeted_after = generate_targeted_sql(
+            after_sql,
+            entity_key=entity_key,
+            affected_relation=affected_relation,
+            dialect=dialect,
+        )
     repaired = generic_repaired_sql(
         before_relation=f"({before_sql})",
         targeted_after_sql=targeted_after,

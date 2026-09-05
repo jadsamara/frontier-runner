@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -53,7 +53,10 @@ class FrontierResult:
     sql_change_candidate_count: int | None = None
     union_candidate_count: int | None = None
     full_rebuild_required: bool = False
+    full_rebuild_recommended: bool = False
     targeted_query_id: str | None = None
+    changed_source_row_count: int | None = None
+    phase_timings: dict[str, int] = field(default_factory=dict)
 
 
 def percent_rows_avoided(full_entity_count: int, frontier_entity_count: int) -> float:
@@ -265,6 +268,8 @@ def run_frontier(
     before_sql: str | None = None,
     after_sql: str | None = None,
     isolated_run: IsolatedRun | None = None,
+    confirm: bool = True,
+    full_rebuild_recommended: bool = False,
 ) -> FrontierResult:
     affected, frontier_sql = resolve_affected_entities(
         config,
@@ -353,7 +358,7 @@ def run_frontier(
                             reason=reason,
                         )
                     affected = list(known.values())
-                    if sql_differs:
+                    if sql_differs and confirm:
                         confirmed_keys = session.confirm(
                             before_sql=before_sql or "",
                             after_sql=after_sql or "",
@@ -421,7 +426,9 @@ def run_frontier(
             sql_change_candidate_count=sql_change_candidate_count,
             union_candidate_count=union_candidate_count,
             full_rebuild_required=full_rebuild_required,
+            full_rebuild_recommended=full_rebuild_recommended,
             targeted_query_id=targeted_query_id,
+            phase_timings=dict(session.phase_timings) if session is not None else {},
         )
     finally:
         if owns_session and session is not None:

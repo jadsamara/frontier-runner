@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -18,6 +19,8 @@ from frontier.comment import maybe_upsert_pr_comment
 from frontier.config import (
     ConfigError,
     load_frontier_config,
+    should_recommend_rebuild,
+    sql_change_rebuild_recommended_pct,
     write_init_config,
 )
 from frontier.artifacts import require_current_artifacts
@@ -36,6 +39,7 @@ from frontier.dbt_artifacts import (
     load_run_results,
 )
 from frontier.frontier import (
+    current_frontier_metrics_sql,
     frontier_result_to_dict,
     load_change_events_csv,
     percent_rows_avoided,
@@ -43,6 +47,7 @@ from frontier.frontier import (
 )
 from frontier.execute import open_isolated_run, sql_change_impact_queries
 from frontier.hashing import entity_hash_key_from_env, hmac_entity_id
+from frontier.impact import evaluate_discovery_counts
 from frontier.proof import (
     apply_resolved_delete,
     measure_mutation_proof,
@@ -51,6 +56,7 @@ from frontier.proof import (
     recorded_proof,
     recorded_sql_change_affected,
     recorded_sql_change_proof,
+    recommended_sql_change_proof,
     resolve_deleted_order,
     sql_change_proof_validation_results,
 )
@@ -71,6 +77,25 @@ from frontier.validation import (
 )
 
 RUN_FILE_NAME = "frontier-run.json"
+
+PHASE_ARTIFACT = "artifact comparison"
+PHASE_IMPACT = "impact-query execution"
+PHASE_MATERIALIZE = "candidate materialization"
+PHASE_TARGET_BASE = "targeted base execution"
+PHASE_TARGET_HEAD = "targeted head execution"
+PHASE_CONFIRM = "confirmation"
+PHASE_UPLOAD = "upload"
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, round((time.perf_counter() - started) * 1000))
+
+
+def _print_phase(name: str, duration_ms: int | None = None, *, skipped: str | None = None) -> None:
+    if skipped:
+        print(f"{name}: skipped ({skipped})")
+        return
+    print(f"{name}: {duration_ms} ms")
 
 
 def _project_dir(args: argparse.Namespace) -> Path:
@@ -125,6 +150,13 @@ def _load_sql_comparison(
     base_manifest = load_manifest(base_manifest_path)
     pr_path = pr_manifest.path or (_target_dir(project_dir) / "manifest.json")
     entity_key, confirmed_keys = _impact_keys(args, project_dir)
+    target_name = None
+    config_path = _config_path(args, project_dir)
+    if config_path.is_file():
+        try:
+            target_name = load_frontier_config(config_path).model.name
+        except ConfigError:
+            target_name = None
     comparison = compare_manifests(
         base_manifest,
         pr_manifest,
@@ -134,6 +166,7 @@ def _load_sql_comparison(
         pr_commit_sha=(os.environ.get("GITHUB_SHA") or "").strip() or None,
         entity_key=entity_key,
         confirmed_keys=confirmed_keys,
+        target_name=target_name,
     )
     return comparison.to_dict()
 
@@ -252,8 +285,9 @@ def _sql_change_queries(
     comparison: dict[str, Any] | None,
     *,
     persist: bool,
+    target_name: str | None = None,
 ) -> tuple[tuple[str, ...], bool]:
-    queries, required = sql_change_impact_queries(comparison)
+    queries, required = sql_change_impact_queries(comparison, target_name=target_name)
     if not persist:
         return (), False
     return queries, required
@@ -273,10 +307,14 @@ def _apply_rebuild_to_comparison(
     result,
     validations: list,
 ) -> dict[str, Any] | None:
+    updated = dict(comparison) if comparison is not None else None
+    if getattr(result, "full_rebuild_recommended", False):
+        if updated is None:
+            updated = {}
+        updated["fullRebuildRecommended"] = True
     if not getattr(result, "full_rebuild_required", False):
-        return comparison
-    if comparison is not None:
-        updated = dict(comparison)
+        return updated if updated is not None else comparison
+    if updated is not None:
         updated["fullRebuildRequired"] = True
         updated["narrowFrontierSafe"] = False
         return updated
@@ -300,6 +338,8 @@ def _print_origin_counts(result) -> None:
         print(f"Union candidates: {result.union_candidate_count}")
     if result.full_rebuild_required:
         print("Impact: FULL_REBUILD_REQUIRED")
+    elif getattr(result, "full_rebuild_recommended", False):
+        print("Impact: FULL_REBUILD_RECOMMENDED")
 
 
 def _write_run_file(path: Path, payload: dict[str, Any]) -> None:
@@ -430,6 +470,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         sql_change_queries, sql_change_required = _sql_change_queries(
             sql_comparison,
             persist=persist,
+            target_name=config.model.name,
         )
         result = run_frontier(
             config,
@@ -583,11 +624,13 @@ def cmd_prove(args: argparse.Namespace) -> int:
     config = load_frontier_config(_config_path(args, project_dir))
     manifest = load_manifest(_target_dir(project_dir) / "manifest.json")
     run_results = load_run_results(_target_dir(project_dir) / "run_results.json")
+    started = time.perf_counter()
     sql_comparison = _load_sql_comparison(
         args,
         pr_manifest=manifest,
         project_dir=project_dir,
     )
+    _print_phase(PHASE_ARTIFACT, _elapsed_ms(started))
     events = _load_events(args, project_dir, sql_comparison)
     sql_change_demo = _sql_change_present(sql_comparison)
 
@@ -614,6 +657,12 @@ def cmd_prove(args: argparse.Namespace) -> int:
         print("Using in-memory warehouse (--dry-run). No live warehouse session.")
         if sql_change_demo:
             sql_proof = recorded_sql_change_proof()
+            print(f"SQL-change candidates: {sql_proof.candidate_frontier_count}")
+            _print_phase(PHASE_IMPACT, skipped="dry-run")
+            _print_phase(PHASE_MATERIALIZE, skipped="dry-run")
+            _print_phase(PHASE_TARGET_BASE, skipped="dry-run")
+            _print_phase(PHASE_TARGET_HEAD, skipped="dry-run")
+            _print_phase(PHASE_CONFIRM, skipped="dry-run")
         else:
             proof = recorded_proof()
             events = apply_resolved_delete(
@@ -653,12 +702,52 @@ def cmd_prove(args: argparse.Namespace) -> int:
     )
 
     isolated = None
+    rebuild_recommended = False
+    discovered_source_rows: int | None = None
+    discovered_candidates: int | None = None
     try:
         sql_change_queries, sql_change_required = _sql_change_queries(
             sql_comparison,
             persist=persist,
+            target_name=config.model.name,
         )
-        if persist:
+        if persist and sql_change_demo and sql_change_queries:
+            started = time.perf_counter()
+            discovered_source_rows, discovered_candidates = evaluate_discovery_counts(
+                sql_change_queries[0],
+                config.model.key,
+                warehouse,
+            )
+            _print_phase(PHASE_IMPACT, _elapsed_ms(started))
+            print(f"SQL-change candidates: {discovered_candidates}")
+            print(f"Changed source rows: {discovered_source_rows}")
+            metrics_sql = current_frontier_metrics_sql(
+                manifest,
+                config.model.name,
+                dialect=warehouse.dialect,
+            )
+            metric_rows = warehouse.execute(metrics_sql)
+            full_count = int(metric_rows[0][0]) if metric_rows else 0
+            threshold = sql_change_rebuild_recommended_pct(config)
+            rebuild_recommended = should_recommend_rebuild(
+                discovered_candidates,
+                full_count,
+                threshold,
+            )
+            if rebuild_recommended:
+                share = discovered_candidates / full_count * 100 if full_count else 0
+                print(
+                    f"Candidate set is {share:.1f}% of "
+                    f"{full_count} entities (threshold {threshold:g}%). "
+                    "FULL_REBUILD_RECOMMENDED; skipping targeted proof."
+                )
+                _print_phase(PHASE_MATERIALIZE, skipped="FULL_REBUILD_RECOMMENDED")
+                _print_phase(PHASE_TARGET_BASE, skipped="FULL_REBUILD_RECOMMENDED")
+                _print_phase(PHASE_TARGET_HEAD, skipped="FULL_REBUILD_RECOMMENDED")
+                _print_phase(PHASE_CONFIRM, skipped="FULL_REBUILD_RECOMMENDED")
+        elif persist and sql_change_demo and sql_change_required and not sql_change_queries:
+            _print_phase(PHASE_IMPACT, skipped="impact SQL unavailable")
+        if persist and not rebuild_recommended:
             model = manifest.find_model(config.model.name)
             isolated = open_isolated_run(
                 warehouse,
@@ -674,28 +763,56 @@ def cmd_prove(args: argparse.Namespace) -> int:
             events=events,
             warehouse=warehouse,
             run_id=run_id,
-            persist=persist,
-            sql_change_queries=sql_change_queries,
-            sql_change_required=sql_change_required,
+            persist=persist and not rebuild_recommended,
+            sql_change_queries=() if rebuild_recommended else sql_change_queries,
+            sql_change_required=False if rebuild_recommended else sql_change_required,
             before_sql=base_sql,
             after_sql=after_sql,
             isolated_run=isolated,
+            confirm=not rebuild_recommended,
+            full_rebuild_recommended=rebuild_recommended,
         )
+        if isolated is not None and sql_change_demo:
+            for phase in (PHASE_MATERIALIZE, PHASE_TARGET_BASE, PHASE_TARGET_HEAD, PHASE_CONFIRM):
+                if phase in isolated.phase_timings:
+                    _print_phase(phase, isolated.phase_timings[phase])
+        if rebuild_recommended:
+            result.sql_change_candidate_count = discovered_candidates
+            result.union_candidate_count = discovered_candidates
+            result.event_candidate_count = result.event_candidate_count or 0
+            result.changed_source_row_count = discovered_source_rows
+            result.full_rebuild_recommended = True
+            if discovered_candidates is not None:
+                frontier_count = min(discovered_candidates, result.full_entity_count)
+                result.frontier_entity_count = frontier_count
+                result.percent_rows_avoided = percent_rows_avoided(
+                    result.full_entity_count,
+                    frontier_count,
+                )
         if sql_change_demo:
             if sql_proof is None:
-                if not result.affected_relation or not base_sql or not after_sql:
-                    raise ConfigError("SQL-change proof requires compiled base/PR SQL and affected keys")
-                sql_proof = measure_sql_change_proof(
-                    config,
-                    warehouse=warehouse,
-                    before_sql=base_sql,
-                    after_sql=after_sql,
-                    affected_relation=result.affected_relation,
-                    impact_sql=sql_change_queries[0] if sql_change_queries else None,
-                    candidate_count=result.union_candidate_count,
-                    confirmed_count=len(result.confirmed_keys) if result.confirmed_keys is not None else None,
-                    full_rebuild_required=result.full_rebuild_required,
-                )
+                if rebuild_recommended:
+                    sql_proof = recommended_sql_change_proof(
+                        full_entity_count=result.full_entity_count,
+                        candidate_count=discovered_candidates or 0,
+                        changed_source_row_count=discovered_source_rows or 0,
+                    )
+                else:
+                    if not result.affected_relation or not base_sql or not after_sql:
+                        raise ConfigError("SQL-change proof requires compiled base/PR SQL and affected keys")
+                    sql_proof = measure_sql_change_proof(
+                        config,
+                        warehouse=warehouse,
+                        before_sql=base_sql,
+                        after_sql=after_sql,
+                        affected_relation=result.affected_relation,
+                        impact_sql=sql_change_queries[0] if sql_change_queries else None,
+                        candidate_count=result.union_candidate_count,
+                        confirmed_count=len(result.confirmed_keys) if result.confirmed_keys is not None else None,
+                        full_rebuild_required=result.full_rebuild_required,
+                        targeted_before_relation=isolated.targeted_base_relation if isolated else None,
+                        targeted_after_relation=isolated.targeted_head_relation if isolated else None,
+                    )
             if dry_run:
                 result.affected_entities = recorded_sql_change_affected(
                     entity_type=config.model.entity,
@@ -703,10 +820,13 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 )
             else:
                 result.affected_entities = []
-            result.frontier_entity_count = sql_proof.candidate_frontier_count
+            result.frontier_entity_count = min(
+                sql_proof.candidate_frontier_count,
+                result.full_entity_count,
+            )
             result.percent_rows_avoided = percent_rows_avoided(
                 result.full_entity_count,
-                sql_proof.candidate_frontier_count,
+                result.frontier_entity_count,
             )
         elif proof is None:
             proof = measure_mutation_proof(
@@ -723,9 +843,9 @@ def cmd_prove(args: argparse.Namespace) -> int:
             result=result,
             warehouse=None if dry_run else warehouse,
         )
-        if sql_proof is not None:
+        if sql_proof is not None and not rebuild_recommended:
             validations.extend(sql_change_proof_validation_results(sql_proof))
-        else:
+        elif proof is not None:
             validations.extend(proof_validation_results(proof))
     finally:
         if isolated is not None:
@@ -741,18 +861,27 @@ def cmd_prove(args: argparse.Namespace) -> int:
     extra_metrics = {
         "fullRowsRecomputed": assessed.full_rows_recomputed,
         "frontierRowsRecomputed": assessed.frontier_rows_recomputed,
-        "missingFrontierEntities": assessed.missing_frontier_entities,
-        "extraFrontierEntities": assessed.extra_frontier_entities,
-        "mismatchedFinalRows": assessed.mismatched_final_rows,
         "testDurationMs": assessed.test_duration_ms,
     }
-    if sql_proof is not None:
+    if not rebuild_recommended:
         extra_metrics.update(
             {
-                "frontierEntityCount": sql_proof.candidate_frontier_count,
+                "missingFrontierEntities": assessed.missing_frontier_entities,
+                "extraFrontierEntities": assessed.extra_frontier_entities,
+                "mismatchedFinalRows": assessed.mismatched_final_rows,
+            }
+        )
+    if sql_proof is not None:
+        frontier_for_metrics = min(
+            sql_proof.candidate_frontier_count,
+            sql_proof.full_rows_recomputed,
+        )
+        extra_metrics.update(
+            {
+                "frontierEntityCount": frontier_for_metrics,
                 "percentRowsAvoided": percent_rows_avoided(
                     sql_proof.full_rows_recomputed,
-                    sql_proof.candidate_frontier_count,
+                    frontier_for_metrics,
                 ),
                 "candidateFrontierCount": sql_proof.candidate_frontier_count,
                 "confirmedFrontierCount": sql_proof.confirmed_frontier_count,
@@ -804,8 +933,13 @@ def cmd_prove(args: argparse.Namespace) -> int:
         print(f"Event-derived candidates: {result.event_candidate_count or 0}")
         print(f"Confirmed changed summaries: {sql_proof.confirmed_frontier_count}")
         print(f"Row count: {sql_proof.before_entity_count} → {sql_proof.after_entity_count}")
-        print(f"Targeted repair: {'safe' if sql_proof.targeted_repair_safe else 'not safe'}")
-        print(f"Full backfill: {'required' if sql_proof.full_rebuild_required else 'not required'}")
+        print(f"Targeted repair: {'skipped' if rebuild_recommended else ('safe' if sql_proof.targeted_repair_safe else 'not safe')}")
+        if sql_proof.full_rebuild_required:
+            print("Full backfill: required")
+        elif rebuild_recommended or sql_proof.full_rebuild_recommended:
+            print("Full backfill: recommended")
+        else:
+            print("Full backfill: not required")
     print(f"Missing frontier entities: {assessed.missing_frontier_entities}")
     print(f"Extra frontier entities: {assessed.extra_frontier_entities}")
     print(f"Mismatched final rows: {assessed.mismatched_final_rows}")
@@ -814,6 +948,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
     for item in validations:
         print(f"  - {item.test_name}: {item.status} (differences={item.difference_count})")
     print(f"Wrote {output}")
+    _print_phase(PHASE_UPLOAD, skipped="run `frontier upload`")
     if overall_status(validations) != "passed":
         print(
             "Assessment failed; wrote diagnostics for upload.",
@@ -835,6 +970,13 @@ def cmd_compare(args: argparse.Namespace) -> int:
     base_manifest = load_manifest(base_manifest_path)
     pr_manifest = load_manifest(pr_manifest_path)
     entity_key, confirmed_keys = _impact_keys(args, project_dir)
+    target_name = None
+    config_path = _config_path(args, project_dir)
+    if config_path.is_file():
+        try:
+            target_name = load_frontier_config(config_path).model.name
+        except ConfigError:
+            target_name = None
     comparison = compare_manifests(
         base_manifest,
         pr_manifest,
@@ -844,6 +986,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         pr_commit_sha=(os.environ.get("GITHUB_SHA") or "").strip() or None,
         entity_key=entity_key,
         confirmed_keys=confirmed_keys,
+        target_name=target_name,
     ).to_dict()
     print(format_compare_report(comparison))
     output = Path(args.output) if args.output else _target_dir(project_dir) / "frontier-compare.json"
@@ -878,7 +1021,9 @@ def cmd_upload(args: argparse.Namespace) -> int:
         f"Uploading {payload.get('externalRunId')} to {api_url} "
         f"as {redact_api_key(api_key)} ({api_key_source})"
     )
+    started = time.perf_counter()
     response = upload_run(payload, api_url=api_url, api_key=api_key)
+    _print_phase(PHASE_UPLOAD, _elapsed_ms(started))
     status = response.pop("_httpStatus", None)
     print(json.dumps({"httpStatus": status, **response}, indent=2))
     run_id = response.get("id")

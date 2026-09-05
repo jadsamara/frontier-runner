@@ -211,6 +211,48 @@ def test_comment_reports_live_sql_change_warehouse_counts() -> None:
     assert "12" not in body
 
 
+def test_comment_reports_recommended_full_rebuild() -> None:
+    body = format_pr_comment(
+        {
+            **PASSED_PAYLOAD,
+            "changeEvents": [],
+            "runMode": "live",
+            "candidateSetOrigin": "sql_change",
+            "metrics": {
+                **PASSED_PAYLOAD["metrics"],
+                "frontierEntityCount": 120_000,
+                "percentRowsAvoided": 20.0,
+                "candidateFrontierCount": 120_000,
+                "confirmedFrontierCount": 0,
+                "changedSourceRowCount": 770_000,
+                "eventCandidateCount": 0,
+            },
+            "sqlComparison": {
+                "base": {"fingerprint": "a" * 64, "modelCount": 4},
+                "pr": {"fingerprint": "b" * 64, "modelCount": 4},
+                "added": [],
+                "removed": [],
+                "modified": [
+                    {
+                        "name": "int_customer_orders",
+                        "changeKinds": ["FILTER_CHANGED"],
+                        "impactStatus": "COMPILED",
+                        "impactExecution": "EXECUTED",
+                    }
+                ],
+                "narrowFrontierSafe": True,
+                "fullRebuildRequired": False,
+                "fullRebuildRecommended": True,
+            },
+        },
+        run_url="https://frontier.example/runs/11111111-1111-4111-8111-111111111111",
+    )
+    assert "Full backfill: recommended" in body
+    assert "Targeted repair: skipped" in body
+    assert "Impact: full rebuild recommended" in body
+    assert "Full backfill: required" not in body
+
+
 def test_comment_reports_origin_counts_without_entity_ids() -> None:
     body = format_pr_comment(
         {

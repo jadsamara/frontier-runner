@@ -26,6 +26,7 @@ def _node(
     depends: tuple[str, ...] = (),
     compiled_code: str | None = None,
     original_file_path: str | None = None,
+    tags: tuple[str, ...] = (),
 ) -> DbtNode:
     unique_id = f"model.jaffle_shop.{name}"
     return DbtNode(
@@ -39,6 +40,7 @@ def _node(
         original_file_path=original_file_path or f"models/{name}.sql",
         compiled_code=sql if compiled_code is None else compiled_code,
         package_name="jaffle_shop",
+        tags=tags,
     )
 
 
@@ -303,6 +305,57 @@ def test_compiled_sql_pair_prefers_changed_production_model() -> None:
         },
     )
     assert pair == (before, after)
+
+
+def test_compare_does_not_compile_demo_or_mutation_models() -> None:
+    base_prod = "select customer_id from orders where status = 'F'"
+    pr_prod = "select customer_id from orders where status in ('F', 'O')"
+    demo_base = (
+        "select o.customer_id from orders o "
+        "join frontier_affected_customers f on o.customer_id = f.customer_id "
+        "where o.status = 'F'"
+    )
+    demo_pr = demo_base.replace("= 'F'", "in ('F', 'O')")
+    base = _manifest(
+        _node("int_customer_orders", sql=base_prod),
+        _node(
+            "frontier_customer_orders_target",
+            sql=demo_base,
+            tags=("frontier_demo",),
+        ),
+        _node(
+            "int_customer_orders_after",
+            sql=demo_base,
+            tags=("frontier_mutation",),
+        ),
+    )
+    pr = _manifest(
+        _node("int_customer_orders", sql=pr_prod),
+        _node(
+            "frontier_customer_orders_target",
+            sql=demo_pr,
+            tags=("frontier_demo",),
+        ),
+        _node(
+            "int_customer_orders_after",
+            sql=demo_pr,
+            tags=("frontier_mutation",),
+        ),
+    )
+    comparison = compare_manifests(
+        base,
+        pr,
+        entity_key="customer_id",
+        target_name="customer_summary",
+    ).to_dict()
+    names = {row["name"]: row for row in comparison["modified"]}
+    assert names["int_customer_orders"]["impactStatus"] == "COMPILED"
+    assert names["int_customer_orders"].get("candidateSql")
+    assert "frontier_affected_customers" not in (names["int_customer_orders"].get("candidateSql") or "").lower()
+    assert names["frontier_customer_orders_target"].get("candidateSql") is None
+    assert names["frontier_customer_orders_target"].get("impactStatus") is None
+    assert names["int_customer_orders_after"].get("candidateSql") is None
+    assert comparison["fullRebuildRequired"] is False
 
 
 def test_stamp_impact_execution_separates_compiler_from_warehouse() -> None:
