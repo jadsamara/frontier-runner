@@ -86,6 +86,7 @@ from frontier.proof import (
     recorded_sql_change_affected,
     recorded_sql_change_proof,
     recommended_sql_change_proof,
+    required_sql_change_proof,
     resolve_deleted_order,
     sql_change_proof_validation_results,
 )
@@ -799,9 +800,16 @@ def cmd_prove(args: argparse.Namespace) -> int:
         project_dir=project_dir,
         sql_comparison=sql_comparison,
     )
+    impact_unavailable = sql_change_required and not selected_queries
     log_step("targeted SQL generation started")
     started = time.perf_counter()
-    if base_sql and after_sql:
+    if impact_unavailable:
+        log_step(
+            "targeted SQL generation completed",
+            duration_ms=elapsed_ms(started),
+            status="skipped:impact SQL unavailable",
+        )
+    elif base_sql and after_sql:
         try:
             model = manifest.find_model(config.model.name)
             _generate_targeted_sql_pair(
@@ -978,7 +986,28 @@ def cmd_prove(args: argparse.Namespace) -> int:
             log_step("impact query completed", status="skipped:impact SQL unavailable")
             log_step("candidate count calculated 0", status="skipped")
             log_step("threshold decision completed", status="skipped:impact SQL unavailable")
+            log_step("candidate materialization started")
+            log_step(
+                "candidate materialization completed",
+                status="skipped:FULL_REBUILD_REQUIRED",
+            )
+            log_step("targeted base execution started")
+            log_step(
+                "targeted base execution completed",
+                status="skipped:FULL_REBUILD_REQUIRED",
+            )
+            log_step("targeted head execution started")
+            log_step(
+                "targeted head execution completed",
+                status="skipped:FULL_REBUILD_REQUIRED",
+            )
+            log_step("confirmation started")
+            log_step("confirmation completed", status="skipped:FULL_REBUILD_REQUIRED")
             _print_phase(PHASE_IMPACT, skipped="impact SQL unavailable")
+            _print_phase(PHASE_MATERIALIZE, skipped="FULL_REBUILD_REQUIRED")
+            _print_phase(PHASE_TARGET_BASE, skipped="FULL_REBUILD_REQUIRED")
+            _print_phase(PHASE_TARGET_HEAD, skipped="FULL_REBUILD_REQUIRED")
+            _print_phase(PHASE_CONFIRM, skipped="FULL_REBUILD_REQUIRED")
         elif sql_change_demo:
             log_step("impact query submission started")
             log_step("impact query submitted", status="skipped:dry-run")
@@ -1008,7 +1037,8 @@ def cmd_prove(args: argparse.Namespace) -> int:
             _print_phase(PHASE_TARGET_BASE, skipped="dry-run")
             _print_phase(PHASE_TARGET_HEAD, skipped="dry-run")
             _print_phase(PHASE_CONFIRM, skipped="dry-run")
-        if persist and not rebuild_recommended:
+        skip_targeted = rebuild_recommended or (persist and impact_unavailable)
+        if persist and not skip_targeted:
             model = manifest.find_model(config.model.name)
             isolated = open_isolated_run(
                 warehouse,
@@ -1024,13 +1054,13 @@ def cmd_prove(args: argparse.Namespace) -> int:
             events=events,
             warehouse=warehouse,
             run_id=run_id,
-            persist=persist and not rebuild_recommended,
-            sql_change_queries=() if rebuild_recommended else sql_change_queries,
-            sql_change_required=False if rebuild_recommended else sql_change_required,
+            persist=persist and not skip_targeted,
+            sql_change_queries=() if skip_targeted else sql_change_queries,
+            sql_change_required=False if skip_targeted else sql_change_required,
             before_sql=base_sql,
             after_sql=after_sql,
             isolated_run=isolated,
-            confirm=not rebuild_recommended,
+            confirm=not skip_targeted,
             full_rebuild_recommended=rebuild_recommended,
         )
         if isolated is not None and sql_change_demo:
@@ -1050,6 +1080,18 @@ def cmd_prove(args: argparse.Namespace) -> int:
                     result.full_entity_count,
                     frontier_count,
                 )
+        if persist and impact_unavailable:
+            result.full_rebuild_required = True
+            reasons = list(result.execution_reasons)
+            if not any("unavailable" in reason.lower() for reason in reasons):
+                reasons.append("SQL impact query unavailable")
+            result.execution_reasons = tuple(reasons)
+            result.frontier_entity_count = result.full_entity_count
+            result.percent_rows_avoided = percent_rows_avoided(
+                result.full_entity_count,
+                result.full_entity_count,
+            )
+        skip_proof_metrics = rebuild_recommended or result.full_rebuild_required
         if sql_change_demo:
             if sql_proof is None:
                 if rebuild_recommended:
@@ -1060,6 +1102,12 @@ def cmd_prove(args: argparse.Namespace) -> int:
                         changed_source_row_count=discovered_source_rows or 0,
                     )
                     log_step("SQL-change proof completed", status="skipped:FULL_REBUILD_RECOMMENDED")
+                elif result.full_rebuild_required:
+                    log_step("SQL-change proof started")
+                    sql_proof = required_sql_change_proof(
+                        full_entity_count=result.full_entity_count,
+                    )
+                    log_step("SQL-change proof completed", status="skipped:FULL_REBUILD_REQUIRED")
                 else:
                     if not result.affected_relation or not base_sql or not after_sql:
                         raise ConfigError("SQL-change proof requires compiled base/PR SQL and affected keys")
@@ -1134,7 +1182,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 result=result,
                 warehouse=None if dry_run else warehouse,
             )
-            if sql_proof is not None and not rebuild_recommended:
+            if sql_proof is not None and not skip_proof_metrics:
                 validations.extend(sql_change_proof_validation_results(sql_proof))
             elif proof is not None:
                 validations.extend(proof_validation_results(proof))
@@ -1165,7 +1213,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
         "frontierRowsRecomputed": assessed.frontier_rows_recomputed,
         "testDurationMs": assessed.test_duration_ms,
     }
-    if not rebuild_recommended:
+    if not rebuild_recommended and not result.full_rebuild_required:
         extra_metrics.update(
             {
                 "missingFrontierEntities": assessed.missing_frontier_entities,
@@ -1235,7 +1283,9 @@ def cmd_prove(args: argparse.Namespace) -> int:
         print(f"Event-derived candidates: {result.event_candidate_count or 0}")
         print(f"Confirmed changed summaries: {sql_proof.confirmed_frontier_count}")
         print(f"Row count: {sql_proof.before_entity_count} → {sql_proof.after_entity_count}")
-        print(f"Targeted repair: {'skipped' if rebuild_recommended else ('safe' if sql_proof.targeted_repair_safe else 'not safe')}")
+        print(
+            f"Targeted repair: {'skipped' if rebuild_recommended or result.full_rebuild_required else ('safe' if sql_proof.targeted_repair_safe else 'not safe')}"
+        )
         if sql_proof.full_rebuild_required:
             print("Full backfill: required")
         elif rebuild_recommended or sql_proof.full_rebuild_recommended:

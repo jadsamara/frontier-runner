@@ -350,6 +350,31 @@ def recommended_sql_change_proof(
     )
 
 
+def required_sql_change_proof(*, full_entity_count: int) -> SqlChangeProof:
+    """Counts-only proof when impact SQL is unavailable or failed.
+
+    The candidate set is unknown, so the frontier is the full entity
+    population. Never treat analysis failure as an empty affected set.
+    """
+    return SqlChangeProof(
+        full_rows_recomputed=full_entity_count,
+        frontier_rows_recomputed=full_entity_count,
+        rows_avoided=0,
+        source_population_count=0,
+        candidate_frontier_count=full_entity_count,
+        confirmed_frontier_count=0,
+        before_entity_count=full_entity_count,
+        after_entity_count=full_entity_count,
+        changed_source_row_count=0,
+        missing_frontier_entities=0,
+        extra_frontier_entities=0,
+        mismatched_final_rows=0,
+        test_duration_ms=0,
+        full_rebuild_required=True,
+        full_rebuild_recommended=False,
+    )
+
+
 def _measure_targeted_sql_change_proof(
     config: FrontierConfig,
     *,

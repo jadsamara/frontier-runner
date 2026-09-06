@@ -5,6 +5,7 @@ from pathlib import Path
 
 from frontier.cli import main
 from frontier.hashing import ENTITY_HASH_KEY_ENV
+from frontier.warehouse import FakeWarehouse
 from tests.conftest import FIXTURES, JAFFLE_SHOP
 
 TEST_HASH_KEY = "test-only-frontier-entity-hash-key"
@@ -137,6 +138,26 @@ def _write_sql_change_manifests(project: Path) -> Path:
     return base_path
 
 
+def _write_source_changed_manifests(project: Path) -> Path:
+    pr_path = project / "target" / "manifest.json"
+    payload = json.loads(pr_path.read_text())
+    after_sql = "select o_custkey as customer_id from DATA_AGENT_DEV.FRONTIER_CDC.ORDERS"
+    before_sql = (
+        "select o_custkey as customer_id from SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.ORDERS"
+    )
+    payload["nodes"]["model.jaffle_shop.stg_orders"]["compiled_code"] = after_sql
+    pr_path.write_text(json.dumps(payload))
+    base = json.loads(json.dumps(payload))
+    base["nodes"]["model.jaffle_shop.stg_orders"]["compiled_code"] = before_sql
+    base_path = project / "target-base" / "manifest.json"
+    base_path.parent.mkdir(parents=True, exist_ok=True)
+    base_path.write_text(json.dumps(base))
+    events = project / "seeds" / "change_events.csv"
+    if events.exists():
+        events.unlink()
+    return base_path
+
+
 def test_prove_dry_run_sql_change_without_events(dbt_project: Path, monkeypatch, capsys) -> None:
     monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
     base_path = _write_sql_change_manifests(dbt_project)
@@ -245,6 +266,56 @@ def test_prove_dry_run_sql_change_without_events(dbt_project: Path, monkeypatch,
     assert "assert_changed_customers_in_frontier" not in names
     values = {entity["entityValue"] for entity in payload["affectedEntities"]}
     assert values == {"4", "7", "9", "22", "31", "44", "73", "88"}
+
+
+def test_prove_source_changed_writes_full_rebuild_instead_of_crashing(
+    dbt_project: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    base_path = _write_source_changed_manifests(dbt_project)
+    monkeypatch.setattr(
+        "frontier.cli.connect_warehouse",
+        lambda *args, **kwargs: FakeWarehouse({"full_entity_count": [(150_000,)]}),
+    )
+    code = main(
+        [
+            "prove",
+            "--project-dir",
+            str(dbt_project),
+            "--include-entity-ids",
+            "--run-id",
+            "sql-change-source-rebuild-001",
+            "--base-manifest",
+            str(base_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "SQL-change proof requires compiled base/PR SQL" not in captured.err
+    assert "SQL-change proof requires compiled base/PR SQL" not in captured.out
+    assert "prove: targeted SQL generation completed skipped:impact SQL unavailable" in captured.out
+    assert "prove: SQL-change proof completed skipped:FULL_REBUILD_REQUIRED" in captured.out
+    assert "Impact: FULL_REBUILD_REQUIRED" in captured.out
+    assert "Full backfill: required" in captured.out
+    assert "Targeted repair: skipped" in captured.out
+    assert "Candidate customers: 150000" in captured.out
+    assert "Wrote " in captured.out
+    payload = json.loads((dbt_project / "target" / "frontier-run.json").read_text())
+    assert payload["sqlComparison"]["fullRebuildRequired"] is True
+    assert payload["sqlComparison"]["narrowFrontierSafe"] is False
+    modified = payload["sqlComparison"]["modified"][0]
+    assert modified["name"] == "stg_orders"
+    assert "SOURCE_CHANGED" in modified["changeKinds"]
+    assert modified["impactStatus"] == "FULL_REBUILD_REQUIRED"
+    assert modified["impactExecution"] == "FAILED"
+    assert payload["metrics"]["fullEntityCount"] == 150000
+    assert payload["metrics"]["frontierEntityCount"] == 150000
+    assert payload["metrics"]["percentRowsAvoided"] == 0
+    assert payload["metrics"]["candidateFrontierCount"] == 150000
+    names = {item["testName"]: item for item in payload["validationResults"]}
+    assert names["assert_sql_change_allows_narrow_frontier"]["status"] == "failed"
+    assert "assert_sql_frontier_covers_reference" not in names
+    assert payload["affectedEntities"] == []
 
 
 def test_run_requires_entity_hash_key(dbt_project: Path, monkeypatch, capsys) -> None:
