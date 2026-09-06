@@ -79,6 +79,10 @@ def build_ingest_payload(
     candidate_set_origin: str | None = None,
     assessment_type: str | None = None,
     cdc: dict[str, Any] | None = None,
+    semantic_manifest_id: str | None = None,
+    semantic_manifest_version: int | None = None,
+    semantic_manifest_fingerprint: str | None = None,
+    manifest_source: str | None = None,
 ) -> dict[str, Any]:
     payload = {
         "externalRunId": external_run_id,
@@ -116,6 +120,17 @@ def build_ingest_payload(
         payload["assessmentType"] = assessment_type
     if cdc:
         payload["cdc"] = cdc
+    if manifest_source == "local_override":
+        payload["manifestSource"] = "local_override"
+    else:
+        if semantic_manifest_id:
+            payload["semanticManifestId"] = semantic_manifest_id
+        if semantic_manifest_version is not None:
+            payload["semanticManifestVersion"] = semantic_manifest_version
+        if semantic_manifest_fingerprint:
+            payload["semanticManifestFingerprint"] = semantic_manifest_fingerprint
+        if manifest_source:
+            payload["manifestSource"] = manifest_source
     assert_payload_has_no_secrets(payload)
     assert_no_raw_rows(payload)
     return payload

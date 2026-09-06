@@ -80,11 +80,20 @@ def load_change_events_csv(path: Path, *, required: bool = True) -> list[ChangeE
         reader = csv.DictReader(handle)
         for row in reader:
             prior = (
-                row.get("prior_customer_id")
-                or row.get("prior_entity_value")
+                row.get("prior_entity_value")
                 or row.get("priorEntityValue")
+                or row.get("prior_entity_id")
                 or ""
             ).strip()
+            if not prior:
+                prior = next(
+                    (
+                        str(value).strip()
+                        for key, value in row.items()
+                        if str(key).startswith("prior_") and value not in (None, "")
+                    ),
+                    "",
+                )
             events.append(
                 ChangeEvent(
                     event_id=str(row.get("event_id") or row.get("eventId") or "").strip(),

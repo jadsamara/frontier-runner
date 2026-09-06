@@ -9,6 +9,15 @@ FIXTURES = Path(__file__).parent / "fixtures"
 JAFFLE_SHOP = Path("/Users/jad/Desktop/data_agent_pipeline/jaffle_shop")
 
 
+@pytest.fixture(autouse=True)
+def allow_local_manifest(monkeypatch) -> None:
+    monkeypatch.setenv("FRONTIER_ALLOW_LOCAL_MANIFEST", "1")
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("FRONTIER_API_KEY", raising=False)
+    monkeypatch.delenv("FRONTIER_DEMO_API_KEY", raising=False)
+    monkeypatch.delenv("FRONTIER_API_URL", raising=False)
+
+
 def copy_dbt_project(tmp_path: Path) -> Path:
     project = tmp_path / "jaffle_shop"
     (project / "target").mkdir(parents=True)

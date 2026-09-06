@@ -145,7 +145,7 @@ def test_comment_explains_sql_change_without_entity_ids() -> None:
     assert "Changed source rows: 12" in body
     assert "Candidate customers: 12" in body
     assert "Event-derived candidates: 0" in body
-    assert "Customer summaries that actually differ: 8" in body
+    assert "Confirmed changed customers: 8" in body
     assert "Row count: 150,000 → 150,000" in body
     assert "Targeted repair: safe" in body
     assert "Full backfill: not required" in body

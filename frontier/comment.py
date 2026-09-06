@@ -116,13 +116,15 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
         if changed_source is not None:
             lines.append(f"Changed source rows: {_format_count(int(changed_source))}")
         if candidate_count is not None:
-            lines.append(f"Candidate customers: {_format_count(int(candidate_count))}")
+            lines.append(
+                f"Candidate {_pluralize(entity_type, int(candidate_count))}: {_format_count(int(candidate_count))}"
+            )
         lines.append(
             f"Event-derived candidates: {_format_count(int(event_candidates or 0))}"
         )
         if confirmed_count is not None:
             lines.append(
-                f"Customer summaries that actually differ: {_format_count(int(confirmed_count))}"
+                f"Confirmed changed {_pluralize(entity_type, int(confirmed_count))}: {_format_count(int(confirmed_count))}"
             )
         if before_count is not None and after_count is not None:
             lines.append(

@@ -65,11 +65,13 @@ def test_coverage_sql_compares_changed_customers_to_frontier() -> None:
         before_relation="before_mart",
         after_relation="after_mart",
         frontier_relation="frontier_customers",
+        entity_key="customer_id",
     )
     extra = extra_frontier_sql(
         before_relation="before_mart",
         after_relation="after_mart",
         frontier_relation="frontier_customers",
+        entity_key="customer_id",
     )
     assert "missing_frontier_entities" in missing
     assert "extra_frontier_entities" in extra

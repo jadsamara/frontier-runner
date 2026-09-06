@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -125,7 +125,10 @@ def load_cdc_config(path: Path) -> CdcConfig:
         source_model = _require_ident(str(row.get("source_model") or ""), field="source_model")
         primary_key = _require_ident(str(row.get("primary_key") or ""), field="primary_key")
         target_key = _require_ident(str(row.get("target_key") or ""), field="target_key")
-        target_entity = _require_ident(str(row.get("target_entity") or ""), field="target_entity")
+        target_entity_raw = str(row.get("target_entity") or "").strip()
+        target_entity = (
+            _require_ident(target_entity_raw, field="target_entity") if target_entity_raw else ""
+        )
         stream_relation = _require_relation(str(row.get("stream_relation") or ""), field="stream_relation")
         base_relation = _require_relation(str(row.get("base_relation") or ""), field="base_relation")
         stream_key = stream_relation.lower()
@@ -150,3 +153,45 @@ def cdc_config_path(project_dir: Path, explicit: str | None = None) -> Path:
     if explicit:
         return Path(explicit).expanduser().resolve()
     return project_dir / CDC_FILE_NAME
+
+
+def overlay_cdc_with_manifest(config: CdcConfig, pinned: Any) -> CdcConfig:
+    from frontier.semantic import ManifestError, PinnedSemanticManifest
+
+    if not isinstance(pinned, PinnedSemanticManifest):
+        raise ManifestError("MANIFEST_REQUIRED", "CDC semantic routing requires a pinned manifest")
+    if pinned.source == "local_override":
+        return config
+    if pinned.id == "00000000-0000-4000-8000-000000000000":
+        return config
+    by_name = {item.name: item for item in pinned.sources}
+    sources: list[CdcSourceConfig] = []
+    for source in config.sources:
+        remote = by_name.get(source.source_model)
+        if remote is None:
+            raise ManifestError(
+                "MANIFEST_LOCAL_REMOTE_CONFLICT",
+                f"CDC source '{source.source_model}' is not in the semantic manifest",
+            )
+        if source.target_entity and source.target_entity != pinned.target_entity_type:
+            raise ManifestError(
+                "MANIFEST_LOCAL_REMOTE_CONFLICT",
+                f"CDC target entity for '{source.source_model}' does not match the semantic manifest",
+            )
+        yaml_requires_delete = "DELETE" in source.require_before_image_for
+        if source.require_before_image_for and yaml_requires_delete != remote.deletes_require_before_image:
+            raise ManifestError(
+                "MANIFEST_LOCAL_REMOTE_CONFLICT",
+                f"CDC before-image policy for '{source.source_model}' does not match the semantic manifest",
+            )
+        require = source.require_before_image_for
+        if not require:
+            require = ("DELETE", "KEY_CHANGE") if remote.deletes_require_before_image else ()
+        sources.append(
+            replace(
+                source,
+                target_entity=pinned.target_entity_type,
+                require_before_image_for=require,
+            )
+        )
+    return replace(config, sources=tuple(sources))

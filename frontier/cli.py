@@ -18,6 +18,7 @@ from frontier.api import (
 from frontier.comment import maybe_upsert_pr_comment
 from frontier.config import (
     ConfigError,
+    FrontierConfig,
     load_frontier_config,
     should_recommend_rebuild,
     sql_change_rebuild_recommended_pct,
@@ -61,8 +62,17 @@ from frontier.progress import (
     failure_status,
     log_step,
 )
-from frontier.cdc.config import cdc_config_path, load_cdc_config
+from frontier.cdc.config import cdc_config_path, load_cdc_config, overlay_cdc_with_manifest
 from frontier.cdc.consume import consume_all, project_name_for
+from frontier.semantic import (
+    PinnedSemanticManifest,
+    default_pin_path,
+    fetch_active_manifest,
+    pin_manifest,
+    print_semantic_manifest,
+    resolve_semantic_manifest,
+    validate_pinned_document,
+)
 from frontier.cdc.prove import prove_batch
 from frontier.cdc.store import SnowflakeCdcStore
 from frontier.cdc.upload import upload_cdc_batch
@@ -70,6 +80,7 @@ from frontier.proof import (
     apply_resolved_delete,
     measure_mutation_proof,
     measure_sql_change_proof,
+    mutation_source_key,
     proof_validation_results,
     recorded_proof,
     recorded_sql_change_affected,
@@ -105,6 +116,13 @@ PHASE_CONFIRM = "confirmation"
 PHASE_UPLOAD = "upload"
 
 
+def _pluralize_entity(entity: str) -> str:
+    token = (entity or "entity").strip() or "entity"
+    if token.endswith("s"):
+        return token
+    return f"{token}s"
+
+
 def _print_phase(name: str, duration_ms: int | None = None, *, skipped: str | None = None) -> None:
     if skipped:
         print(f"{name}: skipped ({skipped})", flush=True)
@@ -124,6 +142,56 @@ def _config_path(args: argparse.Namespace, project_dir: Path) -> Path:
     return project_dir / "frontier.yml"
 
 
+def _api_url(args: argparse.Namespace, config) -> str:
+    return str(
+        getattr(args, "api_url", None)
+        or os.environ.get("FRONTIER_API_URL")
+        or config.api_url,
+    ).rstrip("/")
+
+
+def _optional_api_key() -> str | None:
+    for name in ("FRONTIER_API_KEY", "FRONTIER_DEMO_API_KEY"):
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _resolve_runtime_config(
+    args: argparse.Namespace,
+    project_dir: Path,
+    *,
+    dbt_manifest=None,
+):
+    config = load_frontier_config(_config_path(args, project_dir))
+    explicit = getattr(args, "manifest_file", None)
+    api_key = None if explicit else _optional_api_key()
+    config, _pinned = resolve_semantic_manifest(
+        args,
+        project_dir=project_dir,
+        config=config,
+        dbt_manifest=dbt_manifest,
+        api_url=_api_url(args, config),
+        api_key=api_key,
+    )
+    return config
+
+
+def _ingest_manifest_fields(config) -> dict[str, Any]:
+    pinned = getattr(config, "pinned", None)
+    if not isinstance(pinned, PinnedSemanticManifest):
+        return {}
+    if pinned.source == "local_override":
+        return {"manifest_source": "local_override"}
+    return {
+        "semantic_manifest_id": pinned.id,
+        "semantic_manifest_version": pinned.version,
+        "semantic_manifest_fingerprint": pinned.fingerprint,
+        "manifest_source": pinned.source,
+    }
+
+
 def _target_dir(project_dir: Path) -> Path:
     return project_dir / "target"
 
@@ -132,30 +200,12 @@ def _compiled_root_for(manifest_path: Path) -> Path:
     return manifest_path.parent / "compiled"
 
 
-def _impact_keys(args: argparse.Namespace, project_dir: Path) -> tuple[str | None, tuple[str, ...]]:
-    path = _config_path(args, project_dir)
-    if not path.is_file():
-        return None, ()
-    try:
-        config = load_frontier_config(path)
-    except ConfigError:
-        return None, ()
-    confirmed = tuple(
-        dict.fromkeys(
-            [
-                config.model.key,
-                *[relation.change_key for relation in config.relations.values()],
-            ]
-        )
-    )
-    return config.model.key, confirmed
-
-
 def _load_sql_comparison(
     args: argparse.Namespace,
     *,
     pr_manifest,
     project_dir: Path,
+    config: FrontierConfig | None = None,
 ) -> dict[str, Any] | None:
     base_path = getattr(args, "base_manifest", None)
     if not base_path:
@@ -163,14 +213,28 @@ def _load_sql_comparison(
     base_manifest_path = Path(base_path).expanduser().resolve()
     base_manifest = load_manifest(base_manifest_path)
     pr_path = pr_manifest.path or (_target_dir(project_dir) / "manifest.json")
-    entity_key, confirmed_keys = _impact_keys(args, project_dir)
-    target_name = None
-    config_path = _config_path(args, project_dir)
-    if config_path.is_file():
-        try:
-            target_name = load_frontier_config(config_path).model.name
-        except ConfigError:
-            target_name = None
+    runtime = config
+    if runtime is None:
+        config_path = _config_path(args, project_dir)
+        if config_path.is_file():
+            try:
+                runtime = load_frontier_config(config_path)
+            except ConfigError:
+                runtime = None
+    entity_key = runtime.model.key if runtime else None
+    confirmed_keys = (
+        tuple(
+            dict.fromkeys(
+                [
+                    runtime.model.key,
+                    *[relation.change_key for relation in runtime.relations.values()],
+                ]
+            )
+        )
+        if runtime
+        else ()
+    )
+    target_name = runtime.model.name if runtime else None
     comparison = compare_manifests(
         base_manifest,
         pr_manifest,
@@ -196,15 +260,20 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_inspect(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
     require_current_artifacts(_target_dir(project_dir))
-    config = load_frontier_config(_config_path(args, project_dir))
     manifest = load_manifest(_target_dir(project_dir) / "manifest.json")
+    config = _resolve_runtime_config(args, project_dir, dbt_manifest=manifest)
     if manifest.project_name != config.project:
         raise ConfigError(
             f"frontier.yml project '{config.project}' does not match manifest '{manifest.project_name}'",
         )
     report = inspect_report(manifest, config.model.name)
     print(format_inspect_report(report))
-    comparison = _load_sql_comparison(args, pr_manifest=manifest, project_dir=project_dir)
+    comparison = _load_sql_comparison(
+        args,
+        pr_manifest=manifest,
+        project_dir=project_dir,
+        config=config,
+    )
     if comparison:
         print()
         print(format_compare_report(comparison))
@@ -431,6 +500,7 @@ def _emit_run(
             details["changeEvents"],
             sql_comparison,
         ),
+        **_ingest_manifest_fields(config),
     )
     output = Path(args.output) if args.output else _target_dir(_project_dir(args)) / RUN_FILE_NAME
     _write_run_file(output, payload)
@@ -440,13 +510,14 @@ def _emit_run(
 def cmd_run(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
     require_current_artifacts(_target_dir(project_dir))
-    config = load_frontier_config(_config_path(args, project_dir))
     manifest = load_manifest(_target_dir(project_dir) / "manifest.json")
+    config = _resolve_runtime_config(args, project_dir, dbt_manifest=manifest)
     run_results = load_run_results(_target_dir(project_dir) / "run_results.json")
     sql_comparison = _load_sql_comparison(
         args,
         pr_manifest=manifest,
         project_dir=project_dir,
+        config=config,
     )
     events = _load_events(args, project_dir, sql_comparison)
 
@@ -546,7 +617,7 @@ def cmd_record_failure(args: argparse.Namespace) -> int:
     run_results.json as if it belonged to this commit.
     """
     project_dir = _project_dir(args)
-    config = load_frontier_config(_config_path(args, project_dir))
+    config = _resolve_runtime_config(args, project_dir)
     include_entity_ids = args.include_entity_ids or config.upload.include_entity_ids
     hash_entity_ids = args.hash_entity_ids or config.upload.hash_entity_ids
     send_raw_ids = include_entity_ids and not hash_entity_ids
@@ -625,6 +696,7 @@ def cmd_record_failure(args: argparse.Namespace) -> int:
         ),
         run_mode="live",
         candidate_set_origin="event",
+        **_ingest_manifest_fields(config),
     )
     output = Path(args.output) if args.output else _target_dir(project_dir) / RUN_FILE_NAME
     _write_run_file(output, payload)
@@ -664,8 +736,8 @@ def _generate_targeted_sql_pair(
 def cmd_prove(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
     require_current_artifacts(_target_dir(project_dir))
-    config = load_frontier_config(_config_path(args, project_dir))
     manifest = load_manifest(_target_dir(project_dir) / "manifest.json")
+    config = _resolve_runtime_config(args, project_dir, dbt_manifest=manifest)
     run_results = load_run_results(_target_dir(project_dir) / "run_results.json")
     run_id = args.run_id or default_external_run_id(config.project)
     log_step("compare started")
@@ -675,6 +747,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
             args,
             pr_manifest=manifest,
             project_dir=project_dir,
+            config=config,
         )
     except Exception as error:
         log_step(
@@ -793,6 +866,8 @@ def cmd_prove(args: argparse.Namespace) -> int:
                     manifest,
                     warehouse,
                     proof=config.proof,
+                    source_key=mutation_source_key(config),
+                    entity_key=config.model.key,
                 )
             except ConfigError:
                 warehouse.close()
@@ -1156,7 +1231,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
         if executions:
             print(f"Impact execution: {', '.join(executions)}")
         print(f"Changed source rows: {sql_proof.changed_source_row_count}")
-        print(f"Candidate customers: {sql_proof.candidate_frontier_count}")
+        print(f"Candidate {_pluralize_entity(config.model.entity)}: {sql_proof.candidate_frontier_count}")
         print(f"Event-derived candidates: {result.event_candidate_count or 0}")
         print(f"Confirmed changed summaries: {sql_proof.confirmed_frontier_count}")
         print(f"Row count: {sql_proof.before_entity_count} → {sql_proof.after_entity_count}")
@@ -1198,14 +1273,14 @@ def cmd_compare(args: argparse.Namespace) -> int:
     base_manifest_path = Path(args.base_manifest).expanduser().resolve()
     base_manifest = load_manifest(base_manifest_path)
     pr_manifest = load_manifest(pr_manifest_path)
-    entity_key, confirmed_keys = _impact_keys(args, project_dir)
-    target_name = None
-    config_path = _config_path(args, project_dir)
-    if config_path.is_file():
-        try:
-            target_name = load_frontier_config(config_path).model.name
-        except ConfigError:
-            target_name = None
+    config = _resolve_runtime_config(args, project_dir, dbt_manifest=pr_manifest)
+    entity_key = config.model.key
+    confirmed_keys = tuple(
+        dict.fromkeys(
+            [config.model.key, *[relation.change_key for relation in config.relations.values()]]
+        )
+    )
+    target_name = config.model.name
     comparison = compare_manifests(
         base_manifest,
         pr_manifest,
@@ -1280,6 +1355,32 @@ def cmd_upload(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_manifest_fetch(args: argparse.Namespace) -> int:
+    project_dir = _project_dir(args)
+    config = load_frontier_config(_config_path(args, project_dir))
+    api_key, _source = api_key_from_env()
+    api_url = _api_url(args, config)
+    output = Path(args.output).expanduser().resolve() if args.output else default_pin_path(project_dir)
+    started = time.perf_counter()
+    log_step("manifest fetch started", prefix="manifest")
+    try:
+        pinned = fetch_active_manifest(api_url=api_url, api_key=api_key, project=config.project)
+        validate_pinned_document(pinned)
+        pin_manifest(output, pinned)
+    except Exception as error:
+        log_step(
+            "manifest fetch completed",
+            prefix="manifest",
+            duration_ms=elapsed_ms(started),
+            status=failure_status(error),
+        )
+        raise
+    log_step("manifest fetch completed", prefix="manifest", duration_ms=elapsed_ms(started), status="ok")
+    print_semantic_manifest(pinned)
+    print(f"Wrote {output}", flush=True)
+    return 0
+
+
 def _add_project_dir(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "project_dir",
@@ -1291,6 +1392,18 @@ def _add_project_dir(parser: argparse.ArgumentParser) -> None:
         "--project-dir",
         dest="project_dir_opt",
         help="dbt project directory (same as the positional path)",
+    )
+
+
+def _add_manifest_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--manifest-file",
+        help="Pinned semantic manifest JSON (skips the active SaaS fetch)",
+    )
+    parser.add_argument(
+        "--allow-local-manifest",
+        action="store_true",
+        help="Use frontier.yml semantic mapping when no SaaS manifest is configured",
     )
 
 
@@ -1324,6 +1437,7 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
         help="Use the recorded fixture counts without a live warehouse",
     )
     _add_base_manifest(parser)
+    _add_manifest_flags(parser)
 
 
 def _cdc_path(args: argparse.Namespace, project_dir: Path) -> Path:
@@ -1333,6 +1447,12 @@ def _cdc_path(args: argparse.Namespace, project_dir: Path) -> Path:
 def cmd_cdc_inspect(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
     config = load_cdc_config(_cdc_path(args, project_dir))
+    frontier_path = _config_path(args, project_dir)
+    if frontier_path.is_file():
+        dbt_path = _target_dir(project_dir) / "manifest.json"
+        dbt_manifest = load_manifest(dbt_path) if dbt_path.is_file() else None
+        frontier_config = _resolve_runtime_config(args, project_dir, dbt_manifest=dbt_manifest)
+        config = overlay_cdc_with_manifest(config, frontier_config.pinned)
     print(f"CDC provider: {config.provider}", flush=True)
     print(f"Sources: {len(config.sources)}", flush=True)
     for source in config.sources:
@@ -1413,9 +1533,10 @@ def cmd_cdc_consume(args: argparse.Namespace) -> int:
 def cmd_cdc_prove(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
     require_current_artifacts(_target_dir(project_dir))
-    cdc_config = load_cdc_config(_cdc_path(args, project_dir))
-    frontier_config = load_frontier_config(_config_path(args, project_dir))
     manifest = load_manifest(_target_dir(project_dir) / "manifest.json")
+    cdc_config = load_cdc_config(_cdc_path(args, project_dir))
+    frontier_config = _resolve_runtime_config(args, project_dir, dbt_manifest=manifest)
+    cdc_config = overlay_cdc_with_manifest(cdc_config, frontier_config.pinned)
     warehouse = connect_warehouse(
         project_dir,
         profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
@@ -1475,9 +1596,13 @@ def cmd_cdc_prove(args: argparse.Namespace) -> int:
 def cmd_cdc_upload(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
     require_current_artifacts(_target_dir(project_dir))
-    cdc_config = load_cdc_config(_cdc_path(args, project_dir))
-    frontier_config = load_frontier_config(_config_path(args, project_dir))
     manifest = load_manifest(_target_dir(project_dir) / "manifest.json")
+    pin = default_pin_path(project_dir)
+    if pin.is_file() and not getattr(args, "manifest_file", None):
+        args.manifest_file = str(pin)
+    cdc_config = load_cdc_config(_cdc_path(args, project_dir))
+    frontier_config = _resolve_runtime_config(args, project_dir, dbt_manifest=manifest)
+    cdc_config = overlay_cdc_with_manifest(cdc_config, frontier_config.pinned)
     warehouse = connect_warehouse(
         project_dir,
         profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
@@ -1543,6 +1668,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect = sub.add_parser("inspect", help="Read dbt artifacts and print model lineage")
     _add_project_dir(inspect)
     inspect.add_argument("--config", help="Path to frontier.yml")
+    _add_manifest_flags(inspect)
     _add_base_manifest(inspect)
     inspect.set_defaults(func=cmd_inspect)
 
@@ -1562,6 +1688,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="manifest.json compiled from the pull request (default: target/manifest.json)",
     )
     compare.add_argument("--output", help="Where to write frontier-compare.json")
+    _add_manifest_flags(compare)
     compare.set_defaults(func=cmd_compare)
 
     run = sub.add_parser("run", help="Execute frontier and validation queries")
@@ -1600,7 +1727,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="HMAC-SHA-256 entity IDs even when --include-entity-ids is set",
     )
+    _add_manifest_flags(record_failure)
     record_failure.set_defaults(func=cmd_record_failure)
+
+    manifest_cmd = sub.add_parser("manifest", help="Fetch and pin the active SaaS semantic manifest")
+    manifest_sub = manifest_cmd.add_subparsers(dest="manifest_command", required=True)
+    manifest_fetch = manifest_sub.add_parser("fetch", help="Download the active semantic manifest")
+    _add_project_dir(manifest_fetch)
+    manifest_fetch.add_argument("--config", help="Path to frontier.yml")
+    manifest_fetch.add_argument("--api-url", help="SaaS origin (default: FRONTIER_API_URL or frontier.yml)")
+    manifest_fetch.add_argument(
+        "--output",
+        help="Where to write the pinned manifest (default: target/frontier-manifest.json)",
+    )
+    manifest_fetch.set_defaults(func=cmd_manifest_fetch)
 
     upload = sub.add_parser("upload", help="POST aggregate results to Frontier SaaS")
     _add_project_dir(upload)
@@ -1625,7 +1765,9 @@ def build_parser() -> argparse.ArgumentParser:
     cdc_inspect = cdc_sub.add_parser("inspect", help="Print configured CDC streams without consuming them")
     _add_project_dir(cdc_inspect)
     cdc_inspect.add_argument("--cdc-config", help="Path to frontier-cdc.yml")
+    cdc_inspect.add_argument("--config", help="Path to frontier.yml")
     cdc_inspect.add_argument("--target", help="dbt target name")
+    _add_manifest_flags(cdc_inspect)
     cdc_inspect.set_defaults(func=cmd_cdc_inspect)
 
     cdc_status = cdc_sub.add_parser("status", help="Report whether configured streams have pending data")
@@ -1659,6 +1801,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Apply the repair to the target mart (default: assessment only)",
     )
+    _add_manifest_flags(cdc_prove)
     cdc_prove.set_defaults(func=cmd_cdc_prove)
 
     cdc_upload = cdc_sub.add_parser(
@@ -1672,6 +1815,7 @@ def build_parser() -> argparse.ArgumentParser:
     cdc_upload.add_argument("--target", help="dbt target name")
     cdc_upload.add_argument("--batch-id", help="Completed batch to upload (default: newest COMPLETED not yet uploaded)")
     cdc_upload.add_argument("--api-url", help="Frontier API origin")
+    _add_manifest_flags(cdc_upload)
     cdc_upload.set_defaults(func=cmd_cdc_upload)
     return parser
 

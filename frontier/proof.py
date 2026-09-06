@@ -93,9 +93,9 @@ def except_keyword(dialect: str) -> str:
     return "except"
 
 
-def deleted_order_sql(relation: str) -> str:
+def deleted_order_sql(relation: str, *, source_key: str, entity_key: str) -> str:
     return (
-        "select order_id, customer_id "
+        f"select {source_key}, {entity_key} "
         f"from {relation} as mutation_deleted_order"
     )
 
@@ -108,21 +108,22 @@ def frontier_rows_sql(targeted_relation: str) -> str:
     return f"select count(*) as frontier_rows_recomputed from {targeted_relation}"
 
 
-def actually_changed_customer_sql(
+def actually_changed_entity_sql(
     *,
     before_relation: str,
     after_relation: str,
+    entity_key: str,
     dialect: str = "snowflake",
 ) -> str:
     except_op = except_keyword(dialect)
     return (
-        "select customer_id from ("
+        f"select {entity_key} from ("
         f"    select * from {after_relation}"
         f"    {except_op}"
         f"    select * from {before_relation}"
         ") as after_not_before "
         "union "
-        "select customer_id from ("
+        f"select {entity_key} from ("
         f"    select * from {before_relation}"
         f"    {except_op}"
         f"    select * from {after_relation}"
@@ -135,19 +136,21 @@ def missing_frontier_sql(
     before_relation: str,
     after_relation: str,
     frontier_relation: str,
+    entity_key: str,
     dialect: str = "snowflake",
 ) -> str:
     except_op = except_keyword(dialect)
-    changed = actually_changed_customer_sql(
+    changed = actually_changed_entity_sql(
         before_relation=before_relation,
         after_relation=after_relation,
+        entity_key=entity_key,
         dialect=dialect,
     )
     return (
         "select count(*) as missing_frontier_entities from ("
         f"    {changed}"
         f"    {except_op}"
-        f"    select customer_id from {frontier_relation}"
+        f"    select {entity_key} from {frontier_relation}"
         ") as missing_frontier"
     )
 
@@ -157,17 +160,19 @@ def extra_frontier_sql(
     before_relation: str,
     after_relation: str,
     frontier_relation: str,
+    entity_key: str,
     dialect: str = "snowflake",
 ) -> str:
     except_op = except_keyword(dialect)
-    changed = actually_changed_customer_sql(
+    changed = actually_changed_entity_sql(
         before_relation=before_relation,
         after_relation=after_relation,
+        entity_key=entity_key,
         dialect=dialect,
     )
     return (
         "select count(*) as extra_frontier_entities from ("
-        f"    select customer_id from {frontier_relation}"
+        f"    select {entity_key} from {frontier_relation}"
         f"    {except_op}"
         f"    {changed}"
         ") as extra_frontier"
@@ -233,16 +238,27 @@ def _optional_relation(manifest: Manifest, name: str) -> str | None:
         return None
 
 
+def mutation_source_key(config: FrontierConfig) -> str:
+    for relation in config.relations.values():
+        if relation.route.kind != "direct":
+            return relation.change_key
+    return config.model.key
+
+
 def resolve_deleted_order(
     manifest: Manifest,
     warehouse: WarehouseAdapter,
     *,
     proof: ProofConfig,
+    source_key: str,
+    entity_key: str,
 ) -> tuple[str, str]:
     deleted = _optional_relation(manifest, proof.deleted_order)
     if deleted is None:
         return "5", "781"
-    deleted_rows = warehouse.execute(deleted_order_sql(deleted))
+    deleted_rows = warehouse.execute(
+        deleted_order_sql(deleted, source_key=source_key, entity_key=entity_key)
+    )
     if not deleted_rows or deleted_rows[0][0] is None:
         raise ConfigError("mutation_deleted_order returned no order to delete")
     return str(deleted_rows[0][0]), str(deleted_rows[0][1])
@@ -375,7 +391,7 @@ def _measure_targeted_sql_change_proof(
     extra = max(0, candidate - confirmed)
     changed_source = changed_source_row_count if changed_source_row_count is not None else 0
     if full_entity_count <= 0:
-        raise ConfigError("after-change SQL returned no customers")
+        raise ConfigError("after-change SQL returned no target entities")
     if frontier_rows < 0 or frontier_rows > full_entity_count:
         raise ConfigError("frontier recompute count is outside the full mart")
     return SqlChangeProof(
@@ -552,7 +568,7 @@ def measure_sql_change_proof(
     )
     candidate = candidate_count if candidate_count is not None else extra + confirmed
     if after_count <= 0:
-        raise ConfigError("after-change SQL returned no customers")
+        raise ConfigError("after-change SQL returned no target entities")
     if frontier_rows < 0 or frontier_rows > after_count:
         raise ConfigError("frontier recompute count is outside the full mart")
     return SqlChangeProof(
@@ -602,6 +618,8 @@ def measure_mutation_proof(
             manifest,
             warehouse,
             proof=spec,
+            source_key=mutation_source_key(config),
+            entity_key=entity_key,
         )
     else:
         deleted_order_id = "5"
@@ -632,6 +650,7 @@ def measure_mutation_proof(
             before_relation=before,
             after_relation=after,
             frontier_relation=frontier,
+            entity_key=entity_key,
             dialect=warehouse.dialect,
         ),
     )
@@ -641,6 +660,7 @@ def measure_mutation_proof(
             before_relation=before,
             after_relation=after,
             frontier_relation=frontier,
+            entity_key=entity_key,
             dialect=warehouse.dialect,
         ),
     )
@@ -665,7 +685,7 @@ def measure_mutation_proof(
     )
     duration_ms = max(0, round((time.perf_counter() - started) * 1000))
     if full_rows <= 0:
-        raise ConfigError("after-change mart returned no customers")
+        raise ConfigError("after-change mart returned no target entities")
     if frontier_rows < 0 or frontier_rows > full_rows:
         raise ConfigError("frontier recompute count is outside the full mart")
     return MutationProof(

@@ -11,6 +11,7 @@ from frontier.cdc.config import CdcConfig
 from frontier.cdc.normalize import LogicalChangeEvent, operation_counts
 from frontier.cdc.store import CdcBatch, CdcProofRecord, CdcStore
 from frontier.config import ConfigError, FrontierConfig
+from frontier.semantic import PinnedSemanticManifest
 from frontier.dbt_artifacts import Manifest
 from frontier.github import github_source
 from frontier.progress import elapsed_ms, failure_status, log_step
@@ -29,6 +30,20 @@ FORBIDDEN_UPLOAD_KEY = re.compile(
     r"orderkey|custkey|o_orderkey|c_custkey)",
     re.IGNORECASE,
 )
+
+
+def _ingest_manifest_fields(config: FrontierConfig) -> dict[str, Any]:
+    pinned = getattr(config, "pinned", None)
+    if not isinstance(pinned, PinnedSemanticManifest):
+        return {}
+    if pinned.source == "local_override":
+        return {"manifest_source": "local_override"}
+    return {
+        "semantic_manifest_id": pinned.id,
+        "semantic_manifest_version": pinned.version,
+        "semantic_manifest_fingerprint": pinned.fingerprint,
+        "manifest_source": pinned.source,
+    }
 
 
 def cdc_external_run_id(project_name: str, batch_fingerprint: str) -> str:
@@ -284,6 +299,7 @@ def build_cdc_ingest_payload(
         run_mode="live",
         candidate_set_origin="event",
         assessment_type="cdc",
+        **_ingest_manifest_fields(config),
         cdc={
             "provider": cdc_config.provider,
             "batchFingerprint": fingerprint,

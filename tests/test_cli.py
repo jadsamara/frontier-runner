@@ -750,6 +750,7 @@ def test_prove_dry_run_is_rejected_in_github_actions(dbt_project: Path, monkeypa
             str(dbt_project),
             "--base-manifest",
             str(base_path),
+            "--allow-local-manifest",
         ]
     )
     captured = capsys.readouterr()

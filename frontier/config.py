@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -72,11 +72,11 @@ class UploadConfig:
 
 @dataclass(frozen=True)
 class ProofConfig:
-    before_mart: str = "customer_summary"
-    after_mart: str = "customer_summary_after"
-    repaired_mart: str = "customer_summary_repaired"
-    frontier: str = "frontier_affected_customers"
-    targeted_after: str = "frontier_customer_summary_target_after"
+    before_mart: str = ""
+    after_mart: str = ""
+    repaired_mart: str = ""
+    frontier: str = ""
+    targeted_after: str = ""
     deleted_order: str = "mutation_deleted_order"
 
 
@@ -96,6 +96,7 @@ class FrontierConfig:
     sql_change: SqlChangeConfig = field(default_factory=SqlChangeConfig)
     api_url: str = "http://127.0.0.1:3000"
     path: Path | None = None
+    pinned: object | None = None
 
     def relation(self, name: str) -> RelationConfig:
         try:
@@ -189,7 +190,7 @@ def load_frontier_config(path: Path) -> FrontierConfig:
     if not isinstance(proof_raw, dict):
         raise ConfigError("proof must be a mapping")
 
-    defaults = ProofConfig()
+    defaults = derive_proof_config(model)
     proof = ProofConfig(
         before_mart=str(proof_raw.get("before_mart") or defaults.before_mart).strip(),
         after_mart=str(proof_raw.get("after_mart") or defaults.after_mart).strip(),
@@ -265,6 +266,17 @@ def write_init_config(path: Path, *, force: bool = False) -> Path:
         raise ConfigError(f"{path} already exists (pass --force to overwrite)")
     path.write_text(INIT_FRONTIER_YML)
     return path
+
+
+def derive_proof_config(model: ModelConfig) -> ProofConfig:
+    return ProofConfig(
+        before_mart=model.name,
+        after_mart=f"{model.name}_after",
+        repaired_mart=f"{model.name}_repaired",
+        frontier=f"frontier_affected_{model.entity}s",
+        targeted_after=f"frontier_{model.name}_target_after",
+        deleted_order="mutation_deleted_order",
+    )
 
 
 def sql_change_rebuild_recommended_pct(config: FrontierConfig) -> float:

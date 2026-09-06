@@ -72,6 +72,13 @@ def test_cdc_upload_cli_prints_idempotent_result(dbt_project: Path, monkeypatch,
 
     (dbt_project / "frontier-cdc.yml").write_text((FIXTURES / "frontier-cdc.yml").read_text())
     monkeypatch.setenv("FRONTIER_API_KEY", "frn_test_key")
+    from frontier.config import load_frontier_config
+    from frontier.semantic import local_override_from_config, pin_manifest
+
+    pin_manifest(
+        dbt_project / "target" / "frontier-manifest.json",
+        local_override_from_config(load_frontier_config(dbt_project / "frontier.yml")),
+    )
     monkeypatch.setattr("frontier.cli.connect_warehouse", lambda *args, **kwargs: FakeWarehouse())
 
     def fake_upload(**kwargs):

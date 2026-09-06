@@ -18,6 +18,3 @@ sources:
     primary_key: C_CUSTKEY
     target_entity: customer
     target_key: C_CUSTKEY
-    require_before_image_for:
-      - DELETE
-      - KEY_CHANGE
