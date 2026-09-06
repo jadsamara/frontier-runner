@@ -12,6 +12,7 @@ JAFFLE_SHOP = Path("/Users/jad/Desktop/data_agent_pipeline/jaffle_shop")
 @pytest.fixture(autouse=True)
 def allow_local_manifest(monkeypatch) -> None:
     monkeypatch.setenv("FRONTIER_ALLOW_LOCAL_MANIFEST", "1")
+    monkeypatch.setenv("FRONTIER_HIDE_UPDATE_NOTICE", "1")
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     monkeypatch.delenv("FRONTIER_API_KEY", raising=False)
     monkeypatch.delenv("FRONTIER_DEMO_API_KEY", raising=False)

@@ -97,6 +97,21 @@ from frontier.warehouse import (
     describe_adapter,
     normalize_warehouse_type,
 )
+from frontier.onboard.commands import (
+    cmd_auth_status,
+    cmd_demo_change,
+    cmd_discover,
+    cmd_doctor,
+    cmd_init as cmd_onboard_init,
+    cmd_login,
+    cmd_logout,
+    cmd_permissions,
+    cmd_setup_github,
+    cmd_setup_hash_key,
+    cmd_signup,
+    cmd_update_check,
+    maybe_version_notice,
+)
 from frontier.validation import (
     ValidationResult,
     collect_validation_results,
@@ -251,11 +266,13 @@ def _load_sql_comparison(
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    project_dir = _project_dir(args)
-    path = Path(args.config).expanduser().resolve() if args.config else project_dir / "frontier.yml"
-    write_init_config(path, force=args.force)
-    print(f"Wrote {path}")
-    return 0
+    if getattr(args, "legacy_yml", False):
+        project_dir = _project_dir(args)
+        path = Path(args.config).expanduser().resolve() if args.config else project_dir / "frontier.yml"
+        write_init_config(path, force=args.force)
+        print(f"Wrote {path}")
+        return 0
+    return cmd_onboard_init(args)
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
@@ -1760,11 +1777,80 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"frontier {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    init = sub.add_parser("init", help="Write a frontier.yml next to the dbt project")
+    init = sub.add_parser("init", help="Detect the dbt project and write .frontier/config.yml")
     _add_project_dir(init)
-    init.add_argument("--config", help="Path to write (default: <project-dir>/frontier.yml)")
-    init.add_argument("--force", action="store_true", help="Overwrite an existing file")
+    init.add_argument("--config", help="Unused unless --legacy-yml is set")
+    init.add_argument("--force", action="store_true", help="Overwrite an existing .frontier/config.yml")
+    init.add_argument("--yes", action="store_true", help="Accept detected defaults")
+    init.add_argument(
+        "--legacy-yml",
+        action="store_true",
+        help="Write the example frontier.yml instead of .frontier/config.yml",
+    )
     init.set_defaults(func=cmd_init)
+
+    signup = sub.add_parser("signup", help="Open hosted Frontier signup")
+    signup.add_argument("--api-url", help="SaaS origin")
+    signup.set_defaults(func=cmd_signup)
+
+    login = sub.add_parser("login", help="Store a project API key in the OS keychain")
+    login.add_argument("--api-key", action="store_true", help="Paste a project API key (hidden input)")
+    login.add_argument("--api-url", help="SaaS origin")
+    login.set_defaults(func=cmd_login)
+
+    logout = sub.add_parser("logout", help="Remove stored Frontier API credentials")
+    logout.set_defaults(func=cmd_logout)
+
+    auth = sub.add_parser("auth", help="Show authentication status")
+    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+    auth_status = auth_sub.add_parser("status", help="Show whether the CLI is authenticated")
+    auth_status.set_defaults(func=cmd_auth_status)
+
+    discover = sub.add_parser("discover", help="Infer a draft semantic manifest from dbt artifacts")
+    _add_project_dir(discover)
+    discover.add_argument("--yes", action="store_true", help="Select the first suggested model")
+    discover.add_argument("--model", help="Target model name")
+    discover.set_defaults(func=cmd_discover)
+
+    doctor = sub.add_parser("doctor", help="Diagnose the local Frontier installation")
+    _add_project_dir(doctor)
+    doctor.add_argument("--json", action="store_true", help="Print redacted JSON for support")
+    doctor.add_argument("--skip-warehouse", action="store_true", help="Skip the live Snowflake ping")
+    doctor.set_defaults(func=cmd_doctor)
+
+    setup = sub.add_parser("setup", help="Generate GitHub, hash-key, or Snowflake permission files")
+    setup_sub = setup.add_subparsers(dest="setup_command", required=True)
+    setup_github = setup_sub.add_parser("github", help="Write .github/workflows/frontier.yml")
+    _add_project_dir(setup_github)
+    setup_github.add_argument("--force", action="store_true", help="Overwrite an existing workflow")
+    setup_github.add_argument("--yes", action="store_true", help="Accept defaults")
+    setup_github.add_argument(
+        "--blocking",
+        action="store_true",
+        help="Set FRONTIER_BLOCKING=true (default is false for the first PR)",
+    )
+    setup_github.set_defaults(func=cmd_setup_github)
+    setup_hash = setup_sub.add_parser("hash-key", help="Generate FRONTIER_ENTITY_HASH_KEY")
+    setup_hash.add_argument("--yes", action="store_true", help="Store with gh when available")
+    setup_hash.add_argument("--copy", action="store_true", help="Copy the complete key to the clipboard")
+    setup_hash.add_argument("--print-key", action="store_true", help="Print the complete key")
+    setup_hash.set_defaults(func=cmd_setup_hash_key)
+    setup_snowflake = setup_sub.add_parser("snowflake", help="Print least-privilege Snowflake grants")
+    _add_project_dir(setup_snowflake)
+    setup_snowflake.add_argument("--cdc", action="store_true", help="Include CDC stream grants")
+    setup_snowflake.add_argument("--query-history", action="store_true", help="Include query history grants")
+    setup_snowflake.set_defaults(func=cmd_permissions)
+
+    demo = sub.add_parser("demo", help="First-test PR instructions")
+    demo_sub = demo.add_subparsers(dest="demo_command", required=True)
+    demo_change = demo_sub.add_parser("change", help="Explain a harmless first test PR")
+    _add_project_dir(demo_change)
+    demo_change.set_defaults(func=cmd_demo_change)
+
+    update_check = sub.add_parser("update-check", help="Compare this runner to the hosted latest")
+    _add_project_dir(update_check)
+    update_check.add_argument("--api-url", help="SaaS origin")
+    update_check.set_defaults(func=cmd_update_check)
 
     inspect = sub.add_parser("inspect", help="Read dbt artifacts and print model lineage")
     _add_project_dir(inspect)
@@ -1925,6 +2011,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
+    command = getattr(args, "command", None)
+    if command not in {"update-check", "doctor", "login", "logout", "signup"}:
+        from frontier.onboard.constants import DEFAULT_API_URL
+
+        maybe_version_notice(str(getattr(args, "api_url", None) or DEFAULT_API_URL))
     try:
         return int(args.func(args))
     except ConfigError as error:

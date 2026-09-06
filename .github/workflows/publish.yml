@@ -1,0 +1,60 @@
+# Publish frontier-runner from a version tag only.
+# Do not run until the package name and this workflow are reviewed.
+# PyPI trusted publishing (OIDC) — no long-lived API token.
+
+name: Publish frontier-runner
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    name: Build, smoke-install, and publish
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Verify tag matches package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          test "$TAG" = "$PKG"
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check metadata
+        run: twine check dist/*
+
+      - name: Smoke-install the wheel
+        run: |
+          python -m venv /tmp/frontier-wheel
+          /tmp/frontier-wheel/bin/pip install dist/frontier_runner-*-py3-none-any.whl
+          /tmp/frontier-wheel/bin/frontier --version
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

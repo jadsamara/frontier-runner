@@ -15,12 +15,14 @@ SHA256_OF_ONE = "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4
 def test_init_writes_into_project_dir(tmp_path: Path, capsys) -> None:
     project = tmp_path / "jaffle_shop"
     project.mkdir()
-    assert main(["init", str(project)]) == 0
-    config_path = project / "frontier.yml"
+    (project / "dbt_project.yml").write_text("name: jaffle_shop\nprofile: jaffle_shop\n")
+    assert main(["init", "--yes", str(project)]) == 0
+    config_path = project / ".frontier" / "config.yml"
     assert config_path.is_file()
     out = capsys.readouterr().out
     assert str(config_path) in out
-    assert "customer_summary" in config_path.read_text()
+    assert "jaffle_shop" in config_path.read_text()
+    assert "customer_summary" not in config_path.read_text()
 
 
 def test_init_and_inspect(dbt_project: Path, capsys) -> None:

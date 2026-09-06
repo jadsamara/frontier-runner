@@ -22,6 +22,7 @@ class DbtNode:
     source_name: str | None = None
     compiled_code: str | None = None
     package_name: str | None = None
+    columns: tuple[str, ...] = ()
 
     @property
     def relation(self) -> str:
@@ -134,6 +135,21 @@ class Manifest:
         ]
 
 
+def _columns_from_raw(raw: dict[str, Any]) -> tuple[str, ...]:
+    columns = raw.get("columns") or {}
+    if isinstance(columns, dict):
+        return tuple(str(name) for name in columns)
+    if isinstance(columns, list):
+        names: list[str] = []
+        for item in columns:
+            if isinstance(item, str):
+                names.append(item)
+            elif isinstance(item, dict) and item.get("name"):
+                names.append(str(item["name"]))
+        return tuple(names)
+    return ()
+
+
 def _node_from_raw(unique_id: str, raw: dict[str, Any]) -> DbtNode:
     depends = tuple((raw.get("depends_on") or {}).get("nodes") or [])
     return DbtNode(
@@ -149,6 +165,7 @@ def _node_from_raw(unique_id: str, raw: dict[str, Any]) -> DbtNode:
         source_name=raw.get("source_name"),
         compiled_code=raw.get("compiled_code") or raw.get("compiled_sql"),
         package_name=raw.get("package_name"),
+        columns=_columns_from_raw(raw),
     )
 
 

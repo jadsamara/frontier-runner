@@ -1,28 +1,38 @@
 [project]
 name = "frontier-runner"
 version = "0.1.0"
-description = "Customer-side Frontier CLI: inspect dbt artifacts, run frontier queries, upload aggregates."
+description = "Customer-side Frontier CLI for dbt + Snowflake + GitHub impact assessments."
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
+authors = [{ name = "Frontier" }]
+keywords = ["dbt", "snowflake", "github", "data"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Quality Assurance",
+]
 dependencies = [
-  "pyyaml>=6.0",
-  "sqlglot>=26.0",
+  "pyyaml>=6.0,<7",
+  "sqlglot>=30.0,<31",
+  "keyring>=25.0,<26",
 ]
 
 [project.optional-dependencies]
-snowflake = ["snowflake-connector-python>=3.12"]
-bigquery = ["google-cloud-bigquery>=3.0"]
-databricks = ["databricks-sql-connector>=3.0"]
-postgres = ["psycopg[binary]>=3.2"]
-redshift = ["redshift-connector>=2.1"]
-warehouses = [
-  "snowflake-connector-python>=3.12",
-  "google-cloud-bigquery>=3.0",
-  "databricks-sql-connector>=3.0",
-  "psycopg[binary]>=3.2",
-  "redshift-connector>=2.1",
-]
-dev = ["pytest>=8.0"]
+snowflake = ["snowflake-connector-python>=3.12,<4"]
+dev = ["pytest>=8.0,<9", "build>=1.2,<2"]
+
+[project.urls]
+Homepage = "https://github.com/jadsamara/frontier-runner"
+Changelog = "https://github.com/jadsamara/frontier-runner/blob/main/CHANGELOG.md"
+Issues = "https://github.com/jadsamara/frontier-runner/issues"
+Documentation = "https://frontier-web-x3l3etwczq-pd.a.run.app/docs/quick-start"
 
 [project.scripts]
 frontier = "frontier.cli:main"
@@ -31,9 +41,14 @@ frontier = "frontier.cli:main"
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+include-package-data = true
+license-files = ["LICENSE"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["frontier*"]
+exclude = ["tests*", "docs*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
