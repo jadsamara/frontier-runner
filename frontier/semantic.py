@@ -424,6 +424,17 @@ def fetch_active_manifest(
                 "MANIFEST_IS_DRAFT",
             }:
                 code = "MANIFEST_NOT_FOUND"
+            detail_error = str(body.get("error") or "").strip()
+            if code == "MANIFEST_NOT_ACTIVE":
+                raise ManifestError(
+                    code,
+                    detail_error
+                    or "No active semantic manifest. Open Frontier → Manifests, confirm the mapping, and Activate it.",
+                ) from error
+            raise ManifestError(
+                code,
+                detail_error or f"Active manifest fetch failed with HTTP {error.code}",
+            ) from error
         raise ManifestError(code, f"Active manifest fetch failed with HTTP {error.code}") from error
     except urllib.error.URLError as error:
         raise ManifestError("MANIFEST_SAAS_UNAVAILABLE", "Frontier SaaS is unavailable") from error
