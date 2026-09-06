@@ -46,7 +46,7 @@ jobs:
       - name: Check package metadata
         run: python -m twine check dist/*
 
-      - name: Smoke-install wheel with Snowflake support
+      - name: Smoke-install the wheel
         run: |
           WHEEL="$(realpath "$(find dist -maxdepth 1 -name '*.whl' -print -quit)")"
 

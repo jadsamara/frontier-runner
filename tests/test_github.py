@@ -118,7 +118,7 @@ def test_reference_customer_workflow_uses_prove_and_pinned_runner() -> None:
     assert "frontier record-failure" in text
     assert "rm -rf target" in text
     assert "frontier-artifact-sha" in text
-    assert "frontier-runner[snowflake]==0.1.0" in text
+    assert "frontier-runner[snowflake]==0.1.1" in text
     assert "pip install ./runner" not in text
     assert "FRONTIER_BLOCKING" in text
     assert "pull-requests: write" in text

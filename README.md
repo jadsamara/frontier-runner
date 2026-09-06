@@ -22,7 +22,7 @@ Until the package is on PyPI, install the GitHub Release wheel for a version
 tag. You do not need a commit SHA:
 
 ```bash
-pipx install https://github.com/jadsamara/frontier-runner/releases/download/v0.1.0/frontier_runner-0.1.0-py3-none-any.whl
+pipx install \ "frontier-runner[snowflake] @ https://github.com/jadsamara/frontier-runner/releases/download/v0.1.1/frontier_runner-0.1.1-py3-none-any.whl"
 pipx inject frontier-runner "snowflake-connector-python>=3.12,<4"
 ```
 
@@ -150,7 +150,7 @@ workflow uses `FRONTIER_BLOCKING=false` unless you pass `--blocking`.
 Pin an immutable released version:
 
 ```bash
-pip install "frontier-runner[snowflake]==0.1.0"
+pip install "frontier-runner[snowflake]==0.1.1"
 ```
 
 Until PyPI trusted publishing is reviewed and live, install the GitHub Release
@@ -158,4 +158,3 @@ wheel for the same version tag. Do not look up a runner Git SHA.
 
 Do not `pip install ./runner` from a dbt repository. That path exists only in
 the SaaS monorepo.
-

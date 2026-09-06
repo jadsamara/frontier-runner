@@ -1,0 +1,15 @@
+{
+  "apply": false,
+  "candidateCount": 1,
+  "confirmedChangeCount": 0,
+  "entityKey": "customer_id",
+  "eventRoutingValidated": true,
+  "noOpCount": 1,
+  "queryFingerprints": {
+    "targeted_count": "aa370bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "strategy": "delete-insert-candidates",
+  "targetRelation": "DATA_AGENT_DEV.DBT_DEV.customer_summary",
+  "targetedRowsCompared": true,
+  "wholeTableReferenceExecuted": false
+}

@@ -130,8 +130,8 @@ def fetch_runner_versions(api_url: str) -> RunnerVersions:
             docs_path="/docs/troubleshooting#saas-unreachable",
         )
     return RunnerVersions(
-        minimum_supported=str(body.get("minimumSupported") or "0.1.0"),
-        latest_stable=str(body.get("latestStable") or "0.1.0"),
+        minimum_supported=str(body.get("minimumSupported") or "0.1.1"),
+        latest_stable=str(body.get("latestStable") or "0.1.1"),
     )
 
 

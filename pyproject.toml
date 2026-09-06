@@ -1,10 +1,10 @@
 [project]
 name = "frontier-runner"
-version = "0.1.0"
+version = "0.1.1"
 description = "Customer-side Frontier CLI for dbt + Snowflake + GitHub impact assessments."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 authors = [{ name = "Frontier" }]
 keywords = ["dbt", "snowflake", "github", "data"]
 classifiers = [

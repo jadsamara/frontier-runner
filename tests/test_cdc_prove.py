@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,6 +15,80 @@ from frontier.config import ConfigError, load_frontier_config
 from frontier.dbt_artifacts import DbtNode, Manifest
 from frontier.warehouse import FakeWarehouse
 from tests.conftest import FIXTURES
+
+ORDERS = "DATA_AGENT_DEV.FRONTIER_CDC.ORDERS_STREAM"
+CUSTOMERS = "DATA_AGENT_DEV.FRONTIER_CDC.CUSTOMER_STREAM"
+FORBIDDEN_ENTITY_KEYS = {
+    "customer_id",
+    "entity_id",
+    "entity_key_value",
+    "order_id",
+    "o_orderkey",
+    "o_custkey",
+    "affected_entities",
+    "candidate_ids",
+}
+RAW_TEST_IDS = {"370", "781"}
+HEX_TOKEN = re.compile(r"[0-9A-Fa-f]+")
+
+
+def _normalized_key(key: str) -> str:
+    return key.strip().lower().replace("-", "_")
+
+
+def _is_forbidden_entity_key(key: str) -> bool:
+    normalized = _normalized_key(key)
+    compact = normalized.replace("_", "")
+    forbidden = {_normalized_key(item) for item in FORBIDDEN_ENTITY_KEYS}
+    forbidden_compact = {item.replace("_", "") for item in forbidden}
+    return normalized in forbidden or compact in forbidden_compact
+
+
+def _is_raw_test_id(value: Any) -> bool:
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, int) and str(value) in RAW_TEST_IDS:
+        return True
+    if isinstance(value, float) and value.is_integer() and str(int(value)) in RAW_TEST_IDS:
+        return True
+    return isinstance(value, str) and value in RAW_TEST_IDS
+
+
+def exposed_entity_ids_in_json(value: Any, *, path: str = "$") -> list[str]:
+    """Return paths where a JSON document exposes a raw entity identifier."""
+    findings: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if _is_forbidden_entity_key(str(key)):
+                findings.append(child_path)
+            findings.extend(exposed_entity_ids_in_json(child, path=child_path))
+        return findings
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            findings.extend(exposed_entity_ids_in_json(child, path=f"{path}[{index}]"))
+        return findings
+    if _is_raw_test_id(value):
+        findings.append(path)
+    return findings
+
+
+def exposed_entity_ids_in_text(text: str) -> list[str]:
+    """Return standalone raw IDs. Hex fingerprints that merely contain 370/781 are allowed."""
+    findings: list[str] = []
+    for line in text.splitlines() or [text]:
+        stripped = line.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                findings.extend(exposed_entity_ids_in_json(json.loads(stripped)))
+                continue
+            except json.JSONDecodeError:
+                pass
+        for match in HEX_TOKEN.finditer(line):
+            token = match.group(0)
+            if token in RAW_TEST_IDS:
+                findings.append(token)
+    return findings
 
 ORDERS = "DATA_AGENT_DEV.FRONTIER_CDC.ORDERS_STREAM"
 CUSTOMERS = "DATA_AGENT_DEV.FRONTIER_CDC.CUSTOMER_STREAM"
@@ -276,8 +353,7 @@ def test_entity_ids_absent_from_logs(tmp_path: Path, capsys) -> None:
     store = _captured()
     _prove(store, _warehouse(), tmp_path)
     output = capsys.readouterr().out
-    assert "370" not in output
-    assert "781" not in output
+    assert not exposed_entity_ids_in_text(output)
     assert "O_ORDERKEY" not in output
     assert "customer_id=" not in output
     assert "cdc: batch claim started" in output
@@ -289,7 +365,24 @@ def test_entity_ids_absent_from_logs(tmp_path: Path, capsys) -> None:
     assert "cdc: cleanup started" in output
     assert "cdc: batch completion completed" in output
     artifact = next(tmp_path.glob("frontier-cdc-repair-*.json"))
-    text = artifact.read_text()
-    assert "370" not in text
-    assert "781" not in text
-    assert "delete-insert-candidates" in text
+    payload = json.loads(artifact.read_text())
+    assert not exposed_entity_ids_in_json(payload)
+    assert payload["strategy"] == "delete-insert-candidates"
+
+
+def test_embedded_fingerprint_370_is_not_entity_id_exposure() -> None:
+    payload = json.loads((FIXTURES / "cdc-repair-safe-fingerprint.json").read_text())
+    fingerprint = payload["queryFingerprints"]["targeted_count"]
+    assert "370" in fingerprint
+    assert fingerprint != "370"
+    assert not exposed_entity_ids_in_json(payload)
+    assert not exposed_entity_ids_in_text(json.dumps(payload))
+    assert not exposed_entity_ids_in_text(f"cdc: fingerprint={fingerprint} ok")
+
+
+def test_customer_id_370_json_is_entity_id_exposure() -> None:
+    payload = json.loads((FIXTURES / "cdc-repair-exposed-customer-id.json").read_text())
+    assert payload == {"customer_id": "370"}
+    findings = exposed_entity_ids_in_json(payload)
+    assert findings
+    assert exposed_entity_ids_in_text(json.dumps(payload))
