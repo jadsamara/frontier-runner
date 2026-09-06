@@ -439,7 +439,9 @@ _INGEST_STRIP_KEYS = ("candidateSql", "parameterizedSql", "parameters", "tags")
 
 IMPACT_EXECUTION_EXECUTED = "EXECUTED"
 IMPACT_EXECUTION_NOT_EVALUATED = "NOT_EVALUATED"
+IMPACT_EXECUTION_NOT_RUN = "NOT_RUN"
 IMPACT_EXECUTION_FAILED = "FAILED"
+TARGETED_VALIDATION_NOT_RUN = "NOT_RUN"
 
 
 def stamp_impact_execution(
@@ -448,15 +450,21 @@ def stamp_impact_execution(
     run_mode: str,
     full_rebuild_required: bool,
     sql_change_executed: bool,
+    impact_attempted: bool = False,
 ) -> dict[str, Any] | None:
     """Record whether compiled impact SQL ran in the warehouse.
 
     COMPILED is the predicate compiler. EXECUTED means Snowflake (or the
-    configured adapter) actually ran the candidate query.
+    configured adapter) actually ran the candidate query. NOT_RUN means
+    targeted execution was skipped. FAILED is reserved for an attempt
+    that ran and failed.
     """
     if not comparison:
         return comparison
-    if full_rebuild_required:
+    skipped_rebuild = full_rebuild_required and not impact_attempted and not sql_change_executed
+    if skipped_rebuild:
+        default = IMPACT_EXECUTION_NOT_RUN
+    elif full_rebuild_required:
         default = IMPACT_EXECUTION_FAILED
     elif run_mode == "live" and sql_change_executed:
         default = IMPACT_EXECUTION_EXECUTED
@@ -466,9 +474,15 @@ def stamp_impact_execution(
     for group in ("added", "removed", "modified"):
         for row in copied.get(group) or []:
             if row.get("impactStatus") == FULL_REBUILD_REQUIRED:
-                row["impactExecution"] = IMPACT_EXECUTION_FAILED
+                row["impactExecution"] = (
+                    IMPACT_EXECUTION_FAILED
+                    if impact_attempted or sql_change_executed
+                    else IMPACT_EXECUTION_NOT_RUN
+                )
             elif row.get("impactStatus") or row.get("changeKinds"):
                 row["impactExecution"] = default
+    if skipped_rebuild:
+        copied["targetedValidation"] = TARGETED_VALIDATION_NOT_RUN
     return copied
 
 

@@ -299,19 +299,35 @@ def test_prove_source_changed_writes_full_rebuild_instead_of_crashing(
     assert "Full backfill: required" in captured.out
     assert "Targeted repair: skipped" in captured.out
     assert "Candidate customers: 150000" in captured.out
+    assert "Changed source rows: Not measured" in captured.out
+    assert "Confirmed changed summaries: Not measured" in captured.out
+    assert "Row count: Not measured" in captured.out
+    assert "Missing frontier entities: Not measured" in captured.out
+    assert "Mismatched final rows: Not measured" in captured.out
+    assert "Targeted validation: NOT_RUN" in captured.out
+    assert "Impact execution: NOT_RUN" in captured.out
+    assert "Impact execution: FAILED" not in captured.out
     assert "Wrote " in captured.out
     payload = json.loads((dbt_project / "target" / "frontier-run.json").read_text())
     assert payload["sqlComparison"]["fullRebuildRequired"] is True
     assert payload["sqlComparison"]["narrowFrontierSafe"] is False
+    assert payload["sqlComparison"]["targetedValidation"] == "NOT_RUN"
     modified = payload["sqlComparison"]["modified"][0]
     assert modified["name"] == "stg_orders"
     assert "SOURCE_CHANGED" in modified["changeKinds"]
     assert modified["impactStatus"] == "FULL_REBUILD_REQUIRED"
-    assert modified["impactExecution"] == "FAILED"
+    assert modified["impactExecution"] == "NOT_RUN"
+    assert payload["evidenceLevel"] == "none"
     assert payload["metrics"]["fullEntityCount"] == 150000
     assert payload["metrics"]["frontierEntityCount"] == 150000
     assert payload["metrics"]["percentRowsAvoided"] == 0
     assert payload["metrics"]["candidateFrontierCount"] == 150000
+    assert payload["metrics"]["changedSourceRowCount"] is None
+    assert payload["metrics"]["confirmedFrontierCount"] is None
+    assert payload["metrics"]["confirmedEntityCount"] is None
+    assert payload["metrics"]["missedEntityCount"] is None
+    assert payload["metrics"]["mismatchedFinalRows"] is None
+    assert payload["metrics"]["mismatchedRowCount"] is None
     names = {item["testName"]: item for item in payload["validationResults"]}
     assert names["assert_sql_change_allows_narrow_frontier"]["status"] == "failed"
     assert "assert_sql_frontier_covers_reference" not in names

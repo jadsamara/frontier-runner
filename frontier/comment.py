@@ -28,6 +28,12 @@ def _format_count(value: int) -> str:
     return f"{value:,}"
 
 
+def _format_measured(value: Any) -> str:
+    if value is None:
+        return "Not measured"
+    return _format_count(int(value))
+
+
 def _pluralize(noun: str, count: int) -> str:
     if count == 1:
         return noun
@@ -113,8 +119,7 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
     if sql_kinds or modified:
         operator = sql_kinds[0] if sql_kinds else "SQL change"
         lines.append(f"SQL operator: {operator}")
-        if changed_source is not None:
-            lines.append(f"Changed source rows: {_format_count(int(changed_source))}")
+        lines.append(f"Changed source rows: {_format_measured(changed_source)}")
         if candidate_count is not None:
             lines.append(
                 f"Candidate {_pluralize(entity_type, int(candidate_count))}: {_format_count(int(candidate_count))}"
@@ -122,15 +127,25 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
         lines.append(
             f"Event-derived candidates: {_format_count(int(event_candidates or 0))}"
         )
-        if confirmed_count is not None:
-            lines.append(
-                f"Confirmed changed {_pluralize(entity_type, int(confirmed_count))}: {_format_count(int(confirmed_count))}"
-            )
-        if before_count is not None and after_count is not None:
+        confirmed_label = _pluralize(
+            entity_type,
+            int(confirmed_count) if confirmed_count is not None else 2,
+        )
+        lines.append(f"Confirmed changed {confirmed_label}: {_format_measured(confirmed_count)}")
+        if full_rebuild:
+            lines.append("Row count: Not measured")
+        elif before_count is not None and after_count is not None:
             lines.append(
                 f"Row count: {_format_count(int(before_count))} → {_format_count(int(after_count))}"
             )
-        lines.append(f"Targeted repair: {'skipped' if recommended else ('safe' if targeted_safe else 'not safe')}")
+        lines.append(
+            f"Targeted repair: {'skipped' if recommended or full_rebuild else ('safe' if targeted_safe else 'not safe')}"
+        )
+        targeted_validation = comparison.get("targetedValidation")
+        if targeted_validation:
+            lines.append(f"Targeted validation: {targeted_validation}")
+        elif full_rebuild:
+            lines.append("Targeted validation: NOT_RUN")
         if full_rebuild:
             lines.append("Full backfill: required")
         elif recommended:
@@ -218,7 +233,7 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
             if payload.get("runMode") == "fixture":
                 executions = ["NOT_EVALUATED"]
             elif full_rebuild:
-                executions = ["FAILED"]
+                executions = ["NOT_RUN"]
             elif payload.get("runMode") == "live" and statuses:
                 executions = ["EXECUTED"]
         if executions and statuses:

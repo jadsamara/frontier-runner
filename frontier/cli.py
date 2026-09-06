@@ -377,12 +377,19 @@ def _sql_change_queries(
     return queries, required
 
 
+def _impact_attempted(result) -> bool:
+    if getattr(result, "sql_change_candidate_count", None) is not None:
+        return True
+    return any("failed" in str(reason).lower() for reason in getattr(result, "execution_reasons", ()))
+
+
 def _stamp_sql_comparison(args: argparse.Namespace, comparison: dict[str, Any] | None, result) -> dict[str, Any] | None:
     return stamp_impact_execution(
         comparison,
         run_mode=_run_mode(args),
         full_rebuild_required=bool(getattr(result, "full_rebuild_required", False)),
         sql_change_executed=getattr(result, "sql_change_candidate_count", None) is not None,
+        impact_attempted=_impact_attempted(result),
     )
 
 
@@ -411,6 +418,10 @@ def _apply_rebuild_to_comparison(
         )
     )
     return comparison
+
+
+def _format_measured(value: Any) -> str:
+    return "Not measured" if value is None else str(value)
 
 
 def _print_origin_counts(result) -> None:
@@ -463,6 +474,7 @@ def _emit_run(
         run_mode=_run_mode(args),
         full_rebuild_required=bool(getattr(result, "full_rebuild_required", False)),
         sql_change_executed=getattr(result, "sql_change_candidate_count", None) is not None,
+        impact_attempted=_impact_attempted(result),
     )
     sql_check = sql_change_narrow_frontier_result(sql_comparison)
     if sql_check is not None:
@@ -1211,9 +1223,9 @@ def cmd_prove(args: argparse.Namespace) -> int:
     extra_metrics = {
         "fullRowsRecomputed": assessed.full_rows_recomputed,
         "frontierRowsRecomputed": assessed.frontier_rows_recomputed,
-        "testDurationMs": assessed.test_duration_ms,
     }
     if not rebuild_recommended and not result.full_rebuild_required:
+        extra_metrics["testDurationMs"] = assessed.test_duration_ms
         extra_metrics.update(
             {
                 "missingFrontierEntities": assessed.missing_frontier_entities,
@@ -1234,14 +1246,36 @@ def cmd_prove(args: argparse.Namespace) -> int:
                     frontier_for_metrics,
                 ),
                 "candidateFrontierCount": sql_proof.candidate_frontier_count,
-                "confirmedFrontierCount": sql_proof.confirmed_frontier_count,
-                "sourcePopulationCount": sql_proof.changed_source_row_count,
-                "changedSourceRowCount": sql_proof.changed_source_row_count,
-                "beforeEntityCount": sql_proof.before_entity_count,
-                "afterEntityCount": sql_proof.after_entity_count,
                 "eventCandidateCount": result.event_candidate_count or 0,
             }
         )
+        if result.full_rebuild_required:
+            extra_metrics.update(
+                {
+                    "confirmedFrontierCount": None,
+                    "confirmedEntityCount": None,
+                    "changedSourceRowCount": None,
+                    "sourcePopulationCount": None,
+                    "missedEntityCount": None,
+                    "missingFrontierEntities": None,
+                    "extraFrontierEntities": None,
+                    "mismatchedFinalRows": None,
+                    "mismatchedRowCount": None,
+                    "beforeEntityCount": None,
+                    "afterEntityCount": None,
+                    "testDurationMs": None,
+                }
+            )
+        else:
+            extra_metrics.update(
+                {
+                    "confirmedFrontierCount": sql_proof.confirmed_frontier_count,
+                    "sourcePopulationCount": sql_proof.changed_source_row_count,
+                    "changedSourceRowCount": sql_proof.changed_source_row_count,
+                    "beforeEntityCount": sql_proof.before_entity_count,
+                    "afterEntityCount": sql_proof.after_entity_count,
+                }
+            )
     output = _emit_run(
         args,
         config=config,
@@ -1278,13 +1312,21 @@ def cmd_prove(args: argparse.Namespace) -> int:
             print(f"Impact compilation: {', '.join(compilations)}")
         if executions:
             print(f"Impact execution: {', '.join(executions)}")
-        print(f"Changed source rows: {sql_proof.changed_source_row_count}")
+        print(f"Changed source rows: {_format_measured(None if result.full_rebuild_required else sql_proof.changed_source_row_count)}")
         print(f"Candidate {_pluralize_entity(config.model.entity)}: {sql_proof.candidate_frontier_count}")
         print(f"Event-derived candidates: {result.event_candidate_count or 0}")
-        print(f"Confirmed changed summaries: {sql_proof.confirmed_frontier_count}")
-        print(f"Row count: {sql_proof.before_entity_count} → {sql_proof.after_entity_count}")
+        print(
+            f"Confirmed changed summaries: {_format_measured(None if result.full_rebuild_required else sql_proof.confirmed_frontier_count)}"
+        )
+        if result.full_rebuild_required:
+            print("Row count: Not measured")
+        else:
+            print(f"Row count: {sql_proof.before_entity_count} → {sql_proof.after_entity_count}")
         print(
             f"Targeted repair: {'skipped' if rebuild_recommended or result.full_rebuild_required else ('safe' if sql_proof.targeted_repair_safe else 'not safe')}"
+        )
+        print(
+            f"Targeted validation: {(sql_comparison or {}).get('targetedValidation') or ('NOT_RUN' if result.full_rebuild_required else 'PASSED')}"
         )
         if sql_proof.full_rebuild_required:
             print("Full backfill: required")
@@ -1292,10 +1334,19 @@ def cmd_prove(args: argparse.Namespace) -> int:
             print("Full backfill: recommended")
         else:
             print("Full backfill: not required")
-    print(f"Missing frontier entities: {assessed.missing_frontier_entities}")
-    print(f"Extra frontier entities: {assessed.extra_frontier_entities}")
-    print(f"Mismatched final rows: {assessed.mismatched_final_rows}")
-    print(f"Test duration: {assessed.test_duration_ms} ms")
+    print(
+        f"Missing frontier entities: {_format_measured(None if result.full_rebuild_required else assessed.missing_frontier_entities)}"
+    )
+    print(
+        f"Extra frontier entities: {_format_measured(None if result.full_rebuild_required else assessed.extra_frontier_entities)}"
+    )
+    print(
+        f"Mismatched final rows: {_format_measured(None if result.full_rebuild_required else assessed.mismatched_final_rows)}"
+    )
+    if result.full_rebuild_required:
+        print("Test duration: Not measured")
+    else:
+        print(f"Test duration: {assessed.test_duration_ms} ms")
     print("Validation:")
     for item in validations:
         print(f"  - {item.test_name}: {item.status} (differences={item.difference_count})")

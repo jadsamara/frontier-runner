@@ -410,5 +410,25 @@ def test_stamp_impact_execution_separates_compiler_from_warehouse() -> None:
         sql_change_executed=False,
     )
     assert rebuild is not None
-    assert rebuild["modified"][0]["impactExecution"] == "FAILED"
+    assert rebuild["modified"][0]["impactExecution"] == "NOT_RUN"
+    assert rebuild["targetedValidation"] == "NOT_RUN"
+
+    failed = stamp_impact_execution(
+        {
+            "modified": [
+                {
+                    "name": "int_customer_orders",
+                    "impactStatus": "FULL_REBUILD_REQUIRED",
+                    "changeKinds": ["FILTER_CHANGED"],
+                }
+            ]
+        },
+        run_mode="live",
+        full_rebuild_required=True,
+        sql_change_executed=False,
+        impact_attempted=True,
+    )
+    assert failed is not None
+    assert failed["modified"][0]["impactExecution"] == "FAILED"
+    assert "targetedValidation" not in failed
 

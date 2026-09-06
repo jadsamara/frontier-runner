@@ -253,6 +253,60 @@ def test_comment_reports_recommended_full_rebuild() -> None:
     assert "Full backfill: required" not in body
 
 
+def test_comment_renders_unmeasured_values_for_required_rebuild() -> None:
+    body = format_pr_comment(
+        {
+            **PASSED_PAYLOAD,
+            "status": "failed",
+            "evidenceLevel": "none",
+            "changeEvents": [],
+            "runMode": "live",
+            "candidateSetOrigin": "sql_change",
+            "metrics": {
+                "fullEntityCount": 150_000,
+                "frontierEntityCount": 150_000,
+                "percentRowsAvoided": 0,
+                "candidateFrontierCount": 150_000,
+                "confirmedFrontierCount": None,
+                "confirmedEntityCount": None,
+                "changedSourceRowCount": None,
+                "missedEntityCount": None,
+                "mismatchedFinalRows": None,
+                "eventCandidateCount": 0,
+            },
+            "sqlComparison": {
+                "base": {"fingerprint": "a" * 64, "modelCount": 4},
+                "pr": {"fingerprint": "b" * 64, "modelCount": 4},
+                "added": [],
+                "removed": [],
+                "modified": [
+                    {
+                        "name": "stg_orders",
+                        "changeKinds": ["SOURCE_CHANGED"],
+                        "impactStatus": "FULL_REBUILD_REQUIRED",
+                        "impactExecution": "NOT_RUN",
+                    }
+                ],
+                "narrowFrontierSafe": False,
+                "fullRebuildRequired": True,
+                "targetedValidation": "NOT_RUN",
+            },
+        },
+        run_url="https://frontier.example/runs/11111111-1111-4111-8111-111111111111",
+    )
+    assert "Changed source rows: Not measured" in body
+    assert "Confirmed changed customers: Not measured" in body
+    assert "Row count: Not measured" in body
+    assert "Targeted repair: skipped" in body
+    assert "Targeted validation: NOT_RUN" in body
+    assert "Impact execution: NOT_RUN" in body
+    assert "Impact execution: FAILED" not in body
+    assert "Full backfill: required" in body
+    assert "Candidate customers: 150,000" in body
+    assert "Evidence: none" in body
+    assert "Changed source rows: 0" not in body
+
+
 def test_comment_reports_origin_counts_without_entity_ids() -> None:
     body = format_pr_comment(
         {
