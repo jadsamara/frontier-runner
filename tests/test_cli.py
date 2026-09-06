@@ -23,6 +23,7 @@ def test_init_writes_into_project_dir(tmp_path: Path, capsys) -> None:
     assert str(config_path) in out
     assert "jaffle_shop" in config_path.read_text()
     assert "customer_summary" not in config_path.read_text()
+    assert "Next: frontier login --api-key" in out
 
 
 def test_init_and_inspect(dbt_project: Path, capsys) -> None:

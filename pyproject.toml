@@ -1,6 +1,6 @@
 [project]
 name = "frontier-runner"
-version = "0.1.1"
+version = "0.1.2"
 description = "Customer-side Frontier CLI for dbt + Snowflake + GitHub impact assessments."
 readme = "README.md"
 license = { file = "LICENSE" }

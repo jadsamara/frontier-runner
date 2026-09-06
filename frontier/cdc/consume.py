@@ -162,10 +162,16 @@ def consume_all(config: CdcConfig, *, store: CdcStore, project_name: str) -> lis
 def project_name_for(project_dir) -> str:
     from pathlib import Path
 
-    config_path = Path(project_dir) / "frontier.yml"
+    from frontier.local_config import load_local_config
+
+    root = Path(project_dir)
+    local = load_local_config(root)
+    if local and local.project:
+        return local.project
+    config_path = root / "frontier.yml"
     if config_path.is_file():
         try:
             return load_frontier_config(config_path).project
         except ConfigError:
             pass
-    return Path(project_dir).name
+    return root.name

@@ -118,7 +118,7 @@ def test_reference_customer_workflow_uses_prove_and_pinned_runner() -> None:
     assert "frontier record-failure" in text
     assert "rm -rf target" in text
     assert "frontier-artifact-sha" in text
-    assert "frontier-runner[snowflake]==0.1.1" in text
+    assert "frontier-runner[snowflake]==0.1.2" in text
     assert "pip install ./runner" not in text
     assert "FRONTIER_BLOCKING" in text
     assert "pull-requests: write" in text
@@ -170,6 +170,6 @@ def test_cdc_reference_workflow_is_manual_and_separated() -> None:
     assert "SNOWFLAKE_PASSWORD" not in upload_env
     assert "GITHUB_TOKEN" not in upload_env
     assert "github.token" not in text
-    assert "FRONTIER_RUNNER_REF" in text
+    assert "frontier-runner[snowflake]==0.1.2" in text
     assert "pip install ./runner" not in text
 

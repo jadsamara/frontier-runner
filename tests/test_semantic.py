@@ -161,7 +161,45 @@ def test_fetch_from_fake_saas(dbt_project: Path, fake_saas: str, monkeypatch, ca
     assert "version: 4" in out
     pin = json.loads((dbt_project / "target" / "frontier-manifest.json").read_text())
     assert pin["fingerprint"] == fingerprint_document(JAFFLE_DOCUMENT)
+    assert pin["version"] == 4
     assert _FakeSaas.seen_auth == "Bearer frn_test_key"
+
+
+def test_saas_fetch_without_root_frontier_yml(
+    dbt_project: Path,
+    fake_saas: str,
+    monkeypatch,
+    capsys,
+) -> None:
+    (dbt_project / "frontier.yml").unlink()
+    from frontier.local_config import LocalFrontierConfig, write_local_config
+
+    write_local_config(
+        dbt_project,
+        LocalFrontierConfig(project="jaffle_shop", api_url=fake_saas),
+        force=True,
+    )
+    monkeypatch.setenv("FRONTIER_API_URL", fake_saas)
+    monkeypatch.setenv("FRONTIER_API_KEY", "frn_test_key")
+    monkeypatch.delenv("FRONTIER_ALLOW_LOCAL_MANIFEST", raising=False)
+    assert main(["manifest", "fetch", "--project-dir", str(dbt_project)]) == 0
+    out = capsys.readouterr().out
+    assert "source: saas_active" in out
+    assert "version: 4" in out
+    pin = json.loads((dbt_project / "target" / "frontier-manifest.json").read_text())
+    assert pin["fingerprint"] == fingerprint_document(JAFFLE_DOCUMENT)
+    assert pin["version"] == 4
+    assert not (dbt_project / "frontier.yml").exists()
+
+
+def test_local_manifest_mode_requires_frontier_yml(
+    dbt_project: Path, monkeypatch, capsys
+) -> None:
+    (dbt_project / "frontier.yml").unlink()
+    monkeypatch.delenv("FRONTIER_API_KEY", raising=False)
+    monkeypatch.setenv("FRONTIER_ALLOW_LOCAL_MANIFEST", "1")
+    assert main(["inspect", "--allow-local-manifest", "--project-dir", str(dbt_project)]) == 1
+    assert "Missing Frontier config" in capsys.readouterr().err
 
 
 def test_inspect_uses_fetched_saas_manifest(

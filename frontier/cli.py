@@ -20,6 +20,7 @@ from frontier.config import (
     ConfigError,
     FrontierConfig,
     load_frontier_config,
+    saas_runtime_config,
     should_recommend_rebuild,
     sql_change_rebuild_recommended_pct,
     write_init_config,
@@ -66,11 +67,13 @@ from frontier.cdc.config import cdc_config_path, load_cdc_config, overlay_cdc_wi
 from frontier.cdc.consume import consume_all, project_name_for
 from frontier.semantic import (
     PinnedSemanticManifest,
+    allow_local_manifest,
     default_pin_path,
     fetch_active_manifest,
     pin_manifest,
     print_semantic_manifest,
     resolve_semantic_manifest,
+    validate_pinned_against_dbt,
     validate_pinned_document,
 )
 from frontier.cdc.prove import prove_batch
@@ -112,6 +115,8 @@ from frontier.onboard.commands import (
     cmd_update_check,
     maybe_version_notice,
 )
+from frontier.onboard.constants import DEFAULT_API_URL
+from frontier.local_config import load_local_config
 from frontier.validation import (
     ValidationResult,
     collect_validation_results,
@@ -158,13 +163,23 @@ def _config_path(args: argparse.Namespace, project_dir: Path) -> Path:
     return project_dir / "frontier.yml"
 
 
-def _api_url(args: argparse.Namespace, config, creds=None) -> str:
+def _api_url(args: argparse.Namespace, config=None, creds=None, local=None) -> str:
     return str(
         getattr(args, "api_url", None)
         or os.environ.get("FRONTIER_API_URL")
-        or (creds.api_url if creds and creds.api_url else None)
-        or config.api_url,
+        or (creds.api_url if creds and getattr(creds, "api_url", None) else None)
+        or (local.api_url if local and getattr(local, "api_url", None) else None)
+        or (getattr(config, "api_url", None) if config is not None else None)
+        or DEFAULT_API_URL
     ).rstrip("/")
+
+
+def _saas_project_name(project_dir: Path, creds=None, local=None) -> str:
+    if creds and getattr(creds, "project", None):
+        return str(creds.project).strip()
+    if local and local.project:
+        return local.project
+    return project_dir.name
 
 
 def _resolve_runtime_config(
@@ -173,16 +188,34 @@ def _resolve_runtime_config(
     *,
     dbt_manifest=None,
 ):
-    config = load_frontier_config(_config_path(args, project_dir))
+    local = load_local_config(project_dir)
     explicit = getattr(args, "manifest_file", None)
     creds = None if explicit else try_resolve_api_credential()
     api_key = creds.api_key if creds else None
+    use_local_yml = allow_local_manifest(args) and not api_key and not explicit
+    legacy_path = _config_path(args, project_dir)
+    legacy = None
+    if use_local_yml:
+        legacy = load_frontier_config(legacy_path)
+    elif legacy_path.is_file() and not api_key and not explicit:
+        # Explicit --config without SaaS credentials still loads the legacy mapping.
+        if getattr(args, "config", None):
+            legacy = load_frontier_config(legacy_path)
+    api_url = _api_url(args, legacy, creds, local)
+    if legacy is not None:
+        config = legacy
+    else:
+        config = saas_runtime_config(
+            project=_saas_project_name(project_dir, creds, local),
+            api_url=api_url,
+            environment=local.dbt_target if local else "dev",
+        )
     config, _pinned = resolve_semantic_manifest(
         args,
         project_dir=project_dir,
         config=config,
         dbt_manifest=dbt_manifest,
-        api_url=_api_url(args, config, creds),
+        api_url=api_url,
         api_key=api_key,
     )
     return config
@@ -275,8 +308,14 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     manifest = load_manifest(_target_dir(project_dir) / "manifest.json")
     config = _resolve_runtime_config(args, project_dir, dbt_manifest=manifest)
     if manifest.project_name != config.project:
-        raise ConfigError(
-            f"frontier.yml project '{config.project}' does not match manifest '{manifest.project_name}'",
+        if config.path is not None:
+            raise ConfigError(
+                f"frontier.yml project '{config.project}' does not match manifest '{manifest.project_name}'",
+            )
+        print(
+            f"Warning: dbt project '{manifest.project_name}' does not match "
+            f"Frontier project '{config.project}'.",
+            flush=True,
         )
     report = inspect_report(manifest, config.model.name)
     print(format_inspect_report(report))
@@ -1413,7 +1452,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
 
 def cmd_upload(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
-    config = load_frontier_config(_config_path(args, project_dir))
+    local = load_local_config(project_dir)
     run_file = Path(args.run_file) if args.run_file else _target_dir(project_dir) / RUN_FILE_NAME
     if not run_file.is_file():
         raise ConfigError(
@@ -1433,7 +1472,7 @@ def cmd_upload(args: argparse.Namespace) -> int:
         payload["externalRunId"] = args.run_id
     creds = resolve_api_credential()
     api_key, api_key_source = creds.api_key, creds.source
-    api_url = _api_url(args, config, creds)
+    api_url = _api_url(args, None, creds, local)
     print(
         f"Uploading {payload.get('externalRunId')} to {api_url} "
         f"as {redact_api_key(api_key)} ({api_key_source})",
@@ -1470,16 +1509,20 @@ def cmd_upload(args: argparse.Namespace) -> int:
 
 def cmd_manifest_fetch(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
-    config = load_frontier_config(_config_path(args, project_dir))
+    local = load_local_config(project_dir)
     creds = resolve_api_credential()
     api_key = creds.api_key
-    api_url = _api_url(args, config, creds)
+    api_url = _api_url(args, None, creds, local)
+    project = _saas_project_name(project_dir, creds, local)
     output = Path(args.output).expanduser().resolve() if args.output else default_pin_path(project_dir)
     started = time.perf_counter()
     log_step("manifest fetch started", prefix="manifest")
     try:
-        pinned = fetch_active_manifest(api_url=api_url, api_key=api_key, project=config.project)
+        pinned = fetch_active_manifest(api_url=api_url, api_key=api_key, project=project)
         validate_pinned_document(pinned)
+        dbt_path = _target_dir(project_dir) / "manifest.json"
+        if dbt_path.is_file():
+            validate_pinned_against_dbt(pinned, load_manifest(dbt_path))
         pin_manifest(output, pinned)
     except Exception as error:
         log_step(
@@ -1517,7 +1560,7 @@ def _add_manifest_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--allow-local-manifest",
         action="store_true",
-        help="Use frontier.yml semantic mapping when no SaaS manifest is configured",
+        help="Use frontier.yml semantic mapping when no SaaS credentials are configured",
     )
 
 
@@ -1529,7 +1572,7 @@ def _add_base_manifest(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_run_flags(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", help="Path to frontier.yml")
+    parser.add_argument("--config", help="Path to legacy frontier.yml (required only with --allow-local-manifest)")
     parser.add_argument("--profiles", help="dbt profiles.yml (default: ~/.dbt/profiles.yml)")
     parser.add_argument("--target", help="dbt target name")
     parser.add_argument("--events", help="Change-events CSV (default: seeds/change_events.csv)")
@@ -1561,8 +1604,11 @@ def _cdc_path(args: argparse.Namespace, project_dir: Path) -> Path:
 def cmd_cdc_inspect(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
     config = load_cdc_config(_cdc_path(args, project_dir))
-    frontier_path = _config_path(args, project_dir)
-    if frontier_path.is_file():
+    if (
+        _config_path(args, project_dir).is_file()
+        or getattr(args, "manifest_file", None)
+        or try_resolve_api_credential() is not None
+    ):
         dbt_path = _target_dir(project_dir) / "manifest.json"
         dbt_manifest = load_manifest(dbt_path) if dbt_path.is_file() else None
         frontier_config = _resolve_runtime_config(args, project_dir, dbt_manifest=dbt_manifest)
@@ -1806,6 +1852,11 @@ def build_parser() -> argparse.ArgumentParser:
     discover = sub.add_parser("discover", help="Infer a draft semantic manifest from dbt artifacts")
     _add_project_dir(discover)
     discover.add_argument("--yes", action="store_true", help="Select the first suggested model")
+    discover.add_argument(
+        "--force",
+        action="store_true",
+        help="Upload even when the local dbt project name differs from the authenticated Frontier project",
+    )
     discover.add_argument("--model", help="Target model name")
     discover.set_defaults(func=cmd_discover)
 
@@ -1851,7 +1902,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect = sub.add_parser("inspect", help="Read dbt artifacts and print model lineage")
     _add_project_dir(inspect)
-    inspect.add_argument("--config", help="Path to frontier.yml")
+    inspect.add_argument("--config", help="Path to legacy frontier.yml (required only with --allow-local-manifest)")
     _add_manifest_flags(inspect)
     _add_base_manifest(inspect)
     inspect.set_defaults(func=cmd_inspect)
@@ -1861,7 +1912,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compare compiled SQL between base-branch and PR manifests",
     )
     _add_project_dir(compare)
-    compare.add_argument("--config", help="Path to frontier.yml")
+    compare.add_argument("--config", help="Path to legacy frontier.yml (required only with --allow-local-manifest)")
     compare.add_argument(
         "--base-manifest",
         required=True,
@@ -1893,7 +1944,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write a failed assessment without reading dbt artifacts",
     )
     _add_project_dir(record_failure)
-    record_failure.add_argument("--config", help="Path to frontier.yml")
+    record_failure.add_argument("--config", help="Path to legacy frontier.yml (required only with --allow-local-manifest)")
     record_failure.add_argument("--output", help="Where to write frontier-run.json")
     record_failure.add_argument("--run-id", help="externalRunId for the resulting payload")
     record_failure.add_argument(
@@ -1918,8 +1969,11 @@ def build_parser() -> argparse.ArgumentParser:
     manifest_sub = manifest_cmd.add_subparsers(dest="manifest_command", required=True)
     manifest_fetch = manifest_sub.add_parser("fetch", help="Download the active semantic manifest")
     _add_project_dir(manifest_fetch)
-    manifest_fetch.add_argument("--config", help="Path to frontier.yml")
-    manifest_fetch.add_argument("--api-url", help="SaaS origin (default: FRONTIER_API_URL or frontier.yml)")
+    manifest_fetch.add_argument("--config", help="Unused; SaaS fetch reads .frontier/config.yml")
+    manifest_fetch.add_argument(
+        "--api-url",
+        help="SaaS origin (default: FRONTIER_API_URL, stored credentials, or .frontier/config.yml)",
+    )
     manifest_fetch.add_argument(
         "--output",
         help="Where to write the pinned manifest (default: target/frontier-manifest.json)",
@@ -1928,10 +1982,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     upload = sub.add_parser("upload", help="POST aggregate results to Frontier SaaS")
     _add_project_dir(upload)
-    upload.add_argument("--config", help="Path to frontier.yml")
+    upload.add_argument("--config", help="Unused; upload reads .frontier/config.yml for the API origin")
     upload.add_argument("--run-file", help="Path to frontier-run.json")
     upload.add_argument("--run-id", help="Override externalRunId")
-    upload.add_argument("--api-url", help="SaaS origin (default: FRONTIER_API_URL or frontier.yml)")
+    upload.add_argument(
+        "--api-url",
+        help="SaaS origin (default: FRONTIER_API_URL, stored credentials, or .frontier/config.yml)",
+    )
     upload.add_argument(
         "--blocking",
         action="store_true",
@@ -1949,7 +2006,7 @@ def build_parser() -> argparse.ArgumentParser:
     cdc_inspect = cdc_sub.add_parser("inspect", help="Print configured CDC streams without consuming them")
     _add_project_dir(cdc_inspect)
     cdc_inspect.add_argument("--cdc-config", help="Path to frontier-cdc.yml")
-    cdc_inspect.add_argument("--config", help="Path to frontier.yml")
+    cdc_inspect.add_argument("--config", help="Path to legacy frontier.yml (required only with --allow-local-manifest)")
     cdc_inspect.add_argument("--target", help="dbt target name")
     _add_manifest_flags(cdc_inspect)
     cdc_inspect.set_defaults(func=cmd_cdc_inspect)
@@ -1957,7 +2014,7 @@ def build_parser() -> argparse.ArgumentParser:
     cdc_status = cdc_sub.add_parser("status", help="Report whether configured streams have pending data")
     _add_project_dir(cdc_status)
     cdc_status.add_argument("--cdc-config", help="Path to frontier-cdc.yml")
-    cdc_status.add_argument("--config", help="Path to frontier.yml")
+    cdc_status.add_argument("--config", help="Path to legacy frontier.yml (required only with --allow-local-manifest)")
     cdc_status.add_argument("--profiles", help="dbt profiles.yml (default: ~/.dbt/profiles.yml)")
     cdc_status.add_argument("--target", help="dbt target name")
     cdc_status.set_defaults(func=cmd_cdc_status)
@@ -1965,7 +2022,7 @@ def build_parser() -> argparse.ArgumentParser:
     cdc_consume = cdc_sub.add_parser("consume", help="Durably capture pending stream records")
     _add_project_dir(cdc_consume)
     cdc_consume.add_argument("--cdc-config", help="Path to frontier-cdc.yml")
-    cdc_consume.add_argument("--config", help="Path to frontier.yml")
+    cdc_consume.add_argument("--config", help="Path to legacy frontier.yml (required only with --allow-local-manifest)")
     cdc_consume.add_argument("--profiles", help="dbt profiles.yml (default: ~/.dbt/profiles.yml)")
     cdc_consume.add_argument("--target", help="dbt target name")
     cdc_consume.set_defaults(func=cmd_cdc_consume)
@@ -1976,7 +2033,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_project_dir(cdc_prove)
     cdc_prove.add_argument("--cdc-config", help="Path to frontier-cdc.yml")
-    cdc_prove.add_argument("--config", help="Path to frontier.yml")
+    cdc_prove.add_argument("--config", help="Path to legacy frontier.yml (required only with --allow-local-manifest)")
     cdc_prove.add_argument("--profiles", help="dbt profiles.yml (default: ~/.dbt/profiles.yml)")
     cdc_prove.add_argument("--target", help="dbt target name")
     cdc_prove.add_argument("--batch-id", help="Captured batch to prove (default: oldest CAPTURED or FAILED)")
@@ -1994,7 +2051,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_project_dir(cdc_upload)
     cdc_upload.add_argument("--cdc-config", help="Path to frontier-cdc.yml")
-    cdc_upload.add_argument("--config", help="Path to frontier.yml")
+    cdc_upload.add_argument("--config", help="Path to legacy frontier.yml (required only with --allow-local-manifest)")
     cdc_upload.add_argument("--profiles", help="dbt profiles.yml (default: ~/.dbt/profiles.yml)")
     cdc_upload.add_argument("--target", help="dbt target name")
     cdc_upload.add_argument("--batch-id", help="Completed batch to upload (default: newest COMPLETED not yet uploaded)")

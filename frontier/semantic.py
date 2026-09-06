@@ -225,7 +225,7 @@ def join_route_to_route(source_name: str, source: SemanticSource, entity_key: st
 
 
 def apply_pinned_manifest(config: FrontierConfig, pinned: PinnedSemanticManifest) -> FrontierConfig:
-    if pinned.project and pinned.project != config.project:
+    if pinned.project and config.project and pinned.project != config.project:
         raise ManifestError(
             "MANIFEST_LOCAL_REMOTE_CONFLICT",
             "frontier.yml project does not match the semantic manifest project",
@@ -244,6 +244,17 @@ def apply_pinned_manifest(config: FrontierConfig, pinned: PinnedSemanticManifest
         )
         for item in pinned.sources
     }
+    proof = derive_proof_config(model)
+    project = pinned.project or config.project
+    if not config.relations:
+        return replace(
+            config,
+            project=project,
+            model=model,
+            relations=relations,
+            proof=proof,
+            pinned=pinned,
+        )
     local_names = set(config.relations)
     remote_names = set(relations)
     if local_names and local_names != remote_names:
@@ -284,7 +295,7 @@ def apply_pinned_manifest(config: FrontierConfig, pinned: PinnedSemanticManifest
                 f"Local route for '{name}' does not match the semantic manifest",
             )
     proof = derive_proof_config(model)
-    return replace(config, model=model, relations=relations, proof=proof, pinned=pinned)
+    return replace(config, project=project, model=model, relations=relations, proof=proof, pinned=pinned)
 
 
 def validate_pinned_document(pinned: PinnedSemanticManifest) -> None:

@@ -10,6 +10,7 @@ from frontier.config import redact
 from frontier.credentials import try_resolve_api_credential
 from frontier.errors import InstallError
 from frontier.local_config import load_local_config
+from frontier.semantic import default_pin_path
 from frontier.onboard.constants import DEFAULT_API_URL, SUPPORTED_PYTHON
 from frontier.onboard.detect import ProjectDetection, detect_project, schema_looks_like_production
 from frontier.onboard.saas import (
@@ -32,6 +33,7 @@ class DoctorCheck:
     required: bool
     detail: str = ""
     next_action: str | None = None
+    skipped: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -115,6 +117,19 @@ def run_doctor(
             required=True,
             detail=detection.dbt_project_name or "dbt_project.yml missing",
             next_action=None if dbt_ok else "Run `frontier init` from the dbt project root.",
+        )
+    )
+    initialized = local is not None or (project_dir / "frontier.yml").is_file()
+    checks.append(
+        DoctorCheck(
+            id="local_config",
+            label="Frontier local config",
+            ok=initialized,
+            required=True,
+            detail=str(local.path) if local and local.path else (
+                "frontier.yml" if (project_dir / "frontier.yml").is_file() else "missing"
+            ),
+            next_action=None if initialized else "Run `frontier init`.",
         )
     )
     manifest_ok = detection.manifest_path is not None
@@ -201,7 +216,20 @@ def run_doctor(
             ),
             next_action=None
             if active_ok
-            else "Review and activate the draft in Frontier.",
+            else "Run `frontier discover`, then review and activate the draft in Frontier.",
+        )
+    )
+    pin_path = default_pin_path(project_dir)
+    pinned_ok = pin_path.is_file()
+    checks.append(
+        DoctorCheck(
+            id="pinned_manifest",
+            label="Pinned semantic manifest",
+            ok=pinned_ok,
+            required=active_ok,
+            skipped=not active_ok,
+            detail=str(pin_path) if pinned_ok else "target/frontier-manifest.json missing",
+            next_action=None if pinned_ok or not active_ok else "Run `frontier manifest fetch`.",
         )
     )
     project_name = detection.dbt_project_name or (local.project if local else "")
@@ -212,9 +240,13 @@ def run_doctor(
         DoctorCheck(
             id="manifest_project",
             label="Active manifest matches dbt project",
-            ok=bool(not active or matches),
-            required=True,
-            next_action=None if matches else "Activate a manifest for this dbt project.",
+            ok=bool(active_ok and matches),
+            required=active_ok,
+            skipped=not active_ok,
+            detail="no active manifest" if not active_ok else (
+                "" if matches else f"{active.get('project')} != {project_name}"
+            ),
+            next_action=None if not active_ok or matches else "Activate a manifest for this dbt project.",
         )
     )
 
@@ -318,22 +350,52 @@ def run_doctor(
     return checks
 
 
+NEXT_ACTION_PRIORITY = (
+    "auth",
+    "local_config",
+    "active_manifest",
+    "pinned_manifest",
+    "git",
+    "github_workflow",
+)
+
+
+def doctor_next_action(checks: list[DoctorCheck]) -> str | None:
+    by_id = {check.id: check for check in checks}
+    for check_id in NEXT_ACTION_PRIORITY:
+        check = by_id.get(check_id)
+        if (
+            check
+            and not check.skipped
+            and not check.ok
+            and check.next_action
+        ):
+            return check.next_action
+    for check in checks:
+        if not check.skipped and not check.ok and check.next_action:
+            return check.next_action
+    return None
+
+
 def format_doctor(checks: list[DoctorCheck]) -> str:
     lines: list[str] = []
     for check in checks:
-        mark = "✓" if check.ok else "✗"
+        if check.skipped:
+            mark = "–"
+        elif check.ok:
+            mark = "✓"
+        else:
+            mark = "✗"
         extra = f" ({check.detail})" if check.detail else ""
         lines.append(f"{mark} {check.label}{extra}")
-    failed = [check for check in checks if not check.ok]
-    if failed:
-        action = next((check.next_action for check in failed if check.next_action), None)
-        if action:
-            lines.extend(["", "Next action:", action])
+    action = doctor_next_action(checks)
+    if action:
+        lines.extend(["", "Next action:", action])
     return "\n".join(lines)
 
 
 def doctor_failed(checks: list[DoctorCheck]) -> bool:
-    return any(not check.ok and check.required for check in checks)
+    return any(not check.ok and check.required and not check.skipped for check in checks)
 
 
 def doctor_json(checks: list[DoctorCheck]) -> dict[str, Any]:

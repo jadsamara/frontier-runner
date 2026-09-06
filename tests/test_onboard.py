@@ -29,6 +29,7 @@ from frontier.onboard.github import (
     validate_workflow_yaml,
 )
 from frontier.onboard.hashkey import HASH_KEY_BYTES, generate_entity_hash_key
+from frontier.onboard.saas import rewrite_user_facing_url
 from frontier.onboard.versions import version_at_least
 from frontier import __version__
 from tests.conftest import FIXTURES
@@ -65,6 +66,28 @@ def test_init_detects_dbt_project_and_preserves_existing_config(tmp_path: Path, 
     assert "# keep" in config.read_text()
     out = capsys.readouterr().out
     assert "Kept existing" in out
+
+
+def test_init_next_action_depends_on_auth(tmp_path: Path, capsys) -> None:
+    project = tmp_path / "jaffle_shop"
+    project.mkdir()
+    (project / "dbt_project.yml").write_text("name: jaffle_shop\nprofile: jaffle_shop\n")
+    assert main(["init", "--yes", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert "Wrote " in out
+    assert (project / ".frontier" / "config.yml").is_file()
+    assert "Next: frontier login --api-key" in out
+    save_credentials(
+        StoredCredentials(
+            api_url="https://frontier.example",
+            api_key="frn_abcdefghijklmnopqrstuvwxyz",
+            project="jaffle_shop",
+        )
+    )
+    assert main(["init", "--yes", "--force", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert "Next: frontier discover" in out
+    assert "Next: frontier login --api-key" not in out
 
 
 def test_init_refuses_missing_dbt_project(tmp_path: Path) -> None:
@@ -293,6 +316,97 @@ def test_discover_uploads_draft(tmp_path: Path, monkeypatch, capsys, dbt_project
     assert "activate" in out.lower()
 
 
+def test_discover_rewrites_bind_host_review_url(
+    monkeypatch, capsys, dbt_project: Path
+) -> None:
+    public = "https://frontier-web-x3l3etwczq-pd.a.run.app"
+
+    def fake_upload(creds, document):
+        del document
+        from frontier.onboard.saas import DraftManifestResult
+
+        assert creds.project == "jaffle_shop"
+        return DraftManifestResult(1, "draft", "https://0.0.0.0:8080/manifests?version=1")
+
+    monkeypatch.setattr("frontier.onboard.commands.upload_draft_manifest", fake_upload)
+    monkeypatch.setattr(
+        "frontier.onboard.commands._require_credentials",
+        lambda: StoredCredentials(public, "frn_testkeyxxxx", "jaffle_shop"),
+    )
+    from frontier.local_config import LocalFrontierConfig, write_local_config
+
+    write_local_config(
+        dbt_project,
+        LocalFrontierConfig(project="jaffle_shop", api_url=public),
+        force=True,
+    )
+    assert main(["discover", "--yes", "--project-dir", str(dbt_project)]) == 0
+    out = capsys.readouterr().out
+    assert f"Review: {public}/manifests?version=1" in out
+    assert "0.0.0.0" not in out
+
+
+def test_discover_refuses_project_mismatch_without_force(
+    monkeypatch, capsys, dbt_project: Path
+) -> None:
+    uploaded: dict = {}
+
+    def fake_upload(creds, document):
+        uploaded["project"] = creds.project
+        del document
+        from frontier.onboard.saas import DraftManifestResult
+
+        return DraftManifestResult(1, "draft", "https://example.test/manifests?version=1")
+
+    monkeypatch.setattr("frontier.onboard.commands.upload_draft_manifest", fake_upload)
+    monkeypatch.setattr(
+        "frontier.onboard.commands._require_credentials",
+        lambda: StoredCredentials("https://example.test", "frn_testkeyxxxx", "frontier_test"),
+    )
+    from frontier.local_config import LocalFrontierConfig, write_local_config
+
+    write_local_config(
+        dbt_project,
+        LocalFrontierConfig(project="jaffle_shop", api_url="https://example.test"),
+        force=True,
+    )
+    assert main(["discover", "--yes", "--project-dir", str(dbt_project)]) == 1
+    err = capsys.readouterr().err
+    assert "PROJECT_MISMATCH" in err
+    assert uploaded == {}
+
+
+def test_discover_force_uploads_to_authenticated_project(
+    monkeypatch, capsys, dbt_project: Path
+) -> None:
+    uploaded: dict = {}
+
+    def fake_upload(creds, document):
+        uploaded["project"] = creds.project
+        del document
+        from frontier.onboard.saas import DraftManifestResult
+
+        return DraftManifestResult(1, "draft", "https://example.test/manifests?version=1")
+
+    monkeypatch.setattr("frontier.onboard.commands.upload_draft_manifest", fake_upload)
+    monkeypatch.setattr(
+        "frontier.onboard.commands._require_credentials",
+        lambda: StoredCredentials("https://example.test", "frn_testkeyxxxx", "frontier_test"),
+    )
+    from frontier.local_config import LocalFrontierConfig, write_local_config
+
+    write_local_config(
+        dbt_project,
+        LocalFrontierConfig(project="jaffle_shop", api_url="https://example.test"),
+        force=True,
+    )
+    assert main(["discover", "--yes", "--force", "--project-dir", str(dbt_project)]) == 0
+    assert uploaded["project"] == "frontier_test"
+    out = capsys.readouterr().out
+    assert "does not match" in out
+    assert "Uploading to authenticated project 'frontier_test'" in out
+
+
 def test_doctor_json_is_redacted_and_nonzero_on_failure(
     tmp_path: Path, capsys, monkeypatch
 ) -> None:
@@ -304,6 +418,27 @@ def test_doctor_json_is_redacted_and_nonzero_on_failure(
     assert "password" not in dumped.lower() or "********" in dumped
     assert payload["ok"] is False
     assert any(check["id"] == "auth" and check["ok"] is False for check in payload["checks"])
+
+
+def test_doctor_next_action_prefers_login_over_git(tmp_path: Path, capsys, monkeypatch) -> None:
+    monkeypatch.setattr("frontier.onboard.doctor.saas_reachable", lambda url: True)
+    project = tmp_path / "fresh"
+    project.mkdir()
+    (project / "dbt_project.yml").write_text("name: jaffle_shop\nprofile: jaffle_shop\n")
+    assert main(["doctor", "--skip-warehouse", str(project)]) == 1
+    out = capsys.readouterr().out
+    assert "Next action:" in out
+    assert "frontier login --api-key" in out.split("Next action:", 1)[1]
+    match_line = next(
+        line for line in out.splitlines() if "Active manifest matches dbt project" in line
+    )
+    assert match_line.startswith("–")
+    assert not match_line.startswith("✓")
+    assert main(["doctor", "--json", "--skip-warehouse", str(project)]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    manifest_project = next(check for check in payload["checks"] if check["id"] == "manifest_project")
+    assert manifest_project["skipped"] is True
+    assert manifest_project["ok"] is False
 
 
 def test_workflow_generation_validates_yaml_and_separates_secrets() -> None:
@@ -360,7 +495,7 @@ def test_runner_version_compatibility() -> None:
     assert version_at_least("0.1.0", "0.1.0")
     assert version_at_least("0.2.0", "0.1.0")
     assert not version_at_least("0.0.9", "0.1.0")
-    assert __version__ == "0.1.1"
+    assert __version__ == "0.1.2"
 
 
 def test_install_error_includes_stable_code() -> None:
@@ -376,6 +511,19 @@ def test_install_error_includes_stable_code() -> None:
     assert "Likely cause:" in text
     assert "Next:" in text
     assert "Docs:" in text
+
+
+def test_rewrite_user_facing_url_replaces_bind_hosts() -> None:
+    public = "https://frontier-web-x3l3etwczq-pd.a.run.app"
+    assert (
+        rewrite_user_facing_url("https://0.0.0.0:8080/manifests?version=1", public)
+        == f"{public}/manifests?version=1"
+    )
+    assert rewrite_user_facing_url(f"{public}/manifests?version=2", public) == f"{public}/manifests?version=2"
+    assert (
+        rewrite_user_facing_url("http://127.0.0.1:3000/manifests?version=1", public)
+        == f"{public}/manifests?version=1"
+    )
 
 
 def test_demo_change_does_not_modify_sql(dbt_project: Path) -> None:
@@ -435,7 +583,7 @@ def test_wheel_installs_and_reports_version(tmp_path: Path) -> None:
         env=env,
     )
     version = subprocess.check_output([str(frontier), "--version"], text=True, env=env)
-    assert "0.1.1" in version
+    assert "0.1.2" in version
     names = subprocess.check_output(["python3", "-m", "zipfile", "-l", str(wheels[0])], text=True)
     assert "tests/" not in names
     assert "fixtures/" not in names

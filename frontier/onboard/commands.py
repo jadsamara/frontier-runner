@@ -46,6 +46,7 @@ from frontier.onboard.permissions import snowflake_permission_sql
 from frontier.onboard.prompt import prompt_choice, prompt_text, prompt_yes_no
 from frontier.onboard.saas import (
     fetch_runner_versions,
+    rewrite_user_facing_url,
     upload_draft_manifest,
     whoami,
 )
@@ -192,7 +193,10 @@ def cmd_init(args: Any) -> int:
         print(f"GitHub: {detection.github_origin}")
     if detection.adapter_type:
         print(f"Adapter: {detection.adapter_type}")
-    print("Next: frontier login --api-key")
+    if try_resolve_api_credential():
+        print("Next: frontier discover")
+    else:
+        print("Next: frontier login --api-key")
     return 0
 
 
@@ -296,12 +300,35 @@ def cmd_discover(args: Any) -> int:
     if local and local.project and local.project != creds.project:
         print(
             f"Warning: local project '{local.project}' does not match "
-            f"authenticated project '{creds.project}'. Uploading to '{creds.project}'.",
+            f"authenticated project '{creds.project}'.",
         )
+        confirmed = bool(getattr(args, "force", False))
+        if not confirmed:
+            confirmed = prompt_yes_no(
+                f"Upload this draft to authenticated project '{creds.project}'?",
+                default=False,
+                assume_yes=False,
+            )
+        if not confirmed:
+            raise InstallError(
+                "PROJECT_MISMATCH",
+                "Refusing to upload a semantic manifest to a different Frontier project.",
+                cause=(
+                    f"`.frontier/config.yml` project is '{local.project}', "
+                    f"but the API key is bound to '{creds.project}'."
+                ),
+                next_action=(
+                    "Use the API key for this project, align the name in "
+                    "`.frontier/config.yml`, or pass `--force` after reviewing the mismatch."
+                ),
+                docs_path="/docs/semantic-manifest",
+            )
+        print(f"Uploading to authenticated project '{creds.project}'.")
     result = upload_draft_manifest(creds, selected.to_semantic_document())
+    review_origin = (local.api_url if local else None) or creds.api_url
     print(f"Draft manifest created: version {result.version}")
     print("This draft is not active. Review and activate it in Frontier before CI.")
-    print(f"Review: {result.review_url}")
+    print(f"Review: {rewrite_user_facing_url(result.review_url, review_origin)}")
     return 0
 
 

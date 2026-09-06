@@ -5,7 +5,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 
 from frontier.credentials import StoredCredentials, key_prefix
 from frontier.errors import InstallError
@@ -31,6 +31,30 @@ class DraftManifestResult:
     version: int
     status: str
     review_url: str
+
+
+BIND_HOSTS = {"0.0.0.0", "::", "[::]"}
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def public_origin(configured: str) -> str:
+    return (configured or DEFAULT_API_URL).rstrip("/")
+
+
+def rewrite_user_facing_url(url: str, configured_origin: str) -> str:
+    """Replace Cloud Run bind hosts with the configured public SaaS origin."""
+    configured = public_origin(configured_origin)
+    if not url:
+        return configured
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    cfg = urlparse(configured)
+    cfg_host = (cfg.hostname or "").lower()
+    if host in BIND_HOSTS or (host in LOOPBACK_HOSTS and cfg_host not in LOOPBACK_HOSTS):
+        return urlunparse(
+            (cfg.scheme, cfg.netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+        )
+    return url
 
 
 def _request(
@@ -131,7 +155,7 @@ def fetch_runner_versions(api_url: str) -> RunnerVersions:
         )
     return RunnerVersions(
         minimum_supported=str(body.get("minimumSupported") or "0.1.1"),
-        latest_stable=str(body.get("latestStable") or "0.1.1"),
+        latest_stable=str(body.get("latestStable") or "0.1.2"),
     )
 
 
@@ -187,11 +211,12 @@ def upload_draft_manifest(
             docs_path="/docs/semantic-manifest",
         )
     version = int(body.get("version") or 1)
+    origin = public_origin(creds.api_url)
     review = str(body.get("reviewUrl") or f"{origin}/manifests?version={version}")
     return DraftManifestResult(
         version=version,
         status=str(body.get("status") or "draft"),
-        review_url=review,
+        review_url=rewrite_user_facing_url(review, origin),
     )
 
 

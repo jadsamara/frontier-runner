@@ -121,6 +121,24 @@ def _parse_route(name: str, raw: Any) -> Route:
     )
 
 
+def saas_runtime_config(
+    *,
+    project: str,
+    api_url: str,
+    environment: str = "dev",
+) -> FrontierConfig:
+    """Connection stub used when the mapping comes from a SaaS/pinned manifest."""
+    name = (project or "").strip() or "unknown"
+    model = ModelConfig(name=name, entity=name, key=name, grain=name)
+    return FrontierConfig(
+        project=name,
+        environment=environment,
+        model=model,
+        relations={},
+        api_url=api_url.rstrip("/") or "http://127.0.0.1:3000",
+    )
+
+
 def load_frontier_config(path: Path) -> FrontierConfig:
     if not path.is_file():
         raise ConfigError(f"Missing Frontier config: {path}")
