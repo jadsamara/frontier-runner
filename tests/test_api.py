@@ -6,8 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from frontier.api import build_ingest_payload, upload_run, api_key_from_env
+from frontier.api import build_ingest_payload, upload_run
 from frontier.config import ConfigError, load_frontier_config
+from frontier.credentials import resolve_api_credential
 from frontier.dbt_artifacts import load_manifest
 from frontier.frontier import (
     frontier_result_to_dict,
@@ -313,22 +314,49 @@ def test_upload_honors_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_api_key_prefers_frontier_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FRONTIER_API_KEY", "your-milestone-placeholder-key")
     monkeypatch.setenv("FRONTIER_DEMO_API_KEY", "frn_demo_jaffle_shop_local_only")
-    key, source = api_key_from_env()
-    assert key == "your-milestone-placeholder-key"
-    assert source == "FRONTIER_API_KEY"
+    creds = resolve_api_credential()
+    assert creds.api_key == "your-milestone-placeholder-key"
+    assert creds.source == "FRONTIER_API_KEY"
 
 
 def test_api_key_falls_back_to_demo_when_api_key_blank(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FRONTIER_API_KEY", "   ")
     monkeypatch.setenv("FRONTIER_DEMO_API_KEY", "frn_demo_jaffle_shop_local_only")
-    key, source = api_key_from_env()
-    assert key == "frn_demo_jaffle_shop_local_only"
-    assert source == "FRONTIER_DEMO_API_KEY"
+    creds = resolve_api_credential()
+    assert creds.api_key == "frn_demo_jaffle_shop_local_only"
+    assert creds.source == "FRONTIER_DEMO_API_KEY"
 
 
 def test_api_key_missing_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FRONTIER_API_KEY", raising=False)
     monkeypatch.delenv("FRONTIER_DEMO_API_KEY", raising=False)
-    with pytest.raises(ConfigError, match="FRONTIER_API_KEY"):
-        api_key_from_env()
+    with pytest.raises(ConfigError, match="AUTH_REQUIRED"):
+        resolve_api_credential()
+
+
+def test_demo_key_ignored_outside_local_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.delenv("FRONTIER_ALLOW_LOCAL_MANIFEST", raising=False)
+    monkeypatch.delenv("FRONTIER_API_KEY", raising=False)
+    monkeypatch.setenv("FRONTIER_DEMO_API_KEY", "frn_demo_jaffle_shop_local_only")
+    with pytest.raises(ConfigError, match="AUTH_REQUIRED"):
+        resolve_api_credential()
+
+
+def test_stored_keyring_credential_is_used_without_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from frontier.credentials import StoredCredentials, save_credentials
+
+    monkeypatch.delenv("FRONTIER_API_KEY", raising=False)
+    monkeypatch.delenv("FRONTIER_DEMO_API_KEY", raising=False)
+    save_credentials(
+        StoredCredentials(
+            api_url="https://frontier.example",
+            api_key="frn_stored_keyring_value",
+            project="jaffle_shop",
+            organization="zetra",
+        )
+    )
+    creds = resolve_api_credential()
+    assert creds.api_key == "frn_stored_keyring_value"
+    assert creds.source == "keyring"
 

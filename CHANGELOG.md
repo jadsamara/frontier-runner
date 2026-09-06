@@ -14,4 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `setup hash-key`, `demo change`, `update-check`, `logout`, and `auth status`.
 - Active SaaS semantic-manifest fetch, SQL-change compare/prove, and aggregate upload.
 
+### Fixed
+
+- SaaS commands resolve stored keychain credentials through one shared
+  resolver instead of requiring `FRONTIER_API_KEY` in the environment.
+
 [0.1.0]: https://github.com/jadsamara/frontier-runner/releases/tag/v0.1.0

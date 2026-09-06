@@ -16,8 +16,9 @@ from frontier.credentials import (
     default_fallback_path,
     delete_credentials,
     key_prefix,
-    load_credentials,
+    resolve_api_credential,
     save_credentials,
+    try_resolve_api_credential,
 )
 from frontier.dbt_artifacts import load_manifest
 from frontier.errors import InstallError
@@ -123,7 +124,7 @@ def cmd_logout(_args: Any) -> int:
 
 
 def cmd_auth_status(_args: Any) -> int:
-    creds = load_credentials()
+    creds = try_resolve_api_credential()
     if not creds:
         print("Not authenticated")
         print("Next: frontier login --api-key")
@@ -255,15 +256,7 @@ def _select_suggestion(
 
 
 def _require_credentials() -> StoredCredentials:
-    creds = load_credentials()
-    if not creds:
-        raise InstallError(
-            "AUTH_REQUIRED",
-            "You are not authenticated.",
-            cause="No project API key is stored in the keychain or credentials file.",
-            next_action="Run `frontier login --api-key`.",
-            docs_path="/docs/quick-start",
-        )
+    creds = resolve_api_credential()
     identity = whoami(creds.api_url, creds.api_key)
     return StoredCredentials(
         api_url=creds.api_url,
@@ -380,7 +373,7 @@ def cmd_setup_github(args: Any) -> int:
             docs_path="/docs/github",
         )
     local = load_local_config(project_dir)
-    creds = load_credentials()
+    creds = try_resolve_api_credential()
     assume = _assume_yes(args)
     blocking = bool(getattr(args, "blocking", False))
     path = workflow_path(project_dir, detection.git_root)
@@ -521,7 +514,7 @@ def cmd_update_check(args: Any) -> int:
         local = load_local_config(project_dir)
     except Exception:
         local = None
-    creds = load_credentials()
+    creds = try_resolve_api_credential()
     api_url = (getattr(args, "api_url", None) or (local.api_url if local else None) or (creds.api_url if creds else DEFAULT_API_URL))
     versions = fetch_runner_versions(str(api_url))
     current = current_runner_version()

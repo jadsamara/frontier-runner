@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 import urllib.error
 import urllib.request
@@ -13,15 +12,6 @@ from frontier.config import ConfigError, is_secret_key
 DEFAULT_API_URL = "http://127.0.0.1:3000"
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 DEFAULT_UPLOAD_ATTEMPTS = 4
-
-
-def api_key_from_env() -> tuple[str, str]:
-    """Return (key, env_var_name). FRONTIER_API_KEY wins over FRONTIER_DEMO_API_KEY."""
-    for name in ("FRONTIER_API_KEY", "FRONTIER_DEMO_API_KEY"):
-        value = os.environ.get(name)
-        if value and value.strip():
-            return value, name
-    raise ConfigError("Set FRONTIER_API_KEY or FRONTIER_DEMO_API_KEY to upload")
 
 
 def redact_api_key(key: str) -> str:

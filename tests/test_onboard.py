@@ -4,7 +4,10 @@ import json
 import os
 import stat
 import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +17,7 @@ from frontier.credentials import (
     StoredCredentials,
     delete_credentials,
     load_credentials,
+    load_stored_credentials,
     save_credentials,
 )
 from frontier.dbt_artifacts import load_manifest
@@ -124,6 +128,129 @@ def test_login_validates_and_redacts_key(tmp_path: Path, monkeypatch, capsys) ->
     assert "abcdefghijklmnopqrstuvwxyz" not in status_out
     assert main(["logout"]) == 0
     assert main(["auth", "status"]) == 1
+
+
+def test_isolated_keyring_never_loads_os_keyring_module(monkeypatch) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr("frontier.credentials._load_keyring", lambda: calls.append(1) or None)
+    creds = StoredCredentials(
+        api_url="https://frontier.example",
+        api_key="frn_isolated_keyring_value",
+        project="jaffle_shop",
+        organization="zetra",
+    )
+    assert save_credentials(creds) == "keyring"
+    loaded = load_stored_credentials()
+    assert loaded is not None
+    assert loaded.api_key == creds.api_key
+    delete_credentials()
+    assert load_stored_credentials() is None
+    assert calls == []
+
+
+def test_manifest_fetch_requires_login(dbt_project: Path, capsys) -> None:
+    assert main(["manifest", "fetch", "--project-dir", str(dbt_project)]) == 1
+    err = capsys.readouterr().err
+    assert "AUTH_REQUIRED: Run `frontier login --api-key`." in err
+    assert "FRONTIER_DEMO_API_KEY" not in err
+    assert "to upload" not in err
+
+
+def test_manifest_fetch_uses_stored_credentials_across_processes(dbt_project: Path) -> None:
+    from tests.test_semantic import _active_payload
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+        def do_GET(self) -> None:  # noqa: N802
+            path = self.path.split("?", 1)[0]
+            if path.endswith("/api/v1/auth/whoami"):
+                payload = {
+                    "organization": "zetra",
+                    "project": "jaffle_shop",
+                    "apiKeyPrefix": "frn_subproc12…",
+                }
+            elif path.endswith("/manifests/active"):
+                payload = _active_payload()
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    runner_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(runner_root) + os.pathsep + env.get("PYTHONPATH", "")
+    env.pop("FRONTIER_API_KEY", None)
+    env.pop("FRONTIER_DEMO_API_KEY", None)
+    env.pop("FRONTIER_API_URL", None)
+    host, port = server.server_address
+    origin = f"http://{host}:{port}"
+    login_code = (
+        "from types import SimpleNamespace\n"
+        "from frontier.onboard.commands import cmd_login\n"
+        "raise SystemExit(cmd_login(SimpleNamespace("
+        f"api_key=True, api_url={origin!r}, "
+        '_getpass=lambda prompt: "frn_subprocess_stored_key")))\n'
+    )
+    try:
+        login = subprocess.run(
+            [sys.executable, "-c", login_code],
+            cwd=str(runner_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert login.returncode == 0, login.stderr
+        assert "Authenticated" in login.stdout
+        assert "FRONTIER_API_KEY" not in env
+
+        fetch = subprocess.run(
+            [sys.executable, "-m", "frontier", "manifest", "fetch", "--project-dir", str(dbt_project)],
+            cwd=str(runner_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert fetch.returncode == 0, fetch.stderr
+        assert "source: saas_active" in fetch.stdout
+        pin = json.loads((dbt_project / "target" / "frontier-manifest.json").read_text())
+        assert pin["project"] == "jaffle_shop"
+
+        logout = subprocess.run(
+            [sys.executable, "-m", "frontier", "logout"],
+            cwd=str(runner_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert logout.returncode == 0, logout.stderr
+
+        denied = subprocess.run(
+            [sys.executable, "-m", "frontier", "manifest", "fetch", "--project-dir", str(dbt_project)],
+            cwd=str(runner_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert denied.returncode == 1
+        assert "AUTH_REQUIRED: Run `frontier login --api-key`." in denied.stderr
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
 
 
 def test_discover_suggests_customer_summary_draft_only() -> None:

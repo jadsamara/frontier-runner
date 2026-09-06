@@ -127,11 +127,12 @@ fingerprints, change kinds, and impact status are stored on the uploaded
 assessment.
 
 `frontier upload` posts `target/frontier-run.json` to `POST /api/v1/runs`. It
-retries HTTP 429/5xx and network errors, and honors `Retry-After`. It uses
-`FRONTIER_API_KEY` if that variable is set, otherwise `FRONTIER_DEMO_API_KEY`.
-A leftover placeholder in `FRONTIER_API_KEY` will win over the demo key —
-`unset FRONTIER_API_KEY` if you intend to use the local demo key. Hashed
-uploads set `entityIdsHashed: true`.
+retries HTTP 429/5xx and network errors, and honors `Retry-After`. SaaS
+commands resolve credentials in this order: `FRONTIER_API_KEY`, the OS
+keychain, the `0600` fallback file, then `FRONTIER_DEMO_API_KEY` only when
+`FRONTIER_ALLOW_LOCAL_MANIFEST` is set outside GitHub Actions. If none are
+present, the CLI exits with `AUTH_REQUIRED: Run \`frontier login --api-key\``.
+Hashed uploads set `entityIdsHashed: true`.
 
 In GitHub Actions, assessments use `{project}-{GITHUB_SHA}` as `externalRunId`
 and record repository, branch, commit, and PR number. After a successful

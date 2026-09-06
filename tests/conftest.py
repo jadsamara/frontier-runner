@@ -10,9 +10,14 @@ JAFFLE_SHOP = Path("/Users/jad/Desktop/data_agent_pipeline/jaffle_shop")
 
 
 @pytest.fixture(autouse=True)
-def allow_local_manifest(monkeypatch) -> None:
+def isolate_frontier_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never read or write the developer OS keychain or ~/.config/frontier credentials."""
     monkeypatch.setenv("FRONTIER_ALLOW_LOCAL_MANIFEST", "1")
     monkeypatch.setenv("FRONTIER_HIDE_UPDATE_NOTICE", "1")
+    monkeypatch.setenv("FRONTIER_KEYRING_FILE", str(tmp_path / "frontier-keyring"))
+    monkeypatch.setenv("FRONTIER_CREDENTIALS_FILE", str(tmp_path / "frontier-credentials"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+    monkeypatch.setenv("PYTHON_KEYRING_BACKEND", "keyring.backends.fail.Keyring")
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     monkeypatch.delenv("FRONTIER_API_KEY", raising=False)
     monkeypatch.delenv("FRONTIER_DEMO_API_KEY", raising=False)

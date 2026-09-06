@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from frontier import __version__
 from frontier.config import redact
-from frontier.credentials import load_credentials
+from frontier.credentials import try_resolve_api_credential
 from frontier.errors import InstallError
 from frontier.local_config import load_local_config
 from frontier.onboard.constants import DEFAULT_API_URL, SUPPORTED_PYTHON
@@ -69,8 +69,12 @@ def run_doctor(
     checks: list[DoctorCheck] = []
     detection = detect_project(project_dir)
     local = load_local_config(project_dir)
-    creds = load_credentials()
-    api_url = (local.api_url if local else None) or (creds.api_url if creds else DEFAULT_API_URL)
+    creds = try_resolve_api_credential()
+    api_url = (
+        (local.api_url if local else None)
+        or (creds.api_url if creds else None)
+        or DEFAULT_API_URL
+    )
 
     checks.append(
         DoctorCheck(

@@ -21,6 +21,7 @@ from frontier.config import (
     derive_proof_config,
 )
 from frontier.dbt_artifacts import Manifest
+from frontier.credentials import try_resolve_api_credential
 from frontier.progress import elapsed_ms, log_step
 
 PIN_FILE_NAME = "frontier-manifest.json"
@@ -118,11 +119,7 @@ def default_pin_path(project_dir: Path) -> Path:
 
 
 def api_credentials_configured() -> bool:
-    for name in ("FRONTIER_API_KEY", "FRONTIER_DEMO_API_KEY"):
-        value = (os.environ.get(name) or "").strip()
-        if value:
-            return True
-    return False
+    return try_resolve_api_credential() is not None
 
 
 def allow_local_manifest(args: Any) -> bool:

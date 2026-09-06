@@ -10,11 +10,11 @@ from typing import Any, Sequence
 
 from frontier import __version__
 from frontier.api import (
-    api_key_from_env,
     build_ingest_payload,
     redact_api_key,
     upload_run,
 )
+from frontier.credentials import resolve_api_credential, try_resolve_api_credential
 from frontier.comment import maybe_upsert_pr_comment
 from frontier.config import (
     ConfigError,
@@ -158,20 +158,13 @@ def _config_path(args: argparse.Namespace, project_dir: Path) -> Path:
     return project_dir / "frontier.yml"
 
 
-def _api_url(args: argparse.Namespace, config) -> str:
+def _api_url(args: argparse.Namespace, config, creds=None) -> str:
     return str(
         getattr(args, "api_url", None)
         or os.environ.get("FRONTIER_API_URL")
+        or (creds.api_url if creds and creds.api_url else None)
         or config.api_url,
     ).rstrip("/")
-
-
-def _optional_api_key() -> str | None:
-    for name in ("FRONTIER_API_KEY", "FRONTIER_DEMO_API_KEY"):
-        value = (os.environ.get(name) or "").strip()
-        if value:
-            return value
-    return None
 
 
 def _resolve_runtime_config(
@@ -182,13 +175,14 @@ def _resolve_runtime_config(
 ):
     config = load_frontier_config(_config_path(args, project_dir))
     explicit = getattr(args, "manifest_file", None)
-    api_key = None if explicit else _optional_api_key()
+    creds = None if explicit else try_resolve_api_credential()
+    api_key = creds.api_key if creds else None
     config, _pinned = resolve_semantic_manifest(
         args,
         project_dir=project_dir,
         config=config,
         dbt_manifest=dbt_manifest,
-        api_url=_api_url(args, config),
+        api_url=_api_url(args, config, creds),
         api_key=api_key,
     )
     return config
@@ -1437,8 +1431,9 @@ def cmd_upload(args: argparse.Namespace) -> int:
         )
     if args.run_id:
         payload["externalRunId"] = args.run_id
-    api_url = args.api_url or os.environ.get("FRONTIER_API_URL") or config.api_url
-    api_key, api_key_source = api_key_from_env()
+    creds = resolve_api_credential()
+    api_key, api_key_source = creds.api_key, creds.source
+    api_url = _api_url(args, config, creds)
     print(
         f"Uploading {payload.get('externalRunId')} to {api_url} "
         f"as {redact_api_key(api_key)} ({api_key_source})",
@@ -1476,8 +1471,9 @@ def cmd_upload(args: argparse.Namespace) -> int:
 def cmd_manifest_fetch(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
     config = load_frontier_config(_config_path(args, project_dir))
-    api_key, _source = api_key_from_env()
-    api_url = _api_url(args, config)
+    creds = resolve_api_credential()
+    api_key = creds.api_key
+    api_url = _api_url(args, config, creds)
     output = Path(args.output).expanduser().resolve() if args.output else default_pin_path(project_dir)
     started = time.perf_counter()
     log_step("manifest fetch started", prefix="manifest")
@@ -1726,8 +1722,9 @@ def cmd_cdc_upload(args: argparse.Namespace) -> int:
         profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
         target=getattr(args, "target", None),
     )
-    api_url = args.api_url or os.environ.get("FRONTIER_API_URL") or frontier_config.api_url
-    api_key, api_key_source = api_key_from_env()
+    creds = resolve_api_credential()
+    api_key, api_key_source = creds.api_key, creds.source
+    api_url = _api_url(args, frontier_config, creds)
     print(
         f"Uploading CDC assessment to {api_url} "
         f"as {redact_api_key(api_key)} ({api_key_source})",

@@ -1,6 +1,5 @@
 # Publish frontier-runner from a version tag only.
-# Do not run until the package name and this workflow are reviewed.
-# PyPI trusted publishing (OIDC) — no long-lived API token.
+# PyPI trusted publishing uses OIDC; no long-lived API token.
 
 name: Publish frontier-runner
 
@@ -15,9 +14,10 @@ permissions:
 
 jobs:
   release:
-    name: Build, smoke-install, and publish
+    name: Build, verify, and publish
     runs-on: ubuntu-latest
     environment: pypi
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,28 +33,43 @@ jobs:
       - name: Verify tag matches package version
         run: |
           TAG="${GITHUB_REF_NAME#v}"
-          PKG="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
-          test "$TAG" = "$PKG"
+          PKG="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+
+          if [ "${TAG}" != "${PKG}" ]; then
+            echo "Tag version ${TAG} does not match package version ${PKG}" >&2
+            exit 1
+          fi
 
       - name: Build sdist and wheel
         run: python -m build
 
-      - name: Check metadata
-        run: twine check dist/*
+      - name: Check package metadata
+        run: python -m twine check dist/*
 
-      - name: Smoke-install the wheel
+      - name: Smoke-install wheel with Snowflake support
         run: |
-          python -m venv /tmp/frontier-wheel
-          /tmp/frontier-wheel/bin/pip install dist/frontier_runner-*-py3-none-any.whl
-          /tmp/frontier-wheel/bin/frontier --version
+          WHEEL="$(realpath "$(find dist -maxdepth 1 -name '*.whl' -print -quit)")"
 
-      - name: GitHub Release
+          if [ -z "${WHEEL}" ]; then
+            echo "Built wheel was not found" >&2
+            exit 1
+          fi
+
+          python -m venv /tmp/frontier-wheel
+          /tmp/frontier-wheel/bin/python -m pip install --upgrade pip
+          /tmp/frontier-wheel/bin/python -m pip install \
+            "frontier-runner[snowflake] @ file://${WHEEL}"
+
+          /tmp/frontier-wheel/bin/frontier --version
+          /tmp/frontier-wheel/bin/frontier --help
+          /tmp/frontier-wheel/bin/python -c "import snowflake.connector"
+          /tmp/frontier-wheel/bin/python -c "import frontier"
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          skip-existing: true
