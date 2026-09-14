@@ -350,6 +350,33 @@ def recommended_sql_change_proof(
     )
 
 
+def failed_execution_sql_change_proof(
+    *,
+    full_entity_count: int,
+    candidate_count: int,
+    changed_source_row_count: int,
+) -> SqlChangeProof:
+    """Keep measured candidate counts when a later warehouse phase fails."""
+    frontier = min(max(candidate_count, 0), full_entity_count)
+    return SqlChangeProof(
+        full_rows_recomputed=full_entity_count,
+        frontier_rows_recomputed=frontier,
+        rows_avoided=full_entity_count - frontier,
+        source_population_count=changed_source_row_count,
+        candidate_frontier_count=candidate_count,
+        confirmed_frontier_count=0,
+        before_entity_count=full_entity_count,
+        after_entity_count=full_entity_count,
+        changed_source_row_count=changed_source_row_count,
+        missing_frontier_entities=0,
+        extra_frontier_entities=0,
+        mismatched_final_rows=0,
+        test_duration_ms=0,
+        full_rebuild_required=False,
+        full_rebuild_recommended=False,
+    )
+
+
 def required_sql_change_proof(*, full_entity_count: int) -> SqlChangeProof:
     """Counts-only proof when impact SQL is unavailable or failed.
 

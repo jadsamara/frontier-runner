@@ -24,6 +24,11 @@ class SourceSuggestion:
     maximum_lateness: str | None
     confidence: str
     origin: str
+    route_status: str = "UNRESOLVED"
+    route_path: tuple[Any, ...] = ()
+    evidence: tuple[str, ...] = ()
+    sql_change_blocker: bool = False
+    cdc_blocker: bool = True
 
 
 @dataclass(frozen=True)
@@ -35,31 +40,45 @@ class ModelSuggestion:
     sources: tuple[SourceSuggestion, ...]
     confidence: str
     reasons: tuple[str, ...]
+    target_unique_id: str = ""
+    discarded_overrides: tuple[SourceSuggestion, ...] = ()
 
     def to_document(self) -> dict[str, Any]:
         return self.to_semantic_document()
 
     def to_semantic_document(self) -> dict[str, Any]:
+        sources = []
+        for source in self.sources:
+            item: dict[str, Any] = {
+                "name": source.name,
+                "changeKey": source.change_key if source.change_key else "unresolved",
+                "joinRoute": source.join_route,
+                "mutationPolicy": source.mutation_policy,
+                "deletesRequireBeforeImage": source.deletes_require_before_image,
+                "temporalMode": source.temporal_mode,
+                "eventTimeColumn": source.event_time_column,
+                "maximumLateness": source.maximum_lateness,
+                "confidence": source.confidence,
+                "origin": source.origin,
+                "routeStatus": source.route_status,
+                "evidence": list(source.evidence),
+                "sqlChangeBlocker": source.sql_change_blocker,
+                "cdcBlocker": source.cdc_blocker,
+            }
+            path = [
+                {"model": hop.model, "column": hop.column}
+                for hop in source.route_path
+            ]
+            if path:
+                item["routePath"] = path
+            sources.append(item)
         return {
             "model": self.model,
             "entity": self.entity,
             "entityKey": self.entity_key,
             "grain": self.grain,
-            "sources": [
-                {
-                    "name": source.name,
-                    "changeKey": source.change_key,
-                    "joinRoute": source.join_route,
-                    "mutationPolicy": source.mutation_policy,
-                    "deletesRequireBeforeImage": source.deletes_require_before_image,
-                    "temporalMode": source.temporal_mode,
-                    "eventTimeColumn": source.event_time_column,
-                    "maximumLateness": source.maximum_lateness,
-                    "confidence": source.confidence,
-                    "origin": "inferred",
-                }
-                for source in self.sources
-            ],
+            "generationKind": "generated",
+            "sources": sources,
         }
 
 
@@ -128,57 +147,6 @@ def _source_models(manifest: Manifest, mart: DbtNode) -> list[DbtNode]:
 
 
 def suggest_models(manifest: Manifest) -> list[ModelSuggestion]:
-    marts = [
-        node
-        for node in manifest.models().values()
-        if node.package_name in {None, manifest.project_name} and _is_candidate_mart(node)
-    ]
-    suggestions: list[ModelSuggestion] = []
-    for mart in sorted(marts, key=lambda node: node.unique_id):
-        key, key_confidence = _suggest_key(manifest, mart)
-        entity = _entity_from_key(key, mart.name)
-        sources: list[SourceSuggestion] = []
-        for source in _source_models(manifest, mart):
-            columns = set(_columns(source))
-            if key in columns:
-                join = "direct"
-                change_key = key
-                confidence = "high" if key_confidence == "high" else "medium"
-            else:
-                id_columns = [column for column in columns if _ID_COLUMN.match(column)]
-                change_key = id_columns[0] if id_columns else key
-                join = f"{change_key} -> {key}" if change_key != key else "direct"
-                confidence = "medium" if id_columns else "low"
-            sources.append(
-                SourceSuggestion(
-                    name=source.name,
-                    change_key=change_key,
-                    join_route=join,
-                    mutation_policy="targeted_repair",
-                    deletes_require_before_image=join != key,
-                    temporal_mode="none",
-                    event_time_column=None,
-                    maximum_lateness=None,
-                    confidence=confidence,
-                    origin="inferred",
-                )
-            )
-        if not sources:
-            continue
-        lowest = min((source.confidence for source in sources), default="low")
-        overall = "low" if lowest == "low" or key_confidence == "low" else key_confidence
-        suggestions.append(
-            ModelSuggestion(
-                model=mart.name,
-                entity=entity,
-                entity_key=key,
-                grain=f"one_row_per_{entity}",
-                sources=tuple(sources),
-                confidence=overall,
-                reasons=(
-                    f"Selected {mart.name} as a likely mart",
-                    f"Inferred entity key {key}",
-                ),
-            )
-        )
-    return suggestions
+    from frontier.onboard.routes import suggest_generated_models
+
+    return suggest_generated_models(manifest)

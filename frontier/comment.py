@@ -248,6 +248,15 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
         )
         if reasons:
             lines.append(f"Impact reasons: {', '.join(reasons[:8])}")
+        if comparison.get("proofStatus"):
+            lines.append(f"Proof status: {comparison.get('proofStatus')}")
+        if comparison.get("failurePhase") or comparison.get("failureCode"):
+            lines.append(
+                "Execution failure: "
+                f"{comparison.get('failurePhase') or 'unknown'} "
+                f"{comparison.get('failureCode') or ''} "
+                f"{comparison.get('failureReason') or ''}".strip()
+            )
     failed = _failed_checks(validations)
     if failed:
         lines.extend(["", "Failed checks:", *failed])

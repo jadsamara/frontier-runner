@@ -19,6 +19,7 @@ from frontier.proof import (
     recorded_sql_change_proof,
     recommended_sql_change_proof,
     required_sql_change_proof,
+    failed_execution_sql_change_proof,
     sql_change_proof_validation_results,
     targeted_mismatch_sql,
 )
@@ -191,6 +192,19 @@ def test_required_sql_change_proof_is_full_population() -> None:
     assert recommended.full_rebuild_recommended is True
     assert recommended.full_rebuild_required is False
     assert recommended.candidate_frontier_count == 120_000
+
+
+def test_execution_failure_keeps_measured_candidate_count() -> None:
+    proof = failed_execution_sql_change_proof(
+        full_entity_count=128,
+        candidate_count=56,
+        changed_source_row_count=56,
+    )
+    assert proof.candidate_frontier_count == 56
+    assert proof.changed_source_row_count == 56
+    assert proof.full_rebuild_required is False
+    assert proof.full_rebuild_recommended is False
+    assert proof.frontier_rows_recomputed == 56
 
 
 def test_measure_sql_change_proof_with_fake_warehouse() -> None:

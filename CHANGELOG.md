@@ -5,6 +5,26 @@ All notable changes to frontier-runner are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] — 2026-09-14
+
+### Added
+
+- Generated semantic mappings are runtime-ready for SQL-change assessments
+  when discovered routes verify. Review in Frontier is optional.
+
+### Fixed
+
+- Manifest discovery is idempotent: an unchanged generated mapping reuses the
+  active runtime version instead of creating another.
+- Invalid human overrides are discarded safely and do not churn a new version
+  on every `frontier discover`.
+- Route inference and change-scoped eligibility keep SQL-change assessments
+  unblocked when unrelated sources are unresolved.
+- Execution failures remain `EXECUTION_FAILED` and preserve measured
+  candidates instead of dropping them.
+- Clean SaaS onboarding configuration fixes for `.frontier/config.yml` and
+  related setup.
+
 ## [0.1.2] — 2026-09-06
 
 ### Fixed
@@ -55,6 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SaaS commands resolve stored keychain credentials through one shared
   resolver instead of requiring `FRONTIER_API_KEY` in the environment.
 
+[0.1.3]: https://github.com/jadsamara/frontier-runner/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/jadsamara/frontier-runner/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/jadsamara/frontier-runner/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jadsamara/frontier-runner/releases/tag/v0.1.0

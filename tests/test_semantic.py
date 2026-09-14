@@ -12,10 +12,12 @@ from frontier.config import load_frontier_config
 from frontier.semantic import (
     ManifestError,
     apply_pinned_manifest,
+    canonicalize_semantic_manifest,
     fingerprint_document,
     local_override_from_config,
     pin_manifest,
     pinned_from_payload,
+    semantic_fingerprint,
     validate_pinned_against_dbt,
     validate_pinned_document,
 )
@@ -247,6 +249,75 @@ def test_jaffle_fingerprint_matches_saas_canonical_json() -> None:
     assert digest == fingerprint_document(dict(reversed(list(JAFFLE_DOCUMENT.items()))))
 
 
+def test_semantic_fingerprint_ignores_volatile_and_source_order() -> None:
+    reordered = {
+        **JAFFLE_DOCUMENT,
+        "generationKind": "generated",
+        "sources": list(reversed(JAFFLE_DOCUMENT["sources"])),
+    }
+    reordered["sources"][0] = {
+        **reordered["sources"][0],
+        "joinRoute": "  order_id  ->   customer_id  ",
+        "evidence": ["stg_orders.order_id -> customers.customer_id", "catalog"],
+    }
+    envelope = {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "version": 17,
+        "fingerprint": "ff" * 32,
+        "status": "active",
+        "activatedAt": "2026-09-13T00:00:00.000Z",
+        "changedBy": "cli",
+        "reviewUrl": "https://example.test/manifests?version=17",
+        "targetModel": JAFFLE_DOCUMENT["model"],
+        "targetEntityType": JAFFLE_DOCUMENT["entity"],
+        "entityKey": JAFFLE_DOCUMENT["entityKey"],
+        "grain": JAFFLE_DOCUMENT["grain"],
+        "sources": [
+            {
+                **JAFFLE_DOCUMENT["sources"][1],
+                "joinRoute": "order_id->customer_id",
+                "evidence": ["catalog", "stg_orders.order_id -> customers.customer_id"],
+                "eventTimeColumn": None,
+                "maximumLateness": None,
+            },
+            JAFFLE_DOCUMENT["sources"][0],
+        ],
+    }
+    assert semantic_fingerprint(reordered) == semantic_fingerprint(envelope)
+    names = [source["name"] for source in canonicalize_semantic_manifest(envelope)["sources"]]
+    assert names == ["stg_customers", "stg_orders"]
+
+
+def test_semantic_fingerprint_changes_when_a_route_changes() -> None:
+    changed = {
+        **JAFFLE_DOCUMENT,
+        "sources": [
+            JAFFLE_DOCUMENT["sources"][0],
+            {**JAFFLE_DOCUMENT["sources"][1], "joinRoute": "order_id -> user_id -> customer_id"},
+        ],
+    }
+    assert semantic_fingerprint(changed) != semantic_fingerprint(JAFFLE_DOCUMENT)
+
+
+def test_fingerprint_keeps_unicode_like_saas() -> None:
+    document = {
+        **JAFFLE_DOCUMENT,
+        "sources": [
+            {
+                **JAFFLE_DOCUMENT["sources"][0],
+                "evidence": ["stg_supplies.product_id → order_items.product_id"],
+            },
+            JAFFLE_DOCUMENT["sources"][1],
+        ],
+    }
+    from frontier.semantic import canonical_json
+
+    encoded = canonical_json(document)
+    assert "→" in encoded
+    assert "\\u2192" not in encoded
+    assert fingerprint_document(document) != fingerprint_document(JAFFLE_DOCUMENT)
+
+
 def test_draft_manifest_fails_closed() -> None:
     payload = {**_active_payload(), "status": "draft"}
     pinned = pinned_from_payload(payload, source="saas_active")
@@ -254,36 +325,34 @@ def test_draft_manifest_fails_closed() -> None:
         validate_pinned_document(pinned)
 
 
-def test_low_confidence_route_fails_closed() -> None:
+def test_low_confidence_derived_route_can_be_pinned() -> None:
     document = {
         **JAFFLE_DOCUMENT,
         "sources": [
             JAFFLE_DOCUMENT["sources"][0],
-            {**JAFFLE_DOCUMENT["sources"][1], "confidence": "low"},
+            {**JAFFLE_DOCUMENT["sources"][1], "confidence": "low", "origin": "derived"},
         ],
     }
     pinned = pinned_from_payload(
         {**_active_payload(), "document": document, "fingerprint": fingerprint_document(document)},
         source="saas_active",
     )
-    with pytest.raises(ManifestError, match="MANIFEST_LOW_CONFIDENCE"):
-        validate_pinned_document(pinned)
+    validate_pinned_document(pinned)
 
 
-def test_unconfirmed_inferred_route_fails_closed() -> None:
+def test_derived_unresolved_route_can_be_pinned() -> None:
     document = {
         **JAFFLE_DOCUMENT,
         "sources": [
             JAFFLE_DOCUMENT["sources"][0],
-            {**JAFFLE_DOCUMENT["sources"][1], "origin": "inferred"},
+            {**JAFFLE_DOCUMENT["sources"][1], "origin": "derived", "routeStatus": "UNRESOLVED"},
         ],
     }
     pinned = pinned_from_payload(
         {**_active_payload(), "document": document, "fingerprint": fingerprint_document(document)},
         source="saas_active",
     )
-    with pytest.raises(ManifestError, match="MANIFEST_ROUTE_UNCONFIRMED"):
-        validate_pinned_document(pinned)
+    validate_pinned_document(pinned)
 
 
 def test_incomplete_temporal_policy_fails_closed() -> None:

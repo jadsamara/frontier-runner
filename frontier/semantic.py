@@ -26,7 +26,7 @@ from frontier.progress import elapsed_ms, log_step
 
 PIN_FILE_NAME = "frontier-manifest.json"
 JOIN_ROUTE_PATTERN = re.compile(
-    r"^[A-Za-z_][A-Za-z0-9_]*\s*->\s*[A-Za-z_][A-Za-z0-9_]*$",
+    r"^[A-Za-z_][A-Za-z0-9_]*(\s*->\s*[A-Za-z_][A-Za-z0-9_]*)+$",
 )
 SOURCES = ("saas_active", "pinned_file", "local_override")
 
@@ -49,6 +49,11 @@ class SemanticSource:
     maximum_lateness: str | None
     confidence: str
     origin: str
+    route_status: str = "UNRESOLVED"
+    route_path: tuple[dict[str, str], ...] = ()
+    evidence: tuple[str, ...] = ()
+    sql_change_blocker: bool = False
+    cdc_blocker: bool = False
 
 
 @dataclass(frozen=True)
@@ -82,29 +87,98 @@ class PinnedSemanticManifest:
             "entityKey": self.entity_key,
             "grain": self.grain,
             "sources": [
-                {
-                    "name": item.name,
-                    "changeKey": item.change_key,
-                    "joinRoute": item.join_route,
-                    "mutationPolicy": item.mutation_policy,
-                    "deletesRequireBeforeImage": item.deletes_require_before_image,
-                    "temporalMode": item.temporal_mode,
-                    "eventTimeColumn": item.event_time_column,
-                    "maximumLateness": item.maximum_lateness,
-                    "confidence": item.confidence,
-                    "origin": item.origin,
-                }
+                _source_to_payload(item)
                 for item in self.sources
             ],
         }
 
 
 def canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    # Match SaaS canonicalJson: sorted keys, no ASCII escaping of Unicode.
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def normalize_join_route(route: str) -> str:
+    trimmed = (route or "").strip()
+    lower = trimmed.lower()
+    if lower in {"direct", "unresolved"}:
+        return lower
+    if "->" in trimmed and "{{" not in trimmed:
+        parts = [part.strip() for part in re.split(r"\s*->\s*", trimmed) if part.strip()]
+        if parts:
+            return " -> ".join(parts)
+    return re.sub(r"\s+", " ", trimmed).strip()
+
+
+def canonicalize_semantic_manifest(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    document = document_from_payload(payload or {})
+    sources: list[dict[str, Any]] = []
+    raw_sources = document.get("sources") or []
+    if not isinstance(raw_sources, list):
+        raw_sources = []
+    for raw in raw_sources:
+        if not isinstance(raw, Mapping):
+            continue
+        origin = str(raw.get("origin") or "").strip()
+        confidence = str(raw.get("confidence") or "").strip()
+        item: dict[str, Any] = {
+            "name": str(raw.get("name") or "").strip(),
+            "changeKey": str(raw.get("changeKey") or "").strip(),
+            "joinRoute": normalize_join_route(str(raw.get("joinRoute") or "")),
+            "mutationPolicy": str(raw.get("mutationPolicy") or "targeted_repair"),
+            "deletesRequireBeforeImage": bool(raw.get("deletesRequireBeforeImage")),
+            "temporalMode": str(raw.get("temporalMode") or "none") or "none",
+            "confidence": confidence,
+            "origin": origin,
+            "routeStatus": str(raw.get("routeStatus") or "").strip()
+            or _default_route_status(origin, confidence),
+            "sqlChangeBlocker": bool(raw.get("sqlChangeBlocker")),
+            "cdcBlocker": bool(raw.get("cdcBlocker")),
+        }
+        event_time = str(raw.get("eventTimeColumn") or "").strip()
+        if event_time:
+            item["eventTimeColumn"] = event_time
+        lateness = str(raw.get("maximumLateness") or "").strip()
+        if lateness:
+            item["maximumLateness"] = lateness
+        hops = []
+        path = raw.get("routePath") or []
+        if isinstance(path, list):
+            for hop in path:
+                if not isinstance(hop, Mapping):
+                    continue
+                model = str(hop.get("model") or "").strip()
+                column = str(hop.get("column") or "").strip()
+                if model and column:
+                    hops.append({"model": model, "column": column})
+        if hops:
+            item["routePath"] = hops
+        evidence_raw = raw.get("evidence") or []
+        if isinstance(evidence_raw, list):
+            evidence = sorted(
+                str(entry).strip() for entry in evidence_raw if str(entry).strip()
+            )
+            if evidence:
+                item["evidence"] = evidence
+        sources.append(item)
+    sources.sort(key=lambda item: str(item.get("name") or ""))
+    return {
+        "model": str(document.get("model") or "").strip(),
+        "entity": str(document.get("entity") or "").strip(),
+        "entityKey": str(document.get("entityKey") or "").strip(),
+        "grain": str(document.get("grain") or "").strip(),
+        "sources": sources,
+    }
+
+
+def semantic_fingerprint(payload: Mapping[str, Any] | None) -> str:
+    return hashlib.sha256(
+        canonical_json(canonicalize_semantic_manifest(payload)).encode("utf-8")
+    ).hexdigest()
 
 
 def fingerprint_document(document: Mapping[str, Any]) -> str:
-    return hashlib.sha256(canonical_json(dict(document)).encode("utf-8")).hexdigest()
+    return semantic_fingerprint(document)
 
 
 def fingerprint_prefix(fingerprint: str) -> str:
@@ -135,9 +209,51 @@ def allow_local_manifest(args: Any) -> bool:
     }
 
 
+def _source_to_payload(item: SemanticSource) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "name": item.name,
+        "changeKey": item.change_key,
+        "joinRoute": item.join_route,
+        "mutationPolicy": item.mutation_policy,
+        "deletesRequireBeforeImage": item.deletes_require_before_image,
+        "temporalMode": item.temporal_mode,
+        "eventTimeColumn": item.event_time_column,
+        "maximumLateness": item.maximum_lateness,
+        "confidence": item.confidence,
+        "origin": item.origin,
+    }
+    extended = (
+        item.origin == "derived"
+        or item.route_path
+        or item.evidence
+        or item.sql_change_blocker
+        or item.cdc_blocker
+        or item.route_status not in {"", "VERIFIED", "UNRESOLVED"}
+    )
+    if item.origin == "derived" or item.route_path or item.evidence:
+        extended = True
+    if extended:
+        payload["routeStatus"] = item.route_status
+        if item.route_path:
+            payload["routePath"] = list(item.route_path)
+        if item.evidence:
+            payload["evidence"] = list(item.evidence)
+        payload["sqlChangeBlocker"] = item.sql_change_blocker
+        payload["cdcBlocker"] = item.cdc_blocker
+    return payload
+
+
 def _source_from_mapping(raw: Mapping[str, Any]) -> SemanticSource:
     event_time = raw.get("eventTimeColumn")
     lateness = raw.get("maximumLateness")
+    path_raw = raw.get("routePath") or ()
+    path: list[dict[str, str]] = []
+    if isinstance(path_raw, list):
+        for item in path_raw:
+            if isinstance(item, Mapping) and item.get("model") and item.get("column"):
+                path.append({"model": str(item["model"]), "column": str(item["column"])})
+    evidence_raw = raw.get("evidence") or ()
+    evidence = tuple(str(item) for item in evidence_raw) if isinstance(evidence_raw, list) else ()
     return SemanticSource(
         name=str(raw.get("name") or "").strip(),
         change_key=str(raw.get("changeKey") or "").strip(),
@@ -149,7 +265,21 @@ def _source_from_mapping(raw: Mapping[str, Any]) -> SemanticSource:
         maximum_lateness=None if lateness in (None, "") else str(lateness).strip(),
         confidence=str(raw.get("confidence") or "").strip(),
         origin=str(raw.get("origin") or "").strip(),
+        route_status=str(raw.get("routeStatus") or "").strip() or _default_route_status(
+            str(raw.get("origin") or ""),
+            str(raw.get("confidence") or ""),
+        ),
+        route_path=tuple(path),
+        evidence=evidence,
+        sql_change_blocker=bool(raw.get("sqlChangeBlocker")),
+        cdc_blocker=bool(raw.get("cdcBlocker")),
     )
+
+
+def _default_route_status(origin: str, confidence: str) -> str:
+    if origin in {"confirmed", "derived"} and confidence != "low":
+        return "VERIFIED"
+    return "UNRESOLVED"
 
 
 def document_from_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -206,12 +336,34 @@ def pinned_from_payload(payload: Mapping[str, Any], *, source: str) -> PinnedSem
 
 
 def join_route_to_route(source_name: str, source: SemanticSource, entity_key: str) -> Route:
+    if source.route_status in {"UNRESOLVED", "INVALID", "AMBIGUOUS"}:
+        return Route(kind="unresolved")
+    if source.route_path:
+        from frontier.onboard.routes import RouteHop, compile_route_query
+
+        hops = tuple(
+            RouteHop(model=str(item["model"]), column=str(item["column"]))
+            for item in source.route_path
+        )
+        if len(hops) <= 1 and source.join_route.strip() == "direct":
+            return Route(kind="direct")
+        query = compile_route_query(
+            hops,
+            change_key=source.change_key,
+            entity_key=entity_key,
+        )
+        return Route(kind="query", query=query)
     route = source.join_route.strip()
     if route == "direct":
         return Route(kind="direct")
+    if route == "unresolved":
+        return Route(kind="unresolved")
     if JOIN_ROUTE_PATTERN.fullmatch(route):
+        parts = [part.strip() for part in route.split("->")]
+        if len(parts) > 2:
+            return Route(kind="unresolved")
         query = (
-            f"select {entity_key}\n"
+            f"select distinct {entity_key}\n"
             f"from {{{{ ref('{source_name}') }}}}\n"
             f"where {source.change_key} in ({{{{ changed_values }}}})"
         )
@@ -311,23 +463,17 @@ def validate_pinned_document(pinned: PinnedSemanticManifest) -> None:
                 f"Duplicate source '{source.name}'",
             )
         names.add(source.name)
-        if source.confidence == "low":
-            raise ManifestError(
-                "MANIFEST_LOW_CONFIDENCE",
-                f"Low-confidence mapping for '{source.name}' cannot run autonomously",
-            )
-        if source.origin == "inferred":
-            raise ManifestError(
-                "MANIFEST_ROUTE_UNCONFIRMED",
-                f"Inferred mapping for '{source.name}' must be confirmed before autonomous runs",
-            )
         if source.temporal_mode == "event_time" and not (source.event_time_column or "").strip():
             raise ManifestError(
                 "MANIFEST_TEMPORAL_INCOMPLETE",
                 f"Event-time column is required for '{source.name}'",
             )
         route = source.join_route.strip()
-        if route != "direct" and not JOIN_ROUTE_PATTERN.fullmatch(route) and "{{ changed_values }}" not in route:
+        if (
+            route not in {"direct", "unresolved"}
+            and not JOIN_ROUTE_PATTERN.fullmatch(route)
+            and "{{ changed_values }}" not in route
+        ):
             raise ManifestError(
                 "MANIFEST_LOCAL_REMOTE_CONFLICT",
                 f"Join route for '{source.name}' is invalid",

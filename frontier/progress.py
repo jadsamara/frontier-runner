@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from collections.abc import Iterator
@@ -23,6 +24,19 @@ def elapsed_ms(started: float) -> int:
 
 def failure_status(error: BaseException) -> str:
     return f"failed:{type(error).__name__}"
+
+
+def redact_failure_reason(error: BaseException) -> str:
+    """Keep a machine-readable reason without SQL literals, secrets, or entity IDs."""
+    text = f"{type(error).__name__}: {error}"
+    text = re.sub(r"'[^']{0,400}'", "'***'", text)
+    text = re.sub(r'"[^"]{0,400}"', '"***"', text)
+    text = re.sub(r"\b\d{6,}\b", "***", text)
+    lowered = text.lower()
+    for part in ("password", "token", "secret", "private_key", "api_key"):
+        if part in lowered:
+            text = re.sub(part, "***", text, flags=re.I)
+    return text[:512]
 
 
 def log_step(

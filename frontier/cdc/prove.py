@@ -16,6 +16,7 @@ from frontier.cdc.upload import assert_baseline_fresh
 from frontier.compare import compiled_sql_for
 from frontier.config import ConfigError, FrontierConfig
 from frontier.dbt_artifacts import DbtNode, Manifest
+from frontier.onboard.routes import cdc_unresolved_for_batch
 from frontier.execute import (
     HANDWRITTEN_FRONTIER_MODELS,
     affected_keys_relation,
@@ -330,6 +331,28 @@ def _prove_claimed(
     phase = time.perf_counter()
     log_step("event routing started", prefix=CDC_PREFIX)
     events = store.list_events(batch.batch_id)
+    pinned = getattr(frontier_config, "pinned", None)
+    required = {event.source_model for event in events}
+    if pinned is not None:
+        blocked = cdc_unresolved_for_batch(pinned.sources, required)
+        by_name = {item.name: item for item in pinned.sources}
+        for name in blocked:
+            source = by_name.get(name)
+            status = source.route_status if source else "UNRESOLVED"
+            reason = (
+                source.evidence[0]
+                if source and source.evidence
+                else f"source '{name}' has no verified route"
+            )
+            raise ConfigError(
+                f"ROUTE_UNRESOLVED: CDC source '{name}' cannot be proved ({status}: {reason})"
+            )
+        for name in sorted(required):
+            if name not in by_name:
+                raise ConfigError(
+                    f"ROUTE_UNRESOLVED: CDC source '{name}' cannot be proved "
+                    "(UNRESOLVED: source is not in the runtime manifest)"
+                )
     routed = route_events(events, cdc_config)
     log_step(
         (

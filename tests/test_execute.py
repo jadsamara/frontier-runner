@@ -100,12 +100,24 @@ def test_targeted_sql_pushes_join_into_sources() -> None:
             entity_key="customer_id",
             affected_relation="db.ci.keys",
         )
-    with pytest.raises(ConfigError, match="cannot push affected-key restriction"):
-        generate_targeted_sql(
-            "select customer_id from a union select customer_id from b",
-            entity_key="customer_id",
-            affected_relation="db.ci.keys",
+
+
+def test_targeted_sql_replaces_unqualified_star_after_keys_join() -> None:
+    sql = generate_targeted_sql(
+        """
+        with customers as (
+            select * from FRONTIER_LAB.DBT_DEV.stg_customers
         )
+        select * from customers
+        """,
+        entity_key="customer_id",
+        affected_relation="FRONTIER_LAB.DBT_DEV.FRONTIER_RUN_AFFECTED_KEYS",
+    )
+    lowered = sql.lower()
+    assert "stg_customers.*" in lowered or "customers.*" in lowered
+    assert "select\n  *\nfrom frontier_lab.dbt_dev.stg_customers\n  inner join" not in lowered
+    assert "on stg_customers.customer_id = frontier_keys.customer_id" in lowered
+    assert restriction_is_pushed(sql, entity_key="customer_id")
 
 
 def test_targeted_sql_qualifies_entity_key_on_mart_wrapper() -> None:
@@ -499,7 +511,7 @@ def test_jaffle_three_customers_without_handwritten_frontier_models(monkeypatch)
     assert result.affected_relation is not None
     assert "FRONTIER_" in result.affected_relation
     assert "AFFECTED_KEYS" in result.affected_relation
-    assert "DBT_CI" in result.affected_relation
+    assert "DBT_DEV" in result.affected_relation
     assert not any(
         model in sql
         for sql in warehouse.executed

@@ -144,7 +144,9 @@ def isolated_location(*, model_database: str | None, model_schema: str | None) -
     database = (
         os.environ.get("FRONTIER_WAREHOUSE_DATABASE") or model_database or ""
     ).strip()
-    schema = (os.environ.get("FRONTIER_WAREHOUSE_SCHEMA") or _DEFAULT_SCHEMA).strip()
+    schema = (
+        os.environ.get("FRONTIER_WAREHOUSE_SCHEMA") or model_schema or _DEFAULT_SCHEMA
+    ).strip()
     if not database:
         raise ConfigError("Frontier isolated execution requires a warehouse database")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", database):
@@ -333,10 +335,10 @@ def _qualify_entity_key_against_keys_join(select: exp.Select, entity_key: str) -
     target = entity_key.lower()
     qualified: list[exp.Expression] = []
     for expr in select.expressions or []:
-        if isinstance(expr, exp.Star):
-            if expr.this is None:
-                expr.set("this", exp.to_identifier(alias))
-            qualified.append(expr)
+        if isinstance(expr, exp.Star) or (
+            isinstance(expr, exp.Column) and isinstance(expr.this, exp.Star) and not expr.table
+        ):
+            qualified.append(exp.Column(this=exp.Star(), table=exp.to_identifier(alias)))
             continue
         for column in expr.find_all(exp.Column):
             if str(column.name or "").lower() != target:
@@ -622,7 +624,12 @@ class IsolatedRun:
         sql_change_queries: Iterable[str] = (),
     ) -> IsolatedExecution:
         assert_not_prod(database=self.database, schema=self.schema, relation=self.relation)
-        self.warehouse.execute(create_schema_sql(self.database, self.schema))
+        try:
+            self.warehouse.execute(create_schema_sql(self.database, self.schema))
+        except Exception as error:
+            detail = str(error)
+            if "42501" not in detail and "insufficient privileges" not in detail.lower():
+                raise
         sql = create_affected_keys_sql(
             self.relation,
             self.entity_key,

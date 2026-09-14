@@ -14,7 +14,7 @@ from frontier.config import ConfigError, FrontierConfig
 from frontier.dbt_artifacts import Manifest
 from frontier.execute import IsolatedRun, ORIGIN_SQL_CHANGE, SQL_CHANGE_REASON, merge_unique_keys, open_isolated_run
 from frontier.hashing import entity_type_from_key, hmac_entity_id
-from frontier.progress import elapsed_ms, failure_status, log_step
+from frontier.progress import elapsed_ms, failure_status, log_step, redact_failure_reason
 from frontier.warehouse import WarehouseAdapter
 
 REF_PATTERN = re.compile(r"\{\{\s*ref\(\s*['\"]([^'\"]+)['\"]\s*\)\s*\}\}")
@@ -57,6 +57,11 @@ class FrontierResult:
     union_candidate_count: int | None = None
     full_rebuild_required: bool = False
     full_rebuild_recommended: bool = False
+    execution_failed: bool = False
+    failure_phase: str | None = None
+    failure_code: str | None = None
+    failure_reason: str | None = None
+    proof_status: str | None = None
     targeted_query_id: str | None = None
     changed_source_row_count: int | None = None
     phase_timings: dict[str, int] = field(default_factory=dict)
@@ -180,6 +185,10 @@ def resolve_affected_entities(
 
     for source_name, source_events in events_by_source.items():
         relation = config.relation(source_name)
+        if relation.route.kind in {"unresolved", "invalid"}:
+            raise ConfigError(
+                f"ROUTE_UNRESOLVED: source '{source_name}' has no verified route to {config.model.key}"
+            )
         if relation.route.kind == "direct":
             for event in source_events:
                 affected.append(
@@ -317,6 +326,11 @@ def run_frontier(
     sql_change_candidate_count: int | None = None
     union_candidate_count: int | None = None
     full_rebuild_required = False
+    execution_failed = False
+    failure_phase: str | None = None
+    failure_code: str | None = None
+    failure_reason: str | None = None
+    proof_status: str | None = None
     targeted_query_id: str | None = None
     model = manifest.find_model(config.model.name)
     try:
@@ -339,16 +353,25 @@ def run_frontier(
             )
             if required and not queries:
                 full_rebuild_required = True
+                proof_status = "FULL_REBUILD_REQUIRED"
+                failure_phase = "FULL_REBUILD_REQUIRED"
+                failure_code = "IMPACT_SQL_UNAVAILABLE"
+                failure_reason = "SQL impact query unavailable"
                 execution_reasons.append("SQL impact query unavailable")
             else:
                 try:
                     materialized = session.materialize(keys, sql_change_queries=queries)
-                except Exception:
-                    if required:
-                        full_rebuild_required = True
-                        execution_reasons.append("SQL impact query failed")
-                    else:
-                        raise
+                except Exception as error:
+                    execution_failed = True
+                    proof_status = "EXECUTION_FAILED"
+                    failure_phase = "CANDIDATES_EXECUTED"
+                    failure_code = type(error).__name__
+                    failure_reason = redact_failure_reason(error)
+                    execution_reasons.append("candidate materialization failed")
+                    log_step(
+                        "candidate materialization completed",
+                        status=f"EXECUTION_FAILED:{failure_code}",
+                    )
                 else:
                     affected_relation = materialized.relation
                     event_candidate_count = materialized.event_candidate_count
@@ -370,36 +393,58 @@ def run_frontier(
                             reason=reason,
                         )
                     affected = list(known.values())
-                    if sql_differs and confirm:
-                        confirmed_keys = session.confirm(
-                            before_sql=before_sql or "",
-                            after_sql=after_sql or "",
-                        )
-                        targeted_query_id = (
-                            str(session.last_targeted_query_id)
-                            if session.last_targeted_query_id
-                            else None
-                        )
-                        if confirmed_keys is None:
-                            execution_reasons.append("targeted before/after comparison failed")
-                        elif confirmed_keys:
-                            confirmed_set = set(confirmed_keys)
-                            affected = [
-                                entity
-                                for entity in affected
-                                if entity.entity_value in confirmed_set
-                            ]
-                            for value in confirmed_keys:
-                                if value in {entity.entity_value for entity in affected}:
-                                    continue
-                                affected.append(
-                                    AffectedEntity(
-                                        entity_type=config.model.entity,
-                                        entity_key=config.model.key,
-                                        entity_value=value,
-                                        reason="Confirmed targeted row change",
-                                    )
-                                )
+                    proof_status = "CANDIDATES_EXECUTED"
+                    if sql_differs and confirm and not execution_failed:
+                        try:
+                            confirmed_keys = session.confirm(
+                                before_sql=before_sql or "",
+                                after_sql=after_sql or "",
+                            )
+                        except Exception as error:
+                            execution_failed = True
+                            proof_status = "EXECUTION_FAILED"
+                            if session.targeted_base_relation is None:
+                                failure_phase = "TARGETED_BASE_EXECUTED"
+                            elif session.targeted_head_relation is None:
+                                failure_phase = "TARGETED_HEAD_EXECUTED"
+                            else:
+                                failure_phase = "CONFIRMED"
+                            failure_code = type(error).__name__
+                            failure_reason = redact_failure_reason(error)
+                            execution_reasons.append("targeted execution failed")
+                        else:
+                            targeted_query_id = (
+                                str(session.last_targeted_query_id)
+                                if session.last_targeted_query_id
+                                else None
+                            )
+                            if confirmed_keys is None:
+                                execution_failed = True
+                                proof_status = "EXECUTION_FAILED"
+                                failure_phase = "TARGETED_BASE_EXECUTED"
+                                failure_code = "TARGETED_SQL_UNAVAILABLE"
+                                failure_reason = "targeted before/after SQL could not be generated"
+                                execution_reasons.append("targeted before/after comparison failed")
+                            else:
+                                proof_status = "CONFIRMED"
+                                if confirmed_keys:
+                                    confirmed_set = set(confirmed_keys)
+                                    affected = [
+                                        entity
+                                        for entity in affected
+                                        if entity.entity_value in confirmed_set
+                                    ]
+                                    for value in confirmed_keys:
+                                        if value in {entity.entity_value for entity in affected}:
+                                            continue
+                                        affected.append(
+                                            AffectedEntity(
+                                                entity_type=config.model.entity,
+                                                entity_key=config.model.key,
+                                                entity_value=value,
+                                                reason="Confirmed targeted row change",
+                                            )
+                                        )
 
         unique: dict[str, AffectedEntity] = {}
         for entity in affected:
@@ -429,6 +474,8 @@ def run_frontier(
         full_entity_count = int(row[0])
         if full_rebuild_required:
             frontier_entity_count = full_entity_count
+        elif execution_failed and union_candidate_count is not None:
+            frontier_entity_count = min(union_candidate_count, full_entity_count)
         elif len(row) > 1 and row[1] is not None:
             frontier_entity_count = int(row[1])
         else:
@@ -451,6 +498,11 @@ def run_frontier(
             union_candidate_count=union_candidate_count,
             full_rebuild_required=full_rebuild_required,
             full_rebuild_recommended=full_rebuild_recommended,
+            execution_failed=execution_failed,
+            failure_phase=failure_phase,
+            failure_code=failure_code,
+            failure_reason=failure_reason,
+            proof_status=proof_status,
             targeted_query_id=targeted_query_id,
             phase_timings=dict(session.phase_timings) if session is not None else {},
         )

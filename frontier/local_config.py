@@ -20,9 +20,12 @@ class LocalFrontierConfig:
     default_branch: str = "main"
     version: int = 1
     path: Path | None = None
+    target_model: str | None = None
+    entity: str | None = None
+    entity_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "version": self.version,
             "project": self.project,
             "api_url": self.api_url,
@@ -35,6 +38,13 @@ class LocalFrontierConfig:
                 "default_branch": self.default_branch,
             },
         }
+        if self.target_model:
+            payload["target"] = {
+                "model": self.target_model,
+                "entity": self.entity,
+                "entity_key": self.entity_key,
+            }
+        return payload
 
 
 def config_dir(project_dir: Path) -> Path:
@@ -54,6 +64,7 @@ def load_local_config(project_dir: Path) -> LocalFrontierConfig | None:
         raise ConfigError(f"Invalid {path}")
     dbt = raw.get("dbt") or {}
     git = raw.get("git") or {}
+    target = raw.get("target") or {}
     project = str(raw.get("project") or "").strip()
     if not project:
         raise ConfigError(f"{path} is missing project")
@@ -66,6 +77,9 @@ def load_local_config(project_dir: Path) -> LocalFrontierConfig | None:
         default_branch=str(git.get("default_branch") or "main").strip() or "main",
         version=int(raw.get("version") or 1),
         path=path,
+        target_model=str(target.get("model") or "").strip() or None,
+        entity=str(target.get("entity") or "").strip() or None,
+        entity_key=str(target.get("entity_key") or "").strip() or None,
     )
 
 
@@ -76,3 +90,29 @@ def write_local_config(project_dir: Path, config: LocalFrontierConfig, *, force:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(config.to_dict(), sort_keys=False))
     return path
+
+
+def persist_target_selection(
+    project_dir: Path,
+    *,
+    model: str,
+    entity: str,
+    entity_key: str,
+) -> Path:
+    current = load_local_config(project_dir)
+    if current is None:
+        return config_path(project_dir)
+    updated = LocalFrontierConfig(
+        project=current.project,
+        api_url=current.api_url,
+        dbt_project_dir=current.dbt_project_dir,
+        dbt_target=current.dbt_target,
+        git_provider=current.git_provider,
+        default_branch=current.default_branch,
+        version=current.version,
+        path=current.path,
+        target_model=model,
+        entity=entity,
+        entity_key=entity_key,
+    )
+    return write_local_config(project_dir, updated, force=True)

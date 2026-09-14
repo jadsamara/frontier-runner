@@ -34,6 +34,7 @@ class DoctorCheck:
     detail: str = ""
     next_action: str | None = None
     skipped: bool = False
+    warn: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -216,7 +217,7 @@ def run_doctor(
             ),
             next_action=None
             if active_ok
-            else "Run `frontier discover`, then review and activate the draft in Frontier.",
+            else "Run `frontier discover`.",
         )
     )
     pin_path = default_pin_path(project_dir)
@@ -226,10 +227,10 @@ def run_doctor(
             id="pinned_manifest",
             label="Pinned semantic manifest",
             ok=pinned_ok,
-            required=active_ok,
+            required=False,
             skipped=not active_ok,
             detail=str(pin_path) if pinned_ok else "target/frontier-manifest.json missing",
-            next_action=None if pinned_ok or not active_ok else "Run `frontier manifest fetch`.",
+            next_action=None if pinned_ok or not active_ok else "Prove will fetch and pin automatically; or run `frontier manifest fetch`.",
         )
     )
     project_name = detection.dbt_project_name or (local.project if local else "")
@@ -246,7 +247,57 @@ def run_doctor(
             detail="no active manifest" if not active_ok else (
                 "" if matches else f"{active.get('project')} != {project_name}"
             ),
-            next_action=None if not active_ok or matches else "Activate a manifest for this dbt project.",
+            next_action=None if not active_ok or matches else "Discover a manifest for this dbt project.",
+        )
+    )
+
+    sql_ok = active_ok
+    cdc_ok = active_ok
+    unresolved_routes = 0
+    total_routes = 0
+    if isinstance(active, dict):
+        sources = active.get("sources") or []
+        total_routes = len(sources) if isinstance(sources, list) else 0
+        for source in sources if isinstance(sources, list) else []:
+            if not isinstance(source, dict):
+                continue
+            status = str(source.get("routeStatus") or "")
+            origin = str(source.get("origin") or "")
+            if not status:
+                status = "VERIFIED" if origin in {"confirmed", "derived"} else "UNRESOLVED"
+            if status in {"UNRESOLVED", "AMBIGUOUS"}:
+                unresolved_routes += 1
+            if source.get("sqlChangeBlocker") and status != "VERIFIED":
+                sql_ok = False
+            if status != "VERIFIED":
+                cdc_ok = False
+    checks.append(
+        DoctorCheck(
+            id="sql_change_ready",
+            label="SQL-change assessment readiness",
+            ok=sql_ok,
+            required=True,
+            skipped=not active_ok,
+            detail="" if sql_ok else "required SQL-change routes are unresolved",
+            next_action=None if sql_ok else "Run `frontier discover` after `dbt compile`.",
+        )
+    )
+    checks.append(
+        DoctorCheck(
+            id="cdc_ready",
+            label="CDC readiness",
+            ok=cdc_ok,
+            required=False,
+            skipped=not active_ok,
+            warn=active_ok and not cdc_ok,
+            detail=(
+                "all source routes verified"
+                if cdc_ok
+                else f"{unresolved_routes} of {total_routes} source routes unresolved"
+            ),
+            next_action=None
+            if cdc_ok
+            else "Unresolved CDC sources fail closed only when those sources change.",
         )
     )
 
@@ -354,7 +405,7 @@ NEXT_ACTION_PRIORITY = (
     "auth",
     "local_config",
     "active_manifest",
-    "pinned_manifest",
+    "sql_change_ready",
     "git",
     "github_workflow",
 )
@@ -382,12 +433,17 @@ def format_doctor(checks: list[DoctorCheck]) -> str:
     for check in checks:
         if check.skipped:
             mark = "–"
+        elif check.warn and not check.ok:
+            mark = "△"
         elif check.ok:
             mark = "✓"
         else:
             mark = "✗"
         extra = f" ({check.detail})" if check.detail else ""
-        lines.append(f"{mark} {check.label}{extra}")
+        if check.id == "cdc_ready" and check.detail and not check.ok:
+            lines.append(f"{mark} {check.label}: {check.detail}")
+        else:
+            lines.append(f"{mark} {check.label}{extra}")
     action = doctor_next_action(checks)
     if action:
         lines.extend(["", "Next action:", action])

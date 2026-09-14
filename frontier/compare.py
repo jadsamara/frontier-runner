@@ -451,19 +451,26 @@ def stamp_impact_execution(
     full_rebuild_required: bool,
     sql_change_executed: bool,
     impact_attempted: bool = False,
+    proof_status: str | None = None,
+    failure_phase: str | None = None,
+    failure_code: str | None = None,
+    failure_reason: str | None = None,
 ) -> dict[str, Any] | None:
     """Record whether compiled impact SQL ran in the warehouse.
 
     COMPILED is the predicate compiler. EXECUTED means Snowflake (or the
     configured adapter) actually ran the candidate query. NOT_RUN means
     targeted execution was skipped. FAILED is reserved for an attempt
-    that ran and failed.
+    that ran and failed. EXECUTION_FAILED is a later proof phase, not an
+    unsupported-SQL rebuild.
     """
     if not comparison:
         return comparison
     skipped_rebuild = full_rebuild_required and not impact_attempted and not sql_change_executed
     if skipped_rebuild:
         default = IMPACT_EXECUTION_NOT_RUN
+    elif proof_status == "EXECUTION_FAILED" and (impact_attempted or sql_change_executed):
+        default = IMPACT_EXECUTION_EXECUTED
     elif full_rebuild_required:
         default = IMPACT_EXECUTION_FAILED
     elif run_mode == "live" and sql_change_executed:
@@ -476,13 +483,22 @@ def stamp_impact_execution(
             if row.get("impactStatus") == FULL_REBUILD_REQUIRED:
                 row["impactExecution"] = (
                     IMPACT_EXECUTION_FAILED
-                    if impact_attempted or sql_change_executed
+                    if (impact_attempted or sql_change_executed)
+                    and proof_status != "EXECUTION_FAILED"
                     else IMPACT_EXECUTION_NOT_RUN
                 )
             elif row.get("impactStatus") or row.get("changeKinds"):
                 row["impactExecution"] = default
     if skipped_rebuild:
         copied["targetedValidation"] = TARGETED_VALIDATION_NOT_RUN
+    if proof_status:
+        copied["proofStatus"] = proof_status
+    if failure_phase:
+        copied["failurePhase"] = failure_phase
+    if failure_code:
+        copied["failureCode"] = failure_code
+    if failure_reason:
+        copied["failureReason"] = failure_reason
     return copied
 
 

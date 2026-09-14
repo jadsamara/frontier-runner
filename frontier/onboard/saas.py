@@ -31,6 +31,11 @@ class DraftManifestResult:
     version: int
     status: str
     review_url: str
+    generated: bool = False
+    sql_change_ready: bool = False
+    cdc_ready: bool = False
+    created: bool = True
+    fingerprint: str = ""
 
 
 BIND_HOSTS = {"0.0.0.0", "::", "[::]"}
@@ -63,6 +68,7 @@ def _request(
     url: str,
     api_key: str | None = None,
     payload: dict[str, Any] | None = None,
+    extra_headers: dict[str, str] | None = None,
     timeout_seconds: int = 30,
 ) -> tuple[int, dict[str, Any]]:
     headers = {"Accept": "application/json"}
@@ -72,6 +78,8 @@ def _request(
         data = json.dumps(payload).encode("utf-8")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    if extra_headers:
+        headers.update(extra_headers)
     request = urllib.request.Request(url, method=method, headers=headers, data=data)
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
@@ -155,7 +163,7 @@ def fetch_runner_versions(api_url: str) -> RunnerVersions:
         )
     return RunnerVersions(
         minimum_supported=str(body.get("minimumSupported") or "0.1.1"),
-        latest_stable=str(body.get("latestStable") or "0.1.2"),
+        latest_stable=str(body.get("latestStable") or "0.1.3"),
     )
 
 
@@ -177,6 +185,12 @@ def upload_draft_manifest(
     document: dict[str, Any],
 ) -> DraftManifestResult:
     origin = creds.api_url.rstrip("/")
+    payload_document = json.loads(json.dumps(document, ensure_ascii=False))
+    if isinstance(payload_document, dict):
+        payload_document.pop("generationKind", None)
+    from frontier.semantic import semantic_fingerprint
+
+    fingerprint = semantic_fingerprint(payload_document)
     status, body = _request(
         method="POST",
         url=urljoin(
@@ -184,7 +198,8 @@ def upload_draft_manifest(
             f"api/v1/projects/{quote(creds.project, safe='')}/manifests",
         ),
         api_key=creds.api_key,
-        payload={"document": document, "changedBy": "cli"},
+        payload={"document": payload_document, "changedBy": "cli", "generated": True},
+        extra_headers={"Idempotency-Key": fingerprint},
     )
     if status in {401, 403}:
         raise InstallError(
@@ -213,10 +228,16 @@ def upload_draft_manifest(
     version = int(body.get("version") or 1)
     origin = public_origin(creds.api_url)
     review = str(body.get("reviewUrl") or f"{origin}/manifests?version={version}")
+    created = bool(body.get("created")) if "created" in body else status == 201
     return DraftManifestResult(
         version=version,
         status=str(body.get("status") or "draft"),
         review_url=rewrite_user_facing_url(review, origin),
+        generated=str(body.get("status") or "") == "active" or bool(body.get("generated")),
+        sql_change_ready=bool(body.get("sqlChangeReady", True)),
+        cdc_ready=bool(body.get("cdcReady", False)),
+        created=created,
+        fingerprint=str(body.get("fingerprint") or fingerprint),
     )
 
 

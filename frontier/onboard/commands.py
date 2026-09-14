@@ -26,6 +26,7 @@ from frontier.local_config import (
     LocalFrontierConfig,
     config_path,
     load_local_config,
+    persist_target_selection,
     write_local_config,
 )
 from frontier.onboard.constants import DEFAULT_API_URL, DOCS_ORIGIN
@@ -45,7 +46,10 @@ from frontier.onboard.hashkey import generate_entity_hash_key, hash_key_prefix
 from frontier.onboard.permissions import snowflake_permission_sql
 from frontier.onboard.prompt import prompt_choice, prompt_text, prompt_yes_no
 from frontier.onboard.saas import (
+    DraftManifestResult,
+    fetch_active_manifest_summary,
     fetch_runner_versions,
+    public_origin,
     rewrite_user_facing_url,
     upload_draft_manifest,
     whoami,
@@ -270,6 +274,47 @@ def _require_credentials() -> StoredCredentials:
     )
 
 
+def _route_path_text(source: Any) -> str:
+    hops = getattr(source, "route_path", ()) or ()
+    if not hops:
+        route = str(getattr(source, "join_route", "") or "")
+        return route.replace(" -> ", " → ") if route and route != "unresolved" else ""
+    parts: list[str] = []
+    for hop in hops:
+        model = getattr(hop, "model", None) or (hop.get("model") if isinstance(hop, dict) else "")
+        column = getattr(hop, "column", None) or (hop.get("column") if isinstance(hop, dict) else "")
+        parts.append(f"{model}.{column}")
+    return " → ".join(parts)
+
+
+def _route_reason(source: Any) -> str:
+    evidence = tuple(getattr(source, "evidence", ()) or ())
+    for item in evidence:
+        lowered = str(item).lower()
+        if "does not exist" in lowered or "no join" in lowered or "unresolved" in lowered:
+            return str(item)
+    return str(evidence[-1]) if evidence else ""
+
+
+def _print_source_route(source: Any, *, derived: Any | None = None) -> None:
+    print(f"  {source.name}")
+    print(f"    change key: {source.change_key}")
+    print(f"    route: {source.join_route}")
+    print(f"    status: {source.route_status}")
+    reason = _route_reason(source)
+    if reason:
+        print(f"    reason: {reason}")
+    path = _route_path_text(source)
+    if path:
+        print(f"    path: {path}")
+    if derived is not None:
+        print(f"    derived key: {derived.change_key}")
+        print(f"    derived route: {derived.join_route}")
+        derived_path = _route_path_text(derived)
+        if derived_path:
+            print(f"    derived path: {derived_path}")
+
+
 def cmd_discover(args: Any) -> int:
     project_dir = Path(getattr(args, "project_dir_opt", None) or args.project_dir or ".").expanduser().resolve()
     manifest_path = _ensure_manifest(project_dir)
@@ -288,13 +333,7 @@ def cmd_discover(args: Any) -> int:
         assume_yes=_assume_yes(args),
         model=getattr(args, "model", None),
     )
-    grain_display = selected.grain.replace("_", " ")
     print(f"Detected model: {selected.model}")
-    print(f"Suggested entity: {selected.entity}")
-    print(f"Suggested key: {selected.entity_key}")
-    print(f"Suggested grain: {grain_display}")
-    print(f"Sources: {', '.join(source.name for source in selected.sources)}")
-    print(f"Inferred confidence: {selected.confidence}")
     creds = _require_credentials()
     local = load_local_config(project_dir)
     if local and local.project and local.project != creds.project:
@@ -324,10 +363,86 @@ def cmd_discover(args: Any) -> int:
                 docs_path="/docs/semantic-manifest",
             )
         print(f"Uploading to authenticated project '{creds.project}'.")
-    result = upload_draft_manifest(creds, selected.to_semantic_document())
+    existing = None
+    try:
+        existing = fetch_active_manifest_summary(creds)
+    except InstallError:
+        existing = None
+    from frontier.onboard.routes import merge_human_overrides, readiness
+    from frontier.semantic import semantic_fingerprint
+
+    target_node = manifest.find_model(selected.model)
+    selected = merge_human_overrides(selected, existing, manifest, target_node)
+    document = selected.to_semantic_document()
+    fingerprint = semantic_fingerprint(document)
+    result = None
+    if existing:
+        existing_fingerprint = semantic_fingerprint(existing)
+        if existing_fingerprint == fingerprint:
+            version = int(existing.get("version") or 1)
+            review_origin = public_origin(creds.api_url)
+            result = DraftManifestResult(
+                version=version,
+                status=str(existing.get("status") or "active"),
+                review_url=str(
+                    existing.get("reviewUrl")
+                    or f"{review_origin}/manifests?version={version}"
+                ),
+                generated=True,
+                sql_change_ready=True,
+                cdc_ready=False,
+                created=False,
+                fingerprint=fingerprint,
+            )
+    if result is None:
+        result = upload_draft_manifest(creds, document)
+        fingerprint = result.fingerprint or fingerprint
+    persist_target_selection(
+        project_dir,
+        model=selected.model,
+        entity=selected.entity,
+        entity_key=selected.entity_key,
+    )
+    sql_ready, cdc_ready, verified, unresolved, invalid = readiness(selected)
+    discarded = tuple(getattr(selected, "discarded_overrides", ()) or ())
+    print(f"Target: {selected.model}")
+    print(f"Entity: {selected.entity}")
+    print(f"Key: {selected.entity_key}")
+    print(f"Verified routes: {verified}")
+    print(f"Unresolved routes: {unresolved}")
+    print(f"Invalid routes: {invalid + len(discarded)}")
+    generated_by_name = {source.name: source for source in selected.sources}
+    pending = [
+        source
+        for source in selected.sources
+        if source.route_status in {"INVALID", "UNRESOLVED", "AMBIGUOUS"}
+    ]
+    if pending or discarded:
+        print("Route details:")
+    for source in pending:
+        _print_source_route(source)
+    for source in discarded:
+        print("Discarded invalid override:")
+        _print_source_route(source, derived=generated_by_name.get(source.name))
+    print(f"Ready for SQL-change assessments: {'yes' if sql_ready else 'no'}")
+    print(f"Ready for all CDC sources: {'yes' if cdc_ready else 'no'}")
+    status = result.status
+    if not result.created:
+        print(
+            f"Generated mapping unchanged; reusing runtime manifest version {result.version} ({status})."
+        )
+    else:
+        print(f"Runtime manifest version {result.version} ({status})")
+    print(f"Fingerprint: {fingerprint}")
+    if sql_ready and (status == "active" or result.generated):
+        print("Generated configuration is the runtime mapping for SQL-change assessments.")
+        print("Review in Frontier is optional.")
+    elif sql_ready:
+        print("Generated mapping is SQL-change-ready but SaaS left it as a draft.")
+        print("Retry `frontier discover` or inspect the review URL.")
+    else:
+        print("SQL-change assessments are not ready; review the generated mapping in Frontier.")
     review_origin = (local.api_url if local else None) or creds.api_url
-    print(f"Draft manifest created: version {result.version}")
-    print("This draft is not active. Review and activate it in Frontier before CI.")
     print(f"Review: {rewrite_user_facing_url(result.review_url, review_origin)}")
     return 0
 

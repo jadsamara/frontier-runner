@@ -288,7 +288,7 @@ def test_discover_suggests_customer_summary_draft_only() -> None:
     assert selected.entity_key == "customer_id"
     assert {source.name for source in selected.sources} >= {"stg_customers", "stg_orders"}
     document = selected.to_semantic_document()
-    assert all(source["origin"] == "inferred" for source in document["sources"])
+    assert all(source["origin"] == "derived" for source in document["sources"])
 
 
 def test_discover_uploads_draft(tmp_path: Path, monkeypatch, capsys, dbt_project: Path) -> None:
@@ -299,7 +299,13 @@ def test_discover_uploads_draft(tmp_path: Path, monkeypatch, capsys, dbt_project
         uploaded["project"] = creds.project
         from frontier.onboard.saas import DraftManifestResult
 
-        return DraftManifestResult(1, "draft", "https://example.test/manifests?version=1")
+        return DraftManifestResult(
+            1,
+            "active",
+            "https://example.test/manifests?version=1",
+            generated=True,
+            sql_change_ready=True,
+        )
 
     monkeypatch.setattr("frontier.onboard.commands.upload_draft_manifest", fake_upload)
     monkeypatch.setattr(
@@ -309,11 +315,326 @@ def test_discover_uploads_draft(tmp_path: Path, monkeypatch, capsys, dbt_project
     assert main(["discover", "--yes", "--project-dir", str(dbt_project)]) == 0
     out = capsys.readouterr().out
     assert "Detected model: customer_summary" in out
-    assert "Draft manifest created: version 1" in out
-    assert "not active" in out.lower() or "This draft is not active" in out
+    assert "Target: customer_summary" in out
+    assert "Ready for SQL-change assessments:" in out
+    assert "Runtime manifest version 1 (active)" in out
+    assert "Review in Frontier is optional." in out
+    assert "Review the generated mapping in Frontier before CI" not in out
     assert uploaded["document"]["model"] == "customer_summary"
-    assert uploaded["document"]["sources"][0]["origin"] == "inferred"
-    assert "activate" in out.lower()
+    assert uploaded["document"]["sources"][0]["origin"] == "derived"
+
+
+def _active_from_document(document: dict, version: int = 16) -> dict:
+    return {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "version": version,
+        "status": "active",
+        "targetModel": document["model"],
+        "targetEntityType": document["entity"],
+        "entityKey": document["entityKey"],
+        "grain": document["grain"],
+        "sources": document["sources"],
+        "fingerprint": "ab" * 32,
+        "reviewUrl": f"https://example.test/manifests?version={version}",
+    }
+
+
+def test_discover_reuses_identical_active_version(
+    monkeypatch, capsys, dbt_project: Path
+) -> None:
+    state: dict = {"doc": None, "uploads": 0}
+
+    def fake_active(_creds):
+        if state["doc"] is None:
+            return None
+        return _active_from_document(state["doc"], 16)
+
+    def fake_upload(creds, document):
+        del creds
+        state["uploads"] += 1
+        state["doc"] = document
+        from frontier.onboard.saas import DraftManifestResult
+
+        return DraftManifestResult(
+            16,
+            "active",
+            "https://example.test/manifests?version=16",
+            generated=True,
+            created=True,
+            fingerprint="cd" * 32,
+        )
+
+    monkeypatch.setattr("frontier.onboard.commands.fetch_active_manifest_summary", fake_active)
+    monkeypatch.setattr("frontier.onboard.commands.upload_draft_manifest", fake_upload)
+    monkeypatch.setattr(
+        "frontier.onboard.commands._require_credentials",
+        lambda: StoredCredentials("https://example.test", "frn_testkeyxxxx", "jaffle_shop"),
+    )
+    assert main(["discover", "--yes", "--project-dir", str(dbt_project)]) == 0
+    first = capsys.readouterr().out
+    assert "Runtime manifest version 16 (active)" in first
+    assert state["uploads"] == 1
+    assert main(["discover", "--yes", "--project-dir", str(dbt_project)]) == 0
+    second = capsys.readouterr().out
+    assert state["uploads"] == 1
+    assert "Generated mapping unchanged; reusing runtime manifest version 16 (active)." in second
+    assert "Fingerprint:" in second
+
+
+def test_discover_preserves_valid_human_override(
+    monkeypatch, capsys, dbt_project: Path
+) -> None:
+    uploaded: dict = {}
+
+    def fake_active(_creds):
+        if "document" in uploaded:
+            return _active_from_document(uploaded["document"], 16)
+        return {
+            "version": 15,
+            "status": "active",
+            "targetModel": "customer_summary",
+            "targetEntityType": "customer",
+            "entityKey": "customer_id",
+            "grain": "one_row_per_customer",
+            "sources": [
+                {
+                    "name": "stg_customers",
+                    "changeKey": "customer_id",
+                    "joinRoute": "direct",
+                    "origin": "confirmed",
+                    "confidence": "high",
+                    "mutationPolicy": "targeted_repair",
+                    "deletesRequireBeforeImage": False,
+                    "temporalMode": "none",
+                    "eventTimeColumn": None,
+                    "maximumLateness": None,
+                }
+            ],
+        }
+
+    def fake_upload(creds, document):
+        del creds
+        uploaded["document"] = document
+        uploaded["count"] = uploaded.get("count", 0) + 1
+        from frontier.onboard.saas import DraftManifestResult
+
+        return DraftManifestResult(
+            16,
+            "active",
+            "https://example.test/manifests?version=16",
+            generated=True,
+            created=True,
+        )
+
+    monkeypatch.setattr("frontier.onboard.commands.fetch_active_manifest_summary", fake_active)
+    monkeypatch.setattr("frontier.onboard.commands.upload_draft_manifest", fake_upload)
+    monkeypatch.setattr(
+        "frontier.onboard.commands._require_credentials",
+        lambda: StoredCredentials("https://example.test", "frn_testkeyxxxx", "jaffle_shop"),
+    )
+    assert main(["discover", "--yes", "--project-dir", str(dbt_project)]) == 0
+    customers = next(
+        item for item in uploaded["document"]["sources"] if item["name"] == "stg_customers"
+    )
+    assert customers["origin"] == "confirmed"
+    assert uploaded["count"] == 1
+    capsys.readouterr()
+    assert main(["discover", "--yes", "--project-dir", str(dbt_project)]) == 0
+    out = capsys.readouterr().out
+    assert uploaded["count"] == 1
+    assert "reusing runtime manifest version 16 (active)." in out
+
+
+def test_discover_discarded_invalid_override_does_not_churn(
+    monkeypatch, capsys, dbt_project: Path
+) -> None:
+    uploaded: dict = {}
+
+    def fake_active(_creds):
+        if "document" in uploaded:
+            return _active_from_document(uploaded["document"], 11)
+        return {
+            "version": 10,
+            "status": "active",
+            "targetModel": "customer_summary",
+            "sources": [
+                {
+                    "name": "stg_customers",
+                    "changeKey": "customer_id",
+                    "joinRoute": "direct",
+                    "origin": "confirmed",
+                    "confidence": "high",
+                    "mutationPolicy": "targeted_repair",
+                    "deletesRequireBeforeImage": False,
+                    "temporalMode": "none",
+                },
+                {
+                    "name": "stg_orders",
+                    "changeKey": "supply_id",
+                    "joinRoute": "direct",
+                    "origin": "confirmed",
+                    "confidence": "high",
+                    "mutationPolicy": "targeted_repair",
+                    "deletesRequireBeforeImage": True,
+                    "temporalMode": "none",
+                },
+            ],
+        }
+
+    def fake_upload(creds, document):
+        del creds
+        uploaded["document"] = document
+        uploaded["count"] = uploaded.get("count", 0) + 1
+        from frontier.onboard.saas import DraftManifestResult
+
+        return DraftManifestResult(
+            11,
+            "active",
+            "https://example.test/manifests?version=11",
+            generated=True,
+            created=True,
+        )
+
+    monkeypatch.setattr("frontier.onboard.commands.fetch_active_manifest_summary", fake_active)
+    monkeypatch.setattr("frontier.onboard.commands.upload_draft_manifest", fake_upload)
+    monkeypatch.setattr(
+        "frontier.onboard.commands._require_credentials",
+        lambda: StoredCredentials("https://example.test", "frn_testkeyxxxx", "jaffle_shop"),
+    )
+    assert main(["discover", "--yes", "--project-dir", str(dbt_project)]) == 0
+    assert uploaded["count"] == 1
+    capsys.readouterr()
+    assert main(["discover", "--yes", "--project-dir", str(dbt_project)]) == 0
+    out = capsys.readouterr().out
+    assert uploaded["count"] == 1
+    assert "reusing runtime manifest version 11 (active)." in out
+
+
+def test_discover_promotes_generated_over_invalid_active_manifest(
+    monkeypatch, capsys, dbt_project: Path
+) -> None:
+    uploaded: dict = {}
+
+    def fake_active(_creds):
+        return {
+            "version": 10,
+            "status": "active",
+            "targetModel": "customer_summary",
+            "sources": [
+                {
+                    "name": "stg_customers",
+                    "changeKey": "customer_id",
+                    "joinRoute": "direct",
+                    "origin": "confirmed",
+                    "confidence": "high",
+                    "mutationPolicy": "targeted_repair",
+                    "deletesRequireBeforeImage": False,
+                    "temporalMode": "none",
+                },
+                {
+                    "name": "stg_orders",
+                    "changeKey": "supply_id",
+                    "joinRoute": "direct",
+                    "origin": "confirmed",
+                    "confidence": "high",
+                    "mutationPolicy": "targeted_repair",
+                    "deletesRequireBeforeImage": True,
+                    "temporalMode": "none",
+                },
+            ],
+        }
+
+    def fake_upload(creds, document):
+        uploaded["document"] = document
+        uploaded["project"] = creds.project
+        from frontier.onboard.saas import DraftManifestResult
+
+        orders = next(
+            (source for source in document["sources"] if source["name"] == "stg_orders"),
+            None,
+        )
+        assert orders is not None
+        assert orders["origin"] == "derived"
+        assert orders.get("routeStatus") != "INVALID"
+        assert orders.get("changeKey") != "supply_id"
+        return DraftManifestResult(
+            11,
+            "active",
+            "https://example.test/manifests?version=11",
+            generated=True,
+            sql_change_ready=True,
+        )
+
+    monkeypatch.setattr("frontier.onboard.commands.fetch_active_manifest_summary", fake_active)
+    monkeypatch.setattr("frontier.onboard.commands.upload_draft_manifest", fake_upload)
+    monkeypatch.setattr(
+        "frontier.onboard.commands._require_credentials",
+        lambda: StoredCredentials("https://example.test", "frn_testkeyxxxx", "jaffle_shop"),
+    )
+    assert main(["discover", "--yes", "--project-dir", str(dbt_project)]) == 0
+    out = capsys.readouterr().out
+    assert "Runtime manifest version 11 (active)" in out
+    assert "Review in Frontier is optional." in out
+    assert "before CI" not in out
+    assert "Discarded invalid override:" in out
+    assert "stg_orders" in out
+    assert "change key: supply_id" in out
+    assert "route: direct" in out
+    assert "does not exist" in out
+    orders = next(item for item in uploaded["document"]["sources"] if item["name"] == "stg_orders")
+    assert orders["origin"] == "derived"
+    assert orders.get("changeKey") != "supply_id"
+
+    from frontier.onboard.routes import sql_change_required_sources
+
+    required = sql_change_required_sources(
+        uploaded["document"]["sources"],
+        impact_sql=(
+            "select distinct o.customer_id from stg_orders as o "
+            "where (true) is distinct from (o.order_status = 'F')"
+        ),
+        entity_key="customer_id",
+        changed_models=("stg_orders",),
+    )
+    assert required == ()
+
+    from frontier.semantic import PinnedSemanticManifest
+
+    pin_path = dbt_project / "target" / "generated-pin.json"
+    pinned = PinnedSemanticManifest(
+        id="11111111-1111-4111-8111-111111111111",
+        version=11,
+        fingerprint="ab" * 32,
+        project="jaffle_shop",
+        status="active",
+        activated_at="2026-09-09T00:00:00.000Z",
+        target_model_unique_id="model.jaffle_shop.customer_summary",
+        target_model="customer_summary",
+        target_entity_type="customer",
+        entity_key="customer_id",
+        grain="one_row_per_customer",
+        sources=(),
+        source="saas_active",
+    )
+    monkeypatch.setattr(
+        "frontier.cli.fetch_active_manifest",
+        lambda **kwargs: pinned,
+    )
+    monkeypatch.setenv("FRONTIER_API_KEY", "frn_testkeyxxxx")
+    monkeypatch.setenv("FRONTIER_API_URL", "https://example.test")
+    assert main(
+        [
+            "manifest",
+            "fetch",
+            "--project-dir",
+            str(dbt_project),
+            "--output",
+            str(pin_path),
+        ]
+    ) == 0
+    payload = json.loads(pin_path.read_text())
+    assert payload["version"] == 11
+    assert payload["status"] == "active"
 
 
 def test_discover_rewrites_bind_host_review_url(
@@ -495,7 +816,7 @@ def test_runner_version_compatibility() -> None:
     assert version_at_least("0.1.0", "0.1.0")
     assert version_at_least("0.2.0", "0.1.0")
     assert not version_at_least("0.0.9", "0.1.0")
-    assert __version__ == "0.1.2"
+    assert __version__ == "0.1.3"
 
 
 def test_install_error_includes_stable_code() -> None:
@@ -583,7 +904,7 @@ def test_wheel_installs_and_reports_version(tmp_path: Path) -> None:
         env=env,
     )
     version = subprocess.check_output([str(frontier), "--version"], text=True, env=env)
-    assert "0.1.2" in version
+    assert "0.1.3" in version
     names = subprocess.check_output(["python3", "-m", "zipfile", "-l", str(wheels[0])], text=True)
     assert "tests/" not in names
     assert "fixtures/" not in names

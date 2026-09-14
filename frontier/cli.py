@@ -90,6 +90,7 @@ from frontier.proof import (
     recorded_sql_change_proof,
     recommended_sql_change_proof,
     required_sql_change_proof,
+    failed_execution_sql_change_proof,
     resolve_deleted_order,
     sql_change_proof_validation_results,
 )
@@ -116,6 +117,11 @@ from frontier.onboard.commands import (
     maybe_version_notice,
 )
 from frontier.onboard.constants import DEFAULT_API_URL
+from frontier.onboard.routes import (
+    derive_source_route,
+    impact_returns_entity_key,
+    sql_change_required_sources,
+)
 from frontier.local_config import load_local_config
 from frontier.validation import (
     ValidationResult,
@@ -336,10 +342,86 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     ]
     if missing:
         raise ConfigError(f"Configured relations not in the manifest: {', '.join(missing)}")
-    print("\nConfigured relations:")
-    for name, relation in config.relations.items():
-        node = next(node for node in manifest.nodes.values() if node.name == name)
-        print(f"  - {name} ({node.relation}) change_key={relation.change_key} route={relation.route.kind}")
+    print("\nSemantic routes:")
+    print(f"  Target: {config.model.name}")
+    print(f"  Entity: {config.model.entity}")
+    print(f"  Key: {config.model.key}")
+    pinned = getattr(config, "pinned", None)
+    target_node = None
+    try:
+        target_node = manifest.find_model(config.model.name)
+    except Exception:
+        target_node = None
+    source_items = list(pinned.sources) if pinned is not None else []
+    relation_names = list(config.relations)
+    names = [item.name for item in source_items] or relation_names
+    sql_blockers = 0
+    cdc_blockers = 0
+    for name in names:
+        relation = config.relations.get(name)
+        source = next((item for item in source_items if item.name == name), None)
+        status = source.route_status if source else "unknown"
+        change_key = (source.change_key if source else None) or (
+            relation.change_key if relation else ""
+        )
+        node = None
+        try:
+            node = manifest.find_model(name)
+        except Exception:
+            node = None
+        reason = ""
+        if source and source.evidence:
+            reason = source.evidence[0]
+        columns = set(getattr(node, "columns", ()) or ()) if node else set()
+        if node and change_key and columns and change_key not in columns and change_key != "unresolved":
+            status = "INVALID"
+            reason = f"column {change_key} does not exist"
+        if source and source.join_route == "direct" and columns and config.model.key not in columns:
+            status = "INVALID"
+            reason = f"column {config.model.key} does not exist"
+        sql_blocker = bool(source and source.sql_change_blocker)
+        cdc_blocker = bool(source and (source.cdc_blocker or status != "VERIFIED"))
+        if sql_blocker:
+            sql_blockers += 1
+        if cdc_blocker:
+            cdc_blockers += 1
+        print(f"  {name}")
+        print(f"    change key: {change_key or 'unknown'}")
+        print(f"    status: {status}")
+        if reason:
+            print(f"    reason: {reason}")
+        if source and source.evidence and len(source.evidence) > 1:
+            print(f"    evidence: {source.evidence[0]}")
+        derived = None
+        if node is not None and target_node is not None:
+            try:
+                derived = derive_source_route(
+                    manifest,
+                    node,
+                    target_node,
+                    entity_key=config.model.key,
+                )
+            except Exception:
+                derived = None
+        if derived is not None:
+            print(f"    derived key: {derived.change_key}")
+            if derived.route_path:
+                path = " → ".join(f"{hop.model}.{hop.column}" for hop in derived.route_path)
+                print(f"    derived route: {path}")
+            elif derived.join_route and derived.join_route != "direct":
+                print(f"    derived route: {derived.join_route.replace(' -> ', ' → ')}")
+        elif source and source.route_path:
+            path = " → ".join(
+                f"{hop.get('model')}.{hop.get('column')}" if isinstance(hop, dict) else f"{hop.model}.{hop.column}"
+                for hop in source.route_path
+            )
+            print(f"    derived route: {path}")
+        print(f"    SQL-change blocker: {'yes' if sql_blocker else 'no'}")
+        print(f"    CDC blocker when {name} changes: {'yes' if cdc_blocker else 'no'}")
+        if relation is not None:
+            print(f"    route: {relation.route.kind}")
+    print(f"  SQL-change ready: {'yes' if sql_blockers == 0 else 'no'}")
+    print(f"  CDC ready: {'yes' if cdc_blockers == 0 else 'no'}")
     return 0
 
 
@@ -438,8 +520,13 @@ def _stamp_sql_comparison(args: argparse.Namespace, comparison: dict[str, Any] |
         comparison,
         run_mode=_run_mode(args),
         full_rebuild_required=bool(getattr(result, "full_rebuild_required", False)),
-        sql_change_executed=getattr(result, "sql_change_candidate_count", None) is not None,
+        sql_change_executed=getattr(result, "sql_change_candidate_count", None) is not None
+        or getattr(result, "changed_source_row_count", None) is not None,
         impact_attempted=_impact_attempted(result),
+        proof_status=getattr(result, "proof_status", None),
+        failure_phase=getattr(result, "failure_phase", None),
+        failure_code=getattr(result, "failure_code", None),
+        failure_reason=getattr(result, "failure_reason", None),
     )
 
 
@@ -863,6 +950,29 @@ def cmd_prove(args: argparse.Namespace) -> int:
         sql_comparison=sql_comparison,
     )
     impact_unavailable = sql_change_required and not selected_queries
+    if persist and selected_queries:
+        changed_models = [
+            str(row.get("name") or "")
+            for row in ((sql_comparison or {}).get("modified") or [])
+        ]
+        pinned = getattr(config, "pinned", None)
+        required_routes = sql_change_required_sources(
+            pinned.sources if pinned is not None else (),
+            impact_sql=selected_queries[0],
+            entity_key=config.model.key,
+            changed_models=changed_models,
+        )
+        if sql_comparison is not None:
+            sql_comparison = dict(sql_comparison)
+            sql_comparison["requiredRouteIds"] = list(required_routes)
+        if required_routes and not impact_returns_entity_key(
+            selected_queries[0],
+            config.model.key,
+        ):
+            raise ConfigError(
+                "ROUTE_UNRESOLVED: SQL-change requires verified routes for "
+                + ", ".join(required_routes)
+            )
     log_step("targeted SQL generation started")
     started = time.perf_counter()
     if impact_unavailable:
@@ -1125,6 +1235,12 @@ def cmd_prove(args: argparse.Namespace) -> int:
             confirm=not skip_targeted,
             full_rebuild_recommended=rebuild_recommended,
         )
+        if discovered_candidates is not None:
+            result.changed_source_row_count = discovered_source_rows
+            if result.sql_change_candidate_count is None:
+                result.sql_change_candidate_count = discovered_candidates
+            if result.union_candidate_count is None:
+                result.union_candidate_count = discovered_candidates
         if isolated is not None and sql_change_demo:
             for phase in (PHASE_MATERIALIZE, PHASE_TARGET_BASE, PHASE_TARGET_HEAD, PHASE_CONFIRM):
                 if phase in isolated.phase_timings:
@@ -1144,6 +1260,10 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 )
         if persist and impact_unavailable:
             result.full_rebuild_required = True
+            result.proof_status = "FULL_REBUILD_REQUIRED"
+            result.failure_phase = "FULL_REBUILD_REQUIRED"
+            result.failure_code = "IMPACT_SQL_UNAVAILABLE"
+            result.failure_reason = "SQL impact query unavailable"
             reasons = list(result.execution_reasons)
             if not any("unavailable" in reason.lower() for reason in reasons):
                 reasons.append("SQL impact query unavailable")
@@ -1153,7 +1273,11 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 result.full_entity_count,
                 result.full_entity_count,
             )
-        skip_proof_metrics = rebuild_recommended or result.full_rebuild_required
+        skip_proof_metrics = (
+            rebuild_recommended
+            or result.full_rebuild_required
+            or bool(getattr(result, "execution_failed", False))
+        )
         if sql_change_demo:
             if sql_proof is None:
                 if rebuild_recommended:
@@ -1164,6 +1288,27 @@ def cmd_prove(args: argparse.Namespace) -> int:
                         changed_source_row_count=discovered_source_rows or 0,
                     )
                     log_step("SQL-change proof completed", status="skipped:FULL_REBUILD_RECOMMENDED")
+                    result.proof_status = "FULL_REBUILD_RECOMMENDED"
+                elif getattr(result, "execution_failed", False):
+                    log_step("SQL-change proof started")
+                    sql_proof = failed_execution_sql_change_proof(
+                        full_entity_count=result.full_entity_count,
+                        candidate_count=discovered_candidates
+                        or result.union_candidate_count
+                        or 0,
+                        changed_source_row_count=discovered_source_rows or 0,
+                    )
+                    phase = result.failure_phase or "EXECUTION_FAILED"
+                    code = result.failure_code or "EXECUTION_FAILED"
+                    log_step(
+                        "SQL-change proof completed",
+                        status=f"skipped:EXECUTION_FAILED {phase} {code}",
+                    )
+                    result.proof_status = "EXECUTION_FAILED"
+                    print(
+                        f"Execution failed at {phase}: {code}: {result.failure_reason or 'unknown'}",
+                        flush=True,
+                    )
                 elif result.full_rebuild_required:
                     log_step("SQL-change proof started")
                     sql_proof = required_sql_change_proof(
@@ -1362,6 +1507,17 @@ def cmd_prove(args: argparse.Namespace) -> int:
             print(f"Impact compilation: {', '.join(compilations)}")
         if executions:
             print(f"Impact execution: {', '.join(executions)}")
+        if getattr(result, "proof_status", None):
+            print(f"Proof status: {result.proof_status}")
+        if getattr(result, "execution_failed", False) or (
+            getattr(result, "failure_phase", None) and result.proof_status == "EXECUTION_FAILED"
+        ):
+            print(
+                "Execution failure: "
+                f"{result.failure_phase or 'unknown'} "
+                f"{result.failure_code or ''} "
+                f"{result.failure_reason or ''}".strip()
+            )
         print(f"Changed source rows: {_format_measured(None if result.full_rebuild_required else sql_proof.changed_source_row_count)}")
         print(f"Candidate {_pluralize_entity(config.model.entity)}: {sql_proof.candidate_frontier_count}")
         print(f"Event-derived candidates: {result.event_candidate_count or 0}")
@@ -1849,7 +2005,10 @@ def build_parser() -> argparse.ArgumentParser:
     auth_status = auth_sub.add_parser("status", help="Show whether the CLI is authenticated")
     auth_status.set_defaults(func=cmd_auth_status)
 
-    discover = sub.add_parser("discover", help="Infer a draft semantic manifest from dbt artifacts")
+    discover = sub.add_parser(
+        "discover",
+        help="Derive and upload a generated semantic configuration from dbt artifacts",
+    )
     _add_project_dir(discover)
     discover.add_argument("--yes", action="store_true", help="Select the first suggested model")
     discover.add_argument(
@@ -1900,7 +2059,7 @@ def build_parser() -> argparse.ArgumentParser:
     update_check.add_argument("--api-url", help="SaaS origin")
     update_check.set_defaults(func=cmd_update_check)
 
-    inspect = sub.add_parser("inspect", help="Read dbt artifacts and print model lineage")
+    inspect = sub.add_parser("inspect", help="Validate the runtime mapping and print route evidence")
     _add_project_dir(inspect)
     inspect.add_argument("--config", help="Path to legacy frontier.yml (required only with --allow-local-manifest)")
     _add_manifest_flags(inspect)

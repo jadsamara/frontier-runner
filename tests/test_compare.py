@@ -432,3 +432,27 @@ def test_stamp_impact_execution_separates_compiler_from_warehouse() -> None:
     assert failed["modified"][0]["impactExecution"] == "FAILED"
     assert "targetedValidation" not in failed
 
+    executed_then_failed = stamp_impact_execution(
+        {
+            "modified": [
+                {
+                    "name": "orders",
+                    "impactStatus": "COMPILED",
+                    "changeKinds": ["FILTER_CHANGED"],
+                }
+            ]
+        },
+        run_mode="live",
+        full_rebuild_required=False,
+        sql_change_executed=True,
+        impact_attempted=True,
+        proof_status="EXECUTION_FAILED",
+        failure_phase="CANDIDATES_EXECUTED",
+        failure_code="ProgrammingError",
+        failure_reason="warehouse error",
+    )
+    assert executed_then_failed is not None
+    assert executed_then_failed["modified"][0]["impactExecution"] == "EXECUTED"
+    assert executed_then_failed["proofStatus"] == "EXECUTION_FAILED"
+    assert executed_then_failed["failurePhase"] == "CANDIDATES_EXECUTED"
+
