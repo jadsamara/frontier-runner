@@ -778,6 +778,64 @@ def test_workflow_generation_validates_yaml_and_separates_secrets() -> None:
     assert "SNOWFLAKE_PASSWORD" not in upload
 
 
+def test_bigquery_workflow_uses_wif_and_omits_snowflake() -> None:
+    text = render_workflow(
+        runner_version="0.1.0",
+        profile_name="jaffle_shop",
+        warehouse_type="bigquery",
+        project="acme-analytics",
+        dataset="dbt_ci",
+        location="EU",
+    )
+    loaded = validate_workflow_yaml(text)
+    assert loaded["name"] == "Frontier"
+    assert loaded["permissions"]["id-token"] == "write"
+    assert "google-github-actions/auth@v2" in text
+    assert "GCP_WORKLOAD_IDENTITY_PROVIDER" in text
+    assert "dbt-bigquery" in text
+    assert "frontier-runner[bigquery]==0.1.0" in text
+    assert "SNOWFLAKE_PASSWORD" not in text
+    assert "SNOWFLAKE_ACCOUNT" not in text
+    assert "type: bigquery" in text
+    assert "CDC is not available for BigQuery" in text
+    assert api_and_snowflake_secrets_separated(text)
+    prove = text.split("- name: Generate impact assessment", 1)[1]
+    assert "FRONTIER_API_KEY" not in prove.split("- name: Upload assessment", 1)[0]
+    upload = text.split("- name: Upload assessment", 1)[1]
+    assert "BIGQUERY_PROJECT" not in upload
+    assert "GCP_SERVICE_ACCOUNT" not in upload
+    assert "private_key" not in text
+    assert "super-secret" not in text
+
+
+def test_redshift_workflow_omits_snowflake_and_separates_secrets() -> None:
+    text = render_workflow(
+        runner_version="0.1.0",
+        profile_name="jaffle_shop",
+        warehouse_type="redshift",
+        database="analytics",
+        schema="dbt_ci",
+    )
+    loaded = validate_workflow_yaml(text)
+    assert loaded["name"] == "Frontier"
+    assert "dbt-redshift" in text
+    assert "frontier-runner[redshift]==0.1.0" in text
+    assert "type: redshift" in text
+    assert "CDC is not available for Redshift" in text
+    assert "SNOWFLAKE_PASSWORD" not in text
+    assert "SNOWFLAKE_ACCOUNT" not in text
+    assert "dbt-bigquery" not in text
+    assert "BIGQUERY_PROJECT" not in text
+    assert api_and_snowflake_secrets_separated(text)
+    prove = text.split("- name: Generate impact assessment", 1)[1]
+    assert "FRONTIER_API_KEY" not in prove.split("- name: Upload assessment", 1)[0]
+    upload = text.split("- name: Upload assessment", 1)[1]
+    assert "REDSHIFT_PASSWORD" not in upload
+    assert "REDSHIFT_HOST" not in upload
+    assert "super-secret" not in text
+    assert "AWS_SECRET_ACCESS_KEY" not in text
+
+
 def test_setup_github_writes_workflow(tmp_path: Path, capsys, monkeypatch) -> None:
     import shutil
 
@@ -863,7 +921,10 @@ def test_package_metadata_excludes_saas_and_fixtures() -> None:
     pyproject = (root / "pyproject.toml").read_text()
     assert 'name = "frontier-runner"' in pyproject
     assert "snowflake" in pyproject
-    assert "bigquery" not in pyproject
+    assert "bigquery = [" in pyproject
+    assert "google-cloud-bigquery" in pyproject
+    assert "redshift = [" in pyproject
+    assert "redshift-connector" in pyproject
     assert (root / "LICENSE").is_file()
     assert (root / "CHANGELOG.md").is_file()
     publish = (root / ".github" / "workflows" / "publish.yml").read_text()

@@ -1,6 +1,97 @@
 from __future__ import annotations
 
 
+def bigquery_permission_guidance(
+    *,
+    project: str,
+    dataset: str,
+    location: str = "US",
+    work_dataset: str | None = None,
+) -> str:
+    project = project.strip() or "my-gcp-project"
+    dataset = dataset.strip() or "dbt_dev"
+    work = (work_dataset or dataset).strip() or dataset
+    return "\n".join(
+        [
+            "# Least-privilege BigQuery IAM for Frontier PR assessments.",
+            "# Do not grant roles/bigquery.admin. Do not write to production marts.",
+            "# Authenticate GitHub Actions with Workload Identity Federation.",
+            "# Do not commit a service-account JSON key. CDC is not available for BigQuery.",
+            "",
+            f"# Project: {project}",
+            f"# Model dataset (read): {dataset}",
+            f"# Isolated work dataset (create/drop FRONTIER_* tables): {work}",
+            f"# Location: {location}",
+            "",
+            "gcloud projects add-iam-policy-binding "
+            f"{project} \\",
+            '  --member="serviceAccount:frontier-pr-assessor@'
+            f'{project}.iam.gserviceaccount.com" \\',
+            '  --role="roles/bigquery.jobUser"',
+            "",
+            "# Grant dataViewer on source and model datasets, and dataEditor only on the",
+            "# non-production work dataset used for isolated FRONTIER_* key tables.",
+            f"bq update --source /dev/stdin {project}:{dataset} <<'EOF'",
+            "{",
+            '  "access": [',
+            "    {",
+            '      "role": "READER",',
+            f'      "userByEmail": "frontier-pr-assessor@{project}.iam.gserviceaccount.com"',
+            "    }",
+            "  ]",
+            "}",
+            "EOF",
+            "",
+            "# Intentionally omitted: write access to production mart datasets.",
+            "# Isolated tables are named FRONTIER_<run_id>_AFFECTED_KEYS and must not be shared across PRs.",
+            "",
+        ]
+    )
+
+
+def redshift_permission_sql(
+    *,
+    database: str,
+    schema: str,
+    user: str = "frontier_pr_assessor",
+    work_schema: str | None = None,
+) -> str:
+    database = database.strip() or "dev"
+    schema = schema.strip() or "dbt_ci"
+    work = (work_schema or schema).strip() or schema
+    return "\n".join(
+        [
+            "-- Least-privilege Redshift grants for Frontier PR assessments.",
+            "-- Do not grant superuser. Do not write to production marts.",
+            "-- Keep host, password, and AWS tokens in the customer environment / GitHub secrets.",
+            "-- CDC is not available for Redshift.",
+            "",
+            f"-- Database: {database}",
+            f"-- Model schema (read): {schema}",
+            f"-- Isolated work schema (create/drop FRONTIER_* tables): {work}",
+            f"-- User: {user}",
+            "",
+            f"GRANT USAGE ON SCHEMA {schema} TO {user};",
+            f"GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {user};",
+            f"GRANT SELECT ON ALL VIEWS IN SCHEMA {schema} TO {user};",
+            "",
+            "-- Temporary Frontier key tables (not production marts).",
+            f"CREATE SCHEMA IF NOT EXISTS {work};",
+            f"GRANT USAGE, CREATE ON SCHEMA {work} TO {user};",
+            f"GRANT SELECT, INSERT, UPDATE, DELETE, DROP ON ALL TABLES IN SCHEMA {work} TO {user};",
+            "",
+            "-- Optional query history (own STL rows). Without SYSLOG ACCESS UNRESTRICTED,",
+            "-- scan metrics are marked unavailable rather than invented.",
+            f"-- ALTER USER {user} SYSLOG ACCESS RESTRICTED;",
+            "",
+            f"-- Intentionally omitted: INSERT/UPDATE/DELETE on {schema}",
+            "-- (production or shared marts). The PR-assessment user is read-only there.",
+            "-- Isolated tables are named FRONTIER_<run_id>_AFFECTED_KEYS and must not be shared across PRs.",
+            "",
+        ]
+    )
+
+
 def snowflake_permission_sql(
     *,
     database: str,

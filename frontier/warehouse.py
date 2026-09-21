@@ -193,7 +193,11 @@ class FakeWarehouse:
 
     def _synthetic_origin_keys(self) -> list[tuple[Any, ...]]:
         create = next(
-            (item for item in reversed(self.executed) if item.lower().lstrip().startswith("create or replace table")),
+            (
+                item
+                for item in reversed(self.executed)
+                if item.lower().lstrip().startswith(("create or replace table", "create table "))
+            ),
             "",
         )
         keys: list[tuple[Any, ...]] = []
@@ -240,12 +244,14 @@ class FakeWarehouse:
             return {
                 "query_id": query_id,
                 "bytes_scanned": 1_000,
+                "total_bytes_processed": 1_000,
                 "partitions_scanned": 1,
                 "rows_produced": 3,
             }
         return {
             "query_id": query_id,
             "bytes_scanned": 1_000_000,
+            "total_bytes_processed": 1_000_000,
             "partitions_scanned": 80,
             "rows_produced": 150_000,
         }

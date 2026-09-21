@@ -1,20 +1,32 @@
 # Frontier Runner
 
-Customer-side CLI for dbt + Snowflake + GitHub impact assessments.
+Customer-side CLI for dbt + Snowflake or BigQuery + GitHub impact assessments.
 
 The runner executes next to the dbt project. It sends metadata and aggregate
 evidence to Frontier SaaS. Warehouse rows and warehouse credentials stay here.
 
-Supported stack: **dbt Core or dbt Fusion**, **Snowflake**, **GitHub**, and
-hosted Frontier SaaS. Other warehouses and Git providers are not available in
-this installer.
+Supported stack: **dbt Core or dbt Fusion**, **Snowflake** or **BigQuery**,
+**GitHub**, and hosted Frontier SaaS. CDC remains Snowflake Streams only.
+Redshift and other Git providers are not a supported customer path in this
+installer.
 
 ## Install
+
+Snowflake:
 
 ```bash
 pipx install "frontier-runner[snowflake]"
 # or
 python3 -m pip install "frontier-runner[snowflake]"
+frontier --version
+```
+
+BigQuery:
+
+```bash
+pipx install "frontier-runner[bigquery]"
+# or
+python3 -m pip install "frontier-runner[bigquery]"
 frontier --version
 ```
 
@@ -25,6 +37,8 @@ tag. You do not need a commit SHA:
 pipx install \ "frontier-runner[snowflake] @ https://github.com/jadsamara/frontier-runner/releases/download/v0.1.3/frontier_runner-0.1.3-py3-none-any.whl"
 pipx inject frontier-runner "snowflake-connector-python>=3.12,<4"
 ```
+
+For BigQuery, use the `[bigquery]` extra and inject `google-cloud-bigquery>=3.25,<4`.
 
 ## First assessment (under 15 minutes)
 
@@ -60,8 +74,9 @@ python3 -m pip install -e ".[dev,snowflake]"
 `python3 -m frontier` always works after an editable install.
 
 `frontier run` reads `~/.dbt/profiles.yml` (and warehouse env vars such as
-`SNOWFLAKE_*`). This installer supports Snowflake. Use `--dry-run` to exercise
-the CLI without a warehouse.
+`SNOWFLAKE_*` or `BIGQUERY_*`). This installer supports Snowflake and
+BigQuery SQL-change assessments. Use `--dry-run` to exercise the CLI without
+a warehouse.
 
 Entity IDs in `frontier-run.json` are HMAC-SHA-256 hashed with
 `FRONTIER_ENTITY_HASH_KEY` unless `--include-entity-ids` is set. The key is
@@ -74,7 +89,7 @@ When `--base-manifest` shows modified, added, or removed SQL, the default
 `seeds/change_events.csv` is ignored: the assessment is the compiled SQL
 diff, not a hand-edited event list. Isolated affected keys are written to
 `DBT_CI.FRONTIER_<run_id>_AFFECTED_KEYS` with separate event and
-SQL-change origins. The M14 impact query runs in Snowflake and is unioned
+SQL-change origins. The M14 impact query runs in the project warehouse and is unioned
 for execution. Targeted SQL pushes the key join into source CTEs before
 aggregates. Hand-written `frontier_affected_customers` / repaired models
 are not required for a SQL-change proof. Impact compilation skips models
@@ -114,7 +129,7 @@ processing is not part of this installer.
 
 `frontier compare` reads compiled SQL from the base-branch and PR manifests
 (and `target/compiled` / `target-base/compiled` when `compiled_code` is
-missing), classifies semantic changes with a restricted Snowflake parser
+missing), classifies semantic changes with a restricted warehouse SQL parser
 (sqlglot), and compiles supported diffs into a candidate-key impact query.
 Alias and formatting changes are ignored. Grain changes, unknown UDFs, empty
 compiled SQL, and other unsupported SQL return `FULL_REBUILD_REQUIRED`
@@ -150,6 +165,8 @@ Pin an immutable released version:
 
 ```bash
 pip install "frontier-runner[snowflake]==0.1.3"
+# or
+pip install "frontier-runner[bigquery]==0.1.3"
 ```
 
 Until PyPI trusted publishing is reviewed and live, install the GitHub Release

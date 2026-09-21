@@ -13,7 +13,7 @@ from frontier.impact import (
     FULL_REBUILD_REQUIRED,
     compile_impact_query,
 )
-from frontier.sql_fingerprint import sql_dialect, sql_fingerprint
+from frontier.sql_fingerprint import sql_dialect, sql_fingerprint, using_sql_dialect
 from frontier.snowflake_sql import (
     classify_sql_change,
     describe_sql_change,
@@ -214,7 +214,35 @@ def compare_manifests(
     confirmed_keys: Iterable[str] | None = None,
     target_name: str | None = None,
 ) -> SqlComparison:
-    dialect = sql_dialect(pr.adapter_type or base.adapter_type)
+    dialect = sql_dialect(pr.adapter_type or base.adapter_type) or "snowflake"
+    with using_sql_dialect(dialect):
+        return _compare_manifests(
+            base,
+            pr,
+            dialect=dialect,
+            base_compiled_root=base_compiled_root,
+            pr_compiled_root=pr_compiled_root,
+            base_commit_sha=base_commit_sha,
+            pr_commit_sha=pr_commit_sha,
+            entity_key=entity_key,
+            confirmed_keys=confirmed_keys,
+            target_name=target_name,
+        )
+
+
+def _compare_manifests(
+    base: Manifest,
+    pr: Manifest,
+    *,
+    dialect: str,
+    base_compiled_root: Path | None,
+    pr_compiled_root: Path | None,
+    base_commit_sha: str | None,
+    pr_commit_sha: str | None,
+    entity_key: str | None,
+    confirmed_keys: Iterable[str] | None,
+    target_name: str | None,
+) -> SqlComparison:
     base_models = base.models()
     pr_models = pr.models()
     base_prints = {
@@ -270,7 +298,7 @@ def compare_manifests(
             continue
         base_sql = compiled_sql_for(base_models[unique_id], base_compiled_root) or ""
         pr_sql = compiled_sql_for(node, pr_compiled_root) or ""
-        classification = classify_sql_change(base_sql, pr_sql)
+        classification = classify_sql_change(base_sql, pr_sql, dialect=dialect)
         if not classification.kinds:
             continue
         compile_impact = is_sql_change_impact_model(
@@ -285,6 +313,7 @@ def compare_manifests(
                 entity_key=entity_key or "",
                 confirmed_keys=confirmed_keys or (),
                 classification=classification,
+                dialect=dialect,
             )
             if compile_impact
             else None

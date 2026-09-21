@@ -93,6 +93,34 @@ def test_passed_comment_matches_acceptance_shape() -> None:
     assert "Direct customer key" not in body
 
 
+def test_comment_names_bigquery_and_does_not_claim_cdc() -> None:
+    body = format_pr_comment(
+        {
+            **PASSED_PAYLOAD,
+            "warehouse": {"type": "bigquery", "database": "acme-analytics", "schema": "dbt_ci"},
+        },
+        run_url="https://frontier.example/runs/11111111-1111-4111-8111-111111111111",
+    )
+    assert "Warehouse: BigQuery" in body
+    assert "CDC: unavailable" in body
+    assert "370" not in body
+    assert "super-secret" not in body
+
+
+def test_comment_names_redshift_and_does_not_claim_cdc() -> None:
+    body = format_pr_comment(
+        {
+            **PASSED_PAYLOAD,
+            "warehouse": {"type": "redshift", "database": "analytics", "schema": "dbt_ci"},
+        },
+        run_url="https://frontier.example/runs/11111111-1111-4111-8111-111111111111",
+    )
+    assert "Warehouse: Redshift" in body
+    assert "CDC: unavailable" in body
+    assert "370" not in body
+    assert "super-secret" not in body
+
+
 def test_comment_explains_sql_change_without_entity_ids() -> None:
     body = format_pr_comment(
         {

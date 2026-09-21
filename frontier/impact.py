@@ -24,7 +24,7 @@ from frontier.snowflake_sql import (
     SqlChangeClassification,
     classify_sql_change,
 )
-from frontier.sql_fingerprint import sql_fingerprint
+from frontier.sql_fingerprint import active_sql_dialect, sql_fingerprint, using_sql_dialect
 from frontier.warehouse import WarehouseAdapter
 
 COMPILED = "COMPILED"
@@ -172,11 +172,11 @@ def _rebuild(*reasons: str, entity_key: str = "") -> ImpactCompileResult:
     )
 
 
-def _render(node: exp.Expression | None) -> str:
+def _render(node: exp.Expression | None, dialect: str | None = None) -> str:
     if node is None:
         return ""
     return node.sql(
-        dialect=DIALECT,
+        dialect=dialect or active_sql_dialect(),
         comments=False,
         pretty=False,
         normalize=True,
@@ -234,12 +234,13 @@ class _ParsedQuery:
     cte_order: tuple[str, ...]
 
 
-def _parse_query(sql: str) -> tuple[_ParsedQuery | None, tuple[str, ...]]:
+def _parse_query(sql: str, *, dialect: str | None = None) -> tuple[_ParsedQuery | None, tuple[str, ...]]:
     text = (sql or "").strip()
     if not text:
         return None, ("empty SQL",)
+    dialect_name = dialect or active_sql_dialect()
     try:
-        statements = sqlglot.parse(text, dialect=DIALECT)
+        statements = sqlglot.parse(text, dialect=dialect_name)
     except SqlglotError as error:
         return None, (f"parse error: {error}",)
     expressions = [item for item in statements if item is not None]
@@ -745,12 +746,34 @@ def compile_impact_query(
     entity_key: str,
     confirmed_keys: Iterable[str] = (),
     classification: SqlChangeClassification | None = None,
+    dialect: str | None = None,
 ) -> ImpactCompileResult:
-    """Compile old/new Snowflake SQL into a candidate-key query.
+    """Compile old/new warehouse SQL into a candidate-key query.
 
     Generated SQL comes only from sqlglot AST nodes. Unsupported changes
     return FULL_REBUILD_REQUIRED and never an empty candidate tuple.
     """
+    dialect_name = dialect or active_sql_dialect()
+    with using_sql_dialect(dialect_name):
+        return _compile_impact_query(
+            base_sql,
+            pr_sql,
+            entity_key=entity_key,
+            confirmed_keys=confirmed_keys,
+            classification=classification,
+            dialect=dialect_name,
+        )
+
+
+def _compile_impact_query(
+    base_sql: str,
+    pr_sql: str,
+    *,
+    entity_key: str,
+    confirmed_keys: Iterable[str],
+    classification: SqlChangeClassification | None,
+    dialect: str,
+) -> ImpactCompileResult:
     if not entity_key or not _IDENT.fullmatch(entity_key):
         return _rebuild("entity key is not a confirmed identifier", entity_key=entity_key or "")
     confirmed = frozenset(
@@ -761,7 +784,7 @@ def compile_impact_query(
     if entity_key.lower() not in confirmed:
         return _rebuild("entity key is not a confirmed identifier", entity_key=entity_key)
 
-    change = classification or classify_sql_change(base_sql, pr_sql)
+    change = classification or classify_sql_change(base_sql, pr_sql, dialect=dialect)
     if not change.kinds:
         return ImpactCompileResult(
             status=COMPILED,
@@ -774,8 +797,8 @@ def compile_impact_query(
             candidate_set_state=CANDIDATE_SET_EMPTY,
         )
 
-    base_q, base_err = _parse_query(base_sql)
-    pr_q, pr_err = _parse_query(pr_sql)
+    base_q, base_err = _parse_query(base_sql, dialect=dialect)
+    pr_q, pr_err = _parse_query(pr_sql, dialect=dialect)
     rebuild_reasons: list[str] = []
     rebuild_reasons.extend(base_err)
     rebuild_reasons.extend(pr_err)
@@ -882,7 +905,7 @@ def compile_impact_query(
         candidate_sql=candidate_sql,
         parameterized_sql=parameterized_sql,
         parameters=params,
-        query_fingerprint=sql_fingerprint(candidate_sql, dialect=DIALECT),
+        query_fingerprint=sql_fingerprint(candidate_sql, dialect=dialect),
         candidate_set_state=CANDIDATE_SET_NOT_EVALUATED,
     )
 
@@ -917,7 +940,7 @@ def discovery_counts_sql(
                 strip_distinct(node.expression)
 
     strip_distinct(tree)
-    inner = _render(tree)
+    inner = _render(tree, dialect=dialect)
     sql = (
         "select count(*) as changed_source_row_count, "
         f"count(distinct {entity_key}) as sql_change_candidate_count "
@@ -963,7 +986,7 @@ def source_row_count_sql(candidate_sql: str, *, dialect: str = DIALECT) -> str:
                 strip_distinct(node.expression)
 
     strip_distinct(tree)
-    inner = _render(tree)
+    inner = _render(tree, dialect=dialect)
     return (
         "select count(*) as changed_source_row_count "
         f"from ({inner}) as frontier_changed_source_rows"

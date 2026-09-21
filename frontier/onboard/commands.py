@@ -36,14 +36,21 @@ from frontier.onboard.discover import ModelSuggestion, suggest_models
 from frontier.onboard.doctor import doctor_failed, doctor_json, format_doctor, run_doctor
 from frontier.onboard.gitignore import ensure_gitignore
 from frontier.onboard.github import (
+    BIGQUERY_SECRETS,
+    REDSHIFT_SECRETS,
     SNOWFLAKE_SECRETS,
+    SQL_CHANGE_ADAPTERS,
     render_workflow,
     validate_workflow_yaml,
     workflow_path,
     write_workflow,
 )
 from frontier.onboard.hashkey import generate_entity_hash_key, hash_key_prefix
-from frontier.onboard.permissions import snowflake_permission_sql
+from frontier.onboard.permissions import (
+    bigquery_permission_guidance,
+    redshift_permission_sql,
+    snowflake_permission_sql,
+)
 from frontier.onboard.prompt import prompt_choice, prompt_text, prompt_yes_no
 from frontier.onboard.saas import (
     DraftManifestResult,
@@ -425,7 +432,11 @@ def cmd_discover(args: Any) -> int:
         print("Discarded invalid override:")
         _print_source_route(source, derived=generated_by_name.get(source.name))
     print(f"Ready for SQL-change assessments: {'yes' if sql_ready else 'no'}")
-    print(f"Ready for all CDC sources: {'yes' if cdc_ready else 'no'}")
+    adapter_type = (manifest.adapter_type or "").lower()
+    if adapter_type in {"bigquery", "redshift"}:
+        print(f"Ready for all CDC sources: unavailable ({adapter_type})")
+    else:
+        print(f"Ready for all CDC sources: {'yes' if cdc_ready else 'no'}")
     status = result.status
     if not result.created:
         print(
@@ -528,16 +539,32 @@ def cmd_setup_github(args: Any) -> int:
             print(f"Kept existing {path}")
             return 0
     database, warehouse, schema = "DEV", "COMPUTE_WH", "DBT_CI"
+    project = "my-gcp-project"
+    dataset = "dbt_ci"
+    location = "US"
+    adapter = (detection.adapter_type or "snowflake").strip().lower() or "snowflake"
     try:
         output = load_dbt_profile_output(
             project_dir,
             target=local.dbt_target if local else None,
         )
-        database = str(output.get("database") or database)
+        adapter = str(output.get("type") or adapter).strip().lower() or adapter
+        database = str(output.get("dbname") or output.get("database") or database)
         warehouse = str(output.get("warehouse") or warehouse)
         schema = str(output.get("schema") or schema)
+        project = str(output.get("project") or output.get("database") or project)
+        dataset = str(output.get("dataset") or output.get("schema") or dataset)
+        location = str(output.get("location") or location)
     except Exception:
         pass
+    if adapter not in SQL_CHANGE_ADAPTERS:
+        raise InstallError(
+            "WAREHOUSE_UNSUPPORTED",
+            f"GitHub setup for '{adapter}' is not available.",
+            cause="This runner generates SQL-change workflows for Snowflake, BigQuery, and Redshift.",
+            next_action="Use a dbt Snowflake, BigQuery, or Redshift profile, then retry `frontier setup github`.",
+            docs_path="/docs/github",
+        )
     text = render_workflow(
         runner_version=current_runner_version(),
         profile_name=detection.profile_name or detection.dbt_project_name or "dbt_project",
@@ -546,11 +573,19 @@ def cmd_setup_github(args: Any) -> int:
         warehouse=warehouse,
         schema=schema,
         blocking=blocking,
+        warehouse_type=adapter,
+        project=project,
+        dataset=dataset,
+        location=location,
     )
     write_workflow(path, text, force=True)
     validate_workflow_yaml(path.read_text())
     print(f"Workflow created: {path}")
     print("Commit this file and open a test PR.")
+    extra = adapter if adapter in {"bigquery", "redshift"} else "snowflake"
+    print(f'Customer install: pipx install "frontier-runner[{extra}]"')
+    if adapter in {"bigquery", "redshift"}:
+        print(f"CDC is not available for {adapter}.")
 
     generate_key = prompt_yes_no(
         "Generate a FRONTIER_ENTITY_HASH_KEY now?",
@@ -577,18 +612,46 @@ def cmd_setup_github(args: Any) -> int:
         if hash_key:
             _set_github_secret("FRONTIER_ENTITY_HASH_KEY", hash_key)
         snowflake_present = all(name in existing for name in SNOWFLAKE_SECRETS)
+        bigquery_present = all(name in existing for name in BIGQUERY_SECRETS)
+        redshift_present = all(name in existing for name in REDSHIFT_SECRETS)
         replace = True
-        if snowflake_present:
+        if adapter == "snowflake" and snowflake_present:
             replace = prompt_yes_no(
                 "Snowflake secrets already exist. Replace them?",
                 default=False,
                 assume_yes=False,
             )
-        if replace and not snowflake_present:
+        if adapter == "bigquery" and bigquery_present:
+            replace = prompt_yes_no(
+                "Google Cloud secrets already exist. Replace them?",
+                default=False,
+                assume_yes=False,
+            )
+        if adapter == "redshift" and redshift_present:
+            replace = prompt_yes_no(
+                "Redshift secrets already exist. Replace them?",
+                default=False,
+                assume_yes=False,
+            )
+        if replace and adapter == "snowflake" and not snowflake_present:
             print(
                 "Set SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, and SNOWFLAKE_PASSWORD "
                 "in GitHub Actions (values are not printed).",
             )
+        if replace and adapter == "bigquery" and not bigquery_present:
+            print(
+                "Set GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT, and "
+                "BIGQUERY_PROJECT in GitHub Actions (values are not printed).",
+            )
+            print('Install locally with: pipx install "frontier-runner[bigquery]"')
+            print("CDC is not available for BigQuery.")
+        if replace and adapter == "redshift" and not redshift_present:
+            print(
+                "Set REDSHIFT_HOST, REDSHIFT_USER, and REDSHIFT_PASSWORD "
+                "in GitHub Actions (values are not printed).",
+            )
+            print('Install locally with: pipx install "frontier-runner[redshift]"')
+            print("CDC is not available for Redshift.")
         print("GitHub secrets updated (values not printed).")
     elif hash_key and prompt_yes_no(
         "Copy the entity hash key to the clipboard?",
@@ -712,16 +775,58 @@ def cmd_permissions(args: Any) -> int:
     project_dir = Path(getattr(args, "project_dir_opt", None) or args.project_dir or ".").expanduser().resolve()
     local = load_local_config(project_dir)
     database, schema, warehouse = "DEV", "DBT_DEV", "COMPUTE_WH"
+    project, dataset, location = "my-gcp-project", "dbt_dev", "US"
+    adapter = "snowflake"
     try:
         output = load_dbt_profile_output(
             project_dir,
             target=local.dbt_target if local else None,
         )
-        database = str(output.get("database") or database)
+        adapter = str(output.get("type") or adapter).strip().lower() or adapter
+        database = str(output.get("dbname") or output.get("database") or database)
         schema = str(output.get("schema") or schema)
         warehouse = str(output.get("warehouse") or warehouse)
+        project = str(output.get("project") or output.get("database") or project)
+        dataset = str(output.get("dataset") or output.get("schema") or dataset)
+        location = str(output.get("location") or location)
     except Exception:
         pass
+    requested = getattr(args, "setup_command", None) or adapter
+    if requested == "bigquery" or adapter == "bigquery":
+        if bool(getattr(args, "cdc", False)):
+            raise InstallError(
+                "CDC_UNAVAILABLE",
+                "CDC is not available for BigQuery.",
+                cause="Frontier CDC requires Snowflake Streams.",
+                next_action="Use a Snowflake project for CDC, or omit --cdc.",
+                docs_path="/docs/cdc",
+            )
+        print(
+            bigquery_permission_guidance(
+                project=project,
+                dataset=dataset,
+                location=location,
+            ),
+            end="",
+        )
+        return 0
+    if requested == "redshift" or adapter == "redshift":
+        if bool(getattr(args, "cdc", False)):
+            raise InstallError(
+                "CDC_UNAVAILABLE",
+                "CDC is not available for Redshift.",
+                cause="Frontier CDC requires Snowflake Streams.",
+                next_action="Use a Snowflake project for CDC, or omit --cdc.",
+                docs_path="/docs/cdc",
+            )
+        print(
+            redshift_permission_sql(
+                database=database,
+                schema=schema,
+            ),
+            end="",
+        )
+        return 0
     print(
         snowflake_permission_sql(
             database=database,

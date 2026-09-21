@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
+from collections.abc import Iterator
 
 import sqlglot
 from sqlglot.errors import SqlglotError
@@ -15,12 +18,27 @@ _DIALECTS = {
 }
 
 _WHITESPACE = re.compile(r"\s+")
+_ACTIVE_SQL_DIALECT: ContextVar[str] = ContextVar("frontier_sql_dialect", default="snowflake")
 
 
 def sql_dialect(adapter_type: str | None) -> str | None:
     if not adapter_type:
         return None
     return _DIALECTS.get(adapter_type.strip().lower())
+
+
+def active_sql_dialect() -> str:
+    return _ACTIVE_SQL_DIALECT.get()
+
+
+@contextmanager
+def using_sql_dialect(dialect: str | None) -> Iterator[str]:
+    value = (dialect or "snowflake").strip().lower() or "snowflake"
+    token = _ACTIVE_SQL_DIALECT.set(value)
+    try:
+        yield value
+    finally:
+        _ACTIVE_SQL_DIALECT.reset(token)
 
 
 def _strip_comments_and_whitespace(sql: str) -> str:

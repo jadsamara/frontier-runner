@@ -22,6 +22,9 @@ from frontier.onboard.saas import (
 from frontier.onboard.versions import version_at_least
 from frontier.warehouse import connect_warehouse, load_dbt_profile_output
 
+SQL_CHANGE_ADAPTERS = frozenset({"snowflake", "bigquery", "redshift"})
+CDC_UNAVAILABLE_ADAPTERS = frozenset({"bigquery", "redshift"})
+
 ConnectFn = Callable[..., Any]
 
 
@@ -54,7 +57,7 @@ def _workflow_path(detection: ProjectDetection) -> Path | None:
 def _workflow_runner_version(text: str) -> str | None:
     import re
 
-    match = re.search(r"frontier-runner(?:\[snowflake\])?==([0-9]+\.[0-9]+\.[0-9]+)", text)
+    match = re.search(r"frontier-runner(?:\[(?:snowflake|bigquery|redshift)\])?==([0-9]+\.[0-9]+\.[0-9]+)", text)
     if match:
         return match.group(1)
     match = re.search(r"frontier_runner-([0-9]+\.[0-9]+\.[0-9]+)-py3-none-any", text)
@@ -282,55 +285,81 @@ def run_doctor(
             next_action=None if sql_ok else "Run `frontier discover` after `dbt compile`.",
         )
     )
-    checks.append(
-        DoctorCheck(
-            id="cdc_ready",
-            label="CDC readiness",
-            ok=cdc_ok,
-            required=False,
-            skipped=not active_ok,
-            warn=active_ok and not cdc_ok,
-            detail=(
-                "all source routes verified"
-                if cdc_ok
-                else f"{unresolved_routes} of {total_routes} source routes unresolved"
-            ),
-            next_action=None
-            if cdc_ok
-            else "Unresolved CDC sources fail closed only when those sources change.",
+    adapter = (detection.adapter_type or "").strip().lower()
+    if adapter in CDC_UNAVAILABLE_ADAPTERS:
+        checks.append(
+            DoctorCheck(
+                id="cdc_ready",
+                label="CDC readiness",
+                ok=True,
+                required=False,
+                skipped=True,
+                detail=f"CDC is not available for {adapter}",
+            )
         )
-    )
-
-    snowflake_profile = detection.adapter_type == "snowflake" if detection.adapter_type else False
-    if detection.adapter_type is None and detection.profiles_yml is None:
-        snowflake_profile = False
-    elif detection.adapter_type is None and detection.profile_name:
-        snowflake_profile = False
     else:
-        snowflake_profile = detection.adapter_type in {None, "snowflake"} and bool(detection.targets)
+        checks.append(
+            DoctorCheck(
+                id="cdc_ready",
+                label="CDC readiness",
+                ok=cdc_ok,
+                required=False,
+                skipped=not active_ok,
+                warn=active_ok and not cdc_ok,
+                detail=(
+                    "all source routes verified"
+                    if cdc_ok
+                    else f"{unresolved_routes} of {total_routes} source routes unresolved"
+                ),
+                next_action=None
+                if cdc_ok
+                else "Unresolved CDC sources fail closed only when those sources change.",
+            )
+        )
+
+    if adapter == "snowflake":
+        profile_id, profile_label = "snowflake_profile", "Snowflake profile"
+        conn_id, conn_label = "snowflake_connection", "Snowflake connection"
+        profile_next = "Add a Snowflake output to profiles.yml."
+        conn_next = "Confirm Snowflake credentials in profiles.yml."
+    elif adapter == "bigquery":
+        profile_id, profile_label = "bigquery_profile", "BigQuery profile"
+        conn_id, conn_label = "bigquery_connection", "BigQuery connection"
+        profile_next = "Add a BigQuery output to profiles.yml."
+        conn_next = "Confirm Application Default Credentials or BIGQUERY_PROJECT."
+    elif adapter == "redshift":
+        profile_id, profile_label = "redshift_profile", "Redshift profile"
+        conn_id, conn_label = "redshift_connection", "Redshift connection"
+        profile_next = "Add a Redshift output to profiles.yml."
+        conn_next = "Confirm REDSHIFT_HOST, REDSHIFT_USER, and REDSHIFT_PASSWORD or IAM."
+    else:
+        profile_id, profile_label = "warehouse_profile", "Warehouse profile"
+        conn_id, conn_label = "warehouse_connection", "Warehouse connection"
+        profile_next = "Add a Snowflake, BigQuery, or Redshift output to profiles.yml."
+        conn_next = "Confirm warehouse credentials in profiles.yml."
     checks.append(
         DoctorCheck(
-            id="snowflake_profile",
-            label="Snowflake profile",
-            ok=bool(detection.adapter_type == "snowflake"),
+            id=profile_id,
+            label=profile_label,
+            ok=adapter in SQL_CHANGE_ADAPTERS,
             required=True,
             detail=detection.adapter_type or "no profile",
-            next_action=None
-            if detection.adapter_type == "snowflake"
-            else "Add a Snowflake output to profiles.yml.",
+            next_action=None if adapter in SQL_CHANGE_ADAPTERS else profile_next,
         )
     )
 
     connected = False
     schema = None
-    if not skip_warehouse and detection.adapter_type == "snowflake":
+    if not skip_warehouse and adapter in SQL_CHANGE_ADAPTERS:
         try:
             output = load_dbt_profile_output(project_dir, target=local.dbt_target if local else None)
-            schema = str(output.get("schema") or "")
+            schema = str(output.get("dataset") or output.get("schema") or "")
             warehouse = connect(project_dir, target=local.dbt_target if local else None)
             try:
                 if hasattr(warehouse, "scalar"):
                     warehouse.scalar("select 1")
+                else:
+                    warehouse.execute("select 1")
                 connected = True
             finally:
                 close = getattr(warehouse, "close", None)
@@ -340,14 +369,14 @@ def run_doctor(
             connected = False
             schema = schema or str(error)
     elif skip_warehouse:
-        connected = detection.adapter_type == "snowflake"
+        connected = adapter in SQL_CHANGE_ADAPTERS
     checks.append(
         DoctorCheck(
-            id="snowflake_connection",
-            label="Snowflake connection",
+            id=conn_id,
+            label=conn_label,
             ok=connected,
             required=True,
-            next_action=None if connected else "Confirm Snowflake credentials in profiles.yml.",
+            next_action=None if connected else conn_next,
         )
     )
     prod = schema_looks_like_production(schema)

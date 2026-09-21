@@ -7,6 +7,8 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.errors import SqlglotError
 
+from frontier.sql_fingerprint import active_sql_dialect, using_sql_dialect
+
 DIALECT = "snowflake"
 
 FILTER_CHANGED = "FILTER_CHANGED"
@@ -117,7 +119,7 @@ def _canonical(node: exp.Expression | None) -> str:
     if node is None:
         return ""
     return node.sql(
-        dialect=DIALECT,
+        dialect=active_sql_dialect(),
         comments=False,
         pretty=False,
         normalize=True,
@@ -295,7 +297,13 @@ def _merge_irs(parts: list[NormalizedSelect]) -> NormalizedSelect:
     )
 
 
-def parse_snowflake_sql(sql: str) -> SnowflakeParseResult:
+def parse_snowflake_sql(sql: str, *, dialect: str | None = None) -> SnowflakeParseResult:
+    dialect_name = dialect or active_sql_dialect()
+    with using_sql_dialect(dialect_name):
+        return _parse_warehouse_sql(sql, dialect=dialect_name)
+
+
+def _parse_warehouse_sql(sql: str, *, dialect: str) -> SnowflakeParseResult:
     text = (sql or "").strip()
     if not text:
         return SnowflakeParseResult(
@@ -304,7 +312,7 @@ def parse_snowflake_sql(sql: str) -> SnowflakeParseResult:
             unsupported=("empty SQL",),
         )
     try:
-        statements = sqlglot.parse(text, dialect=DIALECT)
+        statements = sqlglot.parse(text, dialect=dialect)
     except SqlglotError as error:
         return SnowflakeParseResult(
             ok=False,
@@ -352,9 +360,25 @@ def parse_snowflake_sql(sql: str) -> SnowflakeParseResult:
     return SnowflakeParseResult(ok=True, ir=_merge_irs(parts), unsupported=())
 
 
-def classify_sql_change(base_sql: str, pr_sql: str) -> SqlChangeClassification:
-    base = parse_snowflake_sql(base_sql)
-    pr = parse_snowflake_sql(pr_sql)
+def classify_sql_change(
+    base_sql: str,
+    pr_sql: str,
+    *,
+    dialect: str | None = None,
+) -> SqlChangeClassification:
+    dialect_name = dialect or active_sql_dialect()
+    with using_sql_dialect(dialect_name):
+        return _classify_sql_change(base_sql, pr_sql, dialect=dialect_name)
+
+
+def _classify_sql_change(
+    base_sql: str,
+    pr_sql: str,
+    *,
+    dialect: str,
+) -> SqlChangeClassification:
+    base = parse_snowflake_sql(base_sql, dialect=dialect)
+    pr = parse_snowflake_sql(pr_sql, dialect=dialect)
     if not base.ok or not pr.ok:
         reasons = tuple(
             dict.fromkeys(

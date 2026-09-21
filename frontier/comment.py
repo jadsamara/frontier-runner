@@ -57,6 +57,18 @@ def _failed_checks(results: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _warehouse_label(warehouse_type: str) -> str:
+    mapping = {
+        "snowflake": "Snowflake",
+        "bigquery": "BigQuery",
+        "databricks": "Databricks SQL",
+        "postgres": "PostgreSQL",
+        "redshift": "Redshift",
+    }
+    kind = (warehouse_type or "").strip().lower()
+    return mapping.get(kind, warehouse_type or "unknown")
+
+
 def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
     """Aggregate-only PR comment. Never include entity IDs or warehouse values."""
     status = str(payload.get("status") or "failed").upper()
@@ -110,6 +122,12 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
         "",
         f"Model: {model_name}",
     ]
+    warehouse = payload.get("warehouse") or {}
+    warehouse_type = str(warehouse.get("type") or "").strip()
+    if warehouse_type:
+        lines.append(f"Warehouse: {_warehouse_label(warehouse_type)}")
+        if warehouse_type.lower() in {"bigquery", "redshift"}:
+            lines.append("CDC: unavailable")
     if run_mode == "fixture":
         lines.append("Demo fixture — not executed against a live warehouse")
     elif run_mode == "live":

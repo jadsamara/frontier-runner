@@ -22,6 +22,8 @@ _DEFAULT_SCHEMA = "DBT_CI"
 _TABLE_PREFIX = "FRONTIER_"
 _AFFECTED_SUFFIX = "AFFECTED_KEYS"
 _SNOWFLAKE_NAME_LIMIT = 255
+_SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SAFE_PROJECT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 ORIGIN_EVENT = "event"
 ORIGIN_SQL_CHANGE = "sql_change"
@@ -140,7 +142,12 @@ def isolated_table_name(run_id: str, suffix: str = _AFFECTED_SUFFIX) -> str:
     return f"{_TABLE_PREFIX}{token}_{suffix_token}"
 
 
-def isolated_location(*, model_database: str | None, model_schema: str | None) -> tuple[str, str]:
+def isolated_location(
+    *,
+    model_database: str | None,
+    model_schema: str | None,
+    dialect: str = "snowflake",
+) -> tuple[str, str]:
     database = (
         os.environ.get("FRONTIER_WAREHOUSE_DATABASE") or model_database or ""
     ).strip()
@@ -149,36 +156,79 @@ def isolated_location(*, model_database: str | None, model_schema: str | None) -
     ).strip()
     if not database:
         raise ConfigError("Frontier isolated execution requires a warehouse database")
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", database):
+    if not _safe_location_part(database, dialect=dialect, role="project"):
         raise ConfigError("warehouse database is not a safe identifier")
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
+    if not _safe_location_part(schema, dialect=dialect, role="dataset"):
         raise ConfigError("warehouse schema is not a safe identifier")
     assert_not_prod(database=database, schema=schema)
     assert_not_prod(database=model_database, schema=model_schema)
     return database, schema
 
 
-def qualify_relation(database: str, schema: str, table: str) -> str:
+def _safe_location_part(value: str, *, dialect: str, role: str) -> bool:
+    if dialect == "bigquery" and role == "project":
+        return bool(_SAFE_PROJECT.fullmatch(value))
+    return bool(_SAFE_IDENT.fullmatch(value))
+
+
+def qualify_relation(
+    database: str,
+    schema: str,
+    table: str,
+    *,
+    dialect: str = "snowflake",
+) -> str:
+    if dialect == "bigquery":
+        if not _SAFE_PROJECT.fullmatch(database):
+            raise ConfigError(f"unsafe warehouse identifier: {database}")
+        if not _SAFE_IDENT.fullmatch(schema):
+            raise ConfigError(f"unsafe warehouse identifier: {schema}")
+        if not _SAFE_IDENT.fullmatch(table):
+            raise ConfigError(f"unsafe warehouse identifier: {table}")
+        return f"`{database}`.`{schema}`.`{table}`"
     for part in (database, schema, table):
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part):
+        if not _SAFE_IDENT.fullmatch(part):
             raise ConfigError(f"unsafe warehouse identifier: {part}")
     return f"{database}.{schema}.{table}"
 
 
-def affected_keys_relation(run_id: str, *, database: str, schema: str) -> str:
-    return qualify_relation(database, schema, isolated_table_name(run_id, _AFFECTED_SUFFIX))
+def affected_keys_relation(
+    run_id: str,
+    *,
+    database: str,
+    schema: str,
+    dialect: str = "snowflake",
+) -> str:
+    return qualify_relation(
+        database,
+        schema,
+        isolated_table_name(run_id, _AFFECTED_SUFFIX),
+        dialect=dialect,
+    )
 
 
 def targeted_phase_relation(keys_relation: str, phase: str) -> str:
     """Warehouse table for targeted base or head output (not used in discovery)."""
     suffix = "TARGET_BASE" if phase == "base" else "TARGET_HEAD"
     relation = (keys_relation or "").strip()
-    if relation.upper().endswith("AFFECTED_KEYS"):
-        return relation[: -len("AFFECTED_KEYS")] + suffix
+    quote = ""
+    body = relation
+    if body.startswith("`") and body.endswith("`"):
+        quote = "`"
+        body = body[:-1]
+    elif body.startswith('"') and body.endswith('"'):
+        quote = '"'
+        body = body[:-1]
+    if body.upper().endswith("AFFECTED_KEYS"):
+        return f"{body[: -len('AFFECTED_KEYS')]}{suffix}{quote}"
     return f"{relation}_{suffix}"
 
 
-def create_schema_sql(database: str, schema: str) -> str:
+def create_schema_sql(database: str, schema: str, *, dialect: str = "snowflake") -> str:
+    if dialect == "bigquery":
+        return f"create schema if not exists `{database}.{schema}`"
+    if dialect == "redshift":
+        return f"create schema if not exists {schema}"
     return f"create schema if not exists {database}.{schema}"
 
 
@@ -211,8 +261,7 @@ def sql_change_keys_select_sql(entity_key: str, impact_sql: str) -> str:
     )
 
 
-def create_affected_keys_sql(
-    relation: str,
+def affected_keys_select_sql(
     entity_key: str,
     values: Iterable[str] = (),
     *,
@@ -229,10 +278,25 @@ def create_affected_keys_sql(
         raise ConfigError("no candidate keys to materialize")
     inner = " union all ".join(f"({part})" for part in parts)
     return (
-        f"create or replace table {relation} as "
         f"select distinct {entity_key}, origin from ({inner}) as frontier_union_keys "
         f"where {entity_key} is not null"
     )
+
+
+def create_affected_keys_sql(
+    relation: str,
+    entity_key: str,
+    values: Iterable[str] = (),
+    *,
+    sql_change_queries: Iterable[str] = (),
+    dialect: str = "snowflake",
+) -> str:
+    select_sql = affected_keys_select_sql(
+        entity_key,
+        values,
+        sql_change_queries=sql_change_queries,
+    )
+    return create_table_as_sql(relation, select_sql, dialect=dialect)
 
 
 def origin_count_sql(relation: str, entity_key: str) -> str:
@@ -262,11 +326,13 @@ def drop_relation_sql(relation: str) -> str:
     return f"drop table if exists {relation}"
 
 
-def create_table_as_sql(relation: str, select_sql: str) -> str:
+def create_table_as_sql(relation: str, select_sql: str, *, dialect: str = "snowflake") -> str:
     query = (select_sql or "").strip().rstrip(";")
     if not query:
         raise ConfigError("empty SQL for isolated table")
     assert_not_prod(relation=relation)
+    if dialect == "redshift":
+        return f"create table {relation} as {query}"
     return f"create or replace table {relation} as {query}"
 
 
@@ -366,7 +432,13 @@ def _qualify_entity_key_against_keys_join(select: exp.Select, entity_key: str) -
     qualify_root(select.args.get("having"))
 
 
-def _inject_keys_join(select: exp.Select, entity_key: str, affected_relation: str) -> bool:
+def _inject_keys_join(
+    select: exp.Select,
+    entity_key: str,
+    affected_relation: str,
+    *,
+    dialect: str = "snowflake",
+) -> bool:
     if any(_is_keys_join(join) for join in (select.args.get("joins") or [])):
         _qualify_entity_key_against_keys_join(select, entity_key)
         return True
@@ -374,7 +446,11 @@ def _inject_keys_join(select: exp.Select, entity_key: str, affected_relation: st
         return False
     alias = _from_table_alias(select)
     key_col = exp.column(entity_key, table=alias) if alias else exp.column(entity_key)
-    keys_table = exp.alias_(exp.to_table(affected_relation), "frontier_keys", table=True)
+    keys_table = exp.alias_(
+        exp.to_table(affected_relation, dialect=dialect),
+        "frontier_keys",
+        table=True,
+    )
     join = exp.Join(
         this=keys_table,
         kind="INNER",
@@ -411,7 +487,12 @@ def restriction_is_pushed(sql: str, *, entity_key: str, dialect: str = "snowflak
 
 def profile_shows_reduction(full: dict[str, Any], targeted: dict[str, Any]) -> bool:
     """True when the targeted profile scanned or produced strictly less than the full plan."""
-    for key in ("bytes_scanned", "partitions_scanned", "rows_produced"):
+    for key in (
+        "bytes_scanned",
+        "total_bytes_processed",
+        "partitions_scanned",
+        "rows_produced",
+    ):
         full_value = full.get(key)
         targeted_value = targeted.get(key)
         if isinstance(full_value, (int, float)) and isinstance(targeted_value, (int, float)):
@@ -522,9 +603,14 @@ def generate_targeted_sql(
     if with_ is not None:
         for cte in with_.expressions or []:
             body = cte.this
-            if isinstance(body, exp.Select) and _inject_keys_join(body, entity_key, affected_relation):
+            if isinstance(body, exp.Select) and _inject_keys_join(
+                body,
+                entity_key,
+                affected_relation,
+                dialect=dialect,
+            ):
                 injected += 1
-    if _inject_keys_join(outer, entity_key, affected_relation):
+    if _inject_keys_join(outer, entity_key, affected_relation, dialect=dialect):
         injected += 1
     if injected == 0:
         raise ConfigError("cannot push affected-key restriction")
@@ -610,6 +696,43 @@ class IsolatedRun:
     targeted_head_relation: str | None = None
     confirmed_count: int | None = None
     phase_timings: dict[str, int] = field(default_factory=dict)
+    job_metrics: list[dict[str, Any]] = field(default_factory=list)
+
+    def _record_job(self, phase: str) -> dict[str, Any] | None:
+        query_id = getattr(self.warehouse, "last_query_id", None)
+        profile: dict[str, Any] = {}
+        getter = getattr(self.warehouse, "get_query_profile", None)
+        if callable(getter) and query_id:
+            try:
+                profile = dict(getter(str(query_id)) or {})
+            except Exception:
+                profile = {}
+        if not query_id and not profile:
+            return None
+        record = {
+            "phase": phase,
+            "query_id": str(query_id) if query_id else profile.get("query_id") or profile.get("job_id"),
+            "elapsed_ms": (
+                profile["elapsed_ms"]
+                if profile.get("elapsed_ms") is not None
+                else self.phase_timings.get(phase)
+            ),
+            "bytes_scanned": profile.get("bytes_scanned"),
+            "total_bytes_processed": profile.get("total_bytes_processed"),
+            "total_bytes_billed": profile.get("total_bytes_billed"),
+            "slot_millis": profile.get("slot_millis"),
+            "location": profile.get("location"),
+        }
+        if "status" in profile:
+            record["status"] = profile.get("status")
+        if "queue_ms" in profile:
+            record["queue_ms"] = profile.get("queue_ms")
+        if "execution_ms" in profile:
+            record["execution_ms"] = profile.get("execution_ms")
+        if "metrics_available" in profile:
+            record["metrics_available"] = profile.get("metrics_available")
+        self.job_metrics.append(record)
+        return record
 
     def __enter__(self) -> IsolatedRun:
         return self
@@ -625,21 +748,29 @@ class IsolatedRun:
     ) -> IsolatedExecution:
         assert_not_prod(database=self.database, schema=self.schema, relation=self.relation)
         try:
-            self.warehouse.execute(create_schema_sql(self.database, self.schema))
+            self.warehouse.execute(create_schema_sql(self.database, self.schema, dialect=self.warehouse.dialect))
         except Exception as error:
             detail = str(error)
-            if "42501" not in detail and "insufficient privileges" not in detail.lower():
+            lowered = detail.lower()
+            if (
+                "42501" not in detail
+                and "insufficient privileges" not in lowered
+                and "access denied" not in lowered
+                and "permission denied" not in lowered
+                and "already exists" not in lowered
+            ):
                 raise
         sql = create_affected_keys_sql(
             self.relation,
             self.entity_key,
             values,
             sql_change_queries=sql_change_queries,
+            dialect=self.warehouse.dialect,
         )
         log_step("candidate materialization started")
         started = time.perf_counter()
         try:
-            self.warehouse.execute(sql)
+            self._replace_relation(self.relation, sql)
         except Exception as error:
             self.phase_timings["candidate materialization"] = elapsed_ms(started)
             log_step(
@@ -656,6 +787,7 @@ class IsolatedRun:
         )
         self._created.append(self.relation)
         query_id = getattr(self.warehouse, "last_query_id", None)
+        self._record_job("candidate materialization")
         event_values = [str(value).strip() for value in values if str(value).strip()]
         origin_keys: tuple[tuple[str, str], ...] = ()
         if event_values:
@@ -722,7 +854,10 @@ class IsolatedRun:
         log_step("targeted base execution started")
         started = time.perf_counter()
         try:
-            self.warehouse.execute(create_table_as_sql(base_relation, targeted_before))
+            self._replace_relation(
+                base_relation,
+                create_table_as_sql(base_relation, targeted_before, dialect=dialect_name),
+            )
         except Exception as error:
             duration = elapsed_ms(started)
             self.phase_timings["targeted base execution"] = duration
@@ -735,6 +870,7 @@ class IsolatedRun:
         self._created.append(base_relation)
         self.targeted_base_relation = base_relation
         self.phase_timings["targeted base execution"] = elapsed_ms(started)
+        self._record_job("targeted base execution")
         log_step(
             "targeted base execution completed",
             duration_ms=self.phase_timings["targeted base execution"],
@@ -743,7 +879,10 @@ class IsolatedRun:
         log_step("targeted head execution started")
         started = time.perf_counter()
         try:
-            self.warehouse.execute(create_table_as_sql(head_relation, targeted_after))
+            self._replace_relation(
+                head_relation,
+                create_table_as_sql(head_relation, targeted_after, dialect=dialect_name),
+            )
         except Exception as error:
             duration = elapsed_ms(started)
             self.phase_timings["targeted head execution"] = duration
@@ -756,6 +895,7 @@ class IsolatedRun:
         self._created.append(head_relation)
         self.targeted_head_relation = head_relation
         self.phase_timings["targeted head execution"] = elapsed_ms(started)
+        self._record_job("targeted head execution")
         log_step(
             "targeted head execution completed",
             duration_ms=self.phase_timings["targeted head execution"],
@@ -794,7 +934,21 @@ class IsolatedRun:
             status="ok",
         )
         self.last_targeted_query_id = getattr(self.warehouse, "last_query_id", None)
+        self._record_job("confirmation")
         return ()
+
+    def _replace_relation(self, relation: str, create_sql: str) -> None:
+        """Materialize an isolated table without colliding with a concurrent PR.
+
+        Redshift has no CREATE OR REPLACE TABLE for this path, so drop first.
+        Drop failures are ignored when the table does not exist yet.
+        """
+        if self.warehouse.dialect == "redshift":
+            try:
+                self.warehouse.execute(drop_relation_sql(relation))
+            except Exception:
+                pass
+        self.warehouse.execute(create_sql)
 
     def cleanup(self) -> None:
         if self._cleaned:
@@ -804,10 +958,13 @@ class IsolatedRun:
         try:
             relations = list(dict.fromkeys([*self._created, self.relation]))
             for relation in reversed(relations):
-                try:
-                    self.warehouse.execute(drop_relation_sql(relation))
-                except Exception:
-                    continue
+                for attempt in range(3):
+                    try:
+                        self.warehouse.execute(drop_relation_sql(relation))
+                        break
+                    except Exception:
+                        if attempt < 2:
+                            time.sleep(0.05 * (attempt + 1))
             self._cleaned = True
         except Exception as error:
             log_step(
@@ -833,8 +990,14 @@ def open_isolated_run(
     database, schema = isolated_location(
         model_database=model_database,
         model_schema=model_schema,
+        dialect=warehouse.dialect,
     )
-    relation = affected_keys_relation(run_id, database=database, schema=schema)
+    relation = affected_keys_relation(
+        run_id,
+        database=database,
+        schema=schema,
+        dialect=warehouse.dialect,
+    )
     return IsolatedRun(
         warehouse=warehouse,
         relation=relation,

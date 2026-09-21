@@ -1,1 +1,1 @@
-"""Onboarding helpers for a dbt + Snowflake + GitHub install."""
+"""Onboarding helpers for a dbt + Snowflake or BigQuery + GitHub install."""

@@ -1,12 +1,12 @@
 [project]
 name = "frontier-runner"
-version = "0.1.3"
-description = "Customer-side Frontier CLI for dbt + Snowflake + GitHub impact assessments."
+version = "0.2.0"
+description = "Customer-side Frontier CLI for dbt + Snowflake or BigQuery + GitHub impact assessments."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11,<3.14"
 authors = [{ name = "Frontier" }]
-keywords = ["dbt", "snowflake", "github", "data"]
+keywords = ["dbt", "snowflake", "bigquery", "github", "data"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Environment :: Console",
@@ -26,6 +26,8 @@ dependencies = [
 
 [project.optional-dependencies]
 snowflake = ["snowflake-connector-python>=3.12,<4"]
+bigquery = ["google-cloud-bigquery>=3.25,<4"]
+redshift = ["redshift-connector>=2.1.5,<3"]
 dev = ["pytest>=8.0,<9", "build>=1.2,<2"]
 
 [project.urls]

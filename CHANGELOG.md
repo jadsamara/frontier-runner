@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Generated semantic mappings are runtime-ready for SQL-change assessments
   when discovered routes verify. Review in Frontier is optional.
+- BigQuery SQL-change assessments: install `frontier-runner[bigquery]`,
+  authenticate with Workload Identity Federation in GitHub Actions, and run
+  the same inspect/compare/prove path. CDC is not available for BigQuery.
 
 ### Fixed
 

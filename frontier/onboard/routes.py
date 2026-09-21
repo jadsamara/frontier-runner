@@ -13,6 +13,7 @@ from frontier.onboard.discover import (
     _is_candidate_mart,
     _source_models,
 )
+from frontier.sql_fingerprint import active_sql_dialect
 
 _ID_SUFFIX = "_id"
 
@@ -78,7 +79,7 @@ def _columns_from_sql(sql: str) -> tuple[str, ...]:
     except ImportError:
         return ()
     try:
-        parsed = sqlglot.parse_one(sql, dialect="snowflake")
+        parsed = sqlglot.parse_one(sql, dialect=active_sql_dialect())
     except Exception:
         return ()
     if parsed is None:
@@ -668,7 +669,7 @@ def impact_returns_entity_key(sql: str | None, entity_key: str) -> bool:
     except ImportError:
         return entity_key.lower() in sql.lower()
     try:
-        parsed = sqlglot.parse_one(sql, dialect="snowflake")
+        parsed = sqlglot.parse_one(sql, dialect=active_sql_dialect())
     except Exception:
         return entity_key.lower() in sql.lower()
     if parsed is None:

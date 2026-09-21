@@ -117,6 +117,10 @@ def test_snowflake_adapter_reads_query_profile_from_history() -> None:
     assert "information_schema.query_history()" in text
     assert SnowflakeAdapter().last_query_id is None
     assert SnowflakeAdapter().get_query_profile("") == {}
+    assert BigQueryAdapter().last_query_id is None
+    assert BigQueryAdapter().get_query_profile("") == {}
+    assert RedshiftAdapter().last_query_id is None
+    assert RedshiftAdapter().get_query_profile("") == {}
 
 
 def test_snowflake_connect_kwargs_include_bounded_timeouts() -> None:

@@ -143,6 +143,55 @@ PHASE_CONFIRM = "confirmation"
 PHASE_UPLOAD = "upload"
 
 
+def _print_job_metrics(isolated: Any | None, warehouse: Any) -> None:
+    records = list(getattr(isolated, "job_metrics", None) or [])
+    if not records:
+        query_id = getattr(warehouse, "last_query_id", None)
+        if query_id:
+            records = [{"phase": "warehouse", "query_id": query_id}]
+    for record in records:
+        job_id = record.get("query_id") or record.get("job_id")
+        phase = record.get("phase") or "job"
+        if job_id:
+            print(f"{phase} job: {job_id}", flush=True)
+        status = record.get("status")
+        if status:
+            print(f"{phase} status: {status}", flush=True)
+        elapsed = record.get("elapsed_ms")
+        if elapsed is not None:
+            print(f"{phase} elapsed: {elapsed} ms", flush=True)
+        queue_ms = record.get("queue_ms")
+        if queue_ms is not None:
+            print(f"{phase} queue: {queue_ms} ms", flush=True)
+        elif "queue_ms" in record:
+            print(f"{phase} queue: unavailable", flush=True)
+        execution_ms = record.get("execution_ms")
+        if execution_ms is not None:
+            print(f"{phase} execution: {execution_ms} ms", flush=True)
+        elif "execution_ms" in record:
+            print(f"{phase} execution: unavailable", flush=True)
+        bytes_processed = record.get("total_bytes_processed")
+        if bytes_processed is None:
+            bytes_processed = record.get("bytes_scanned")
+        if bytes_processed is not None:
+            print(
+                f"{phase} bytes processed: {bytes_processed} "
+                "(warehouse processing metric, not candidate count or cost savings)",
+                flush=True,
+            )
+        elif record.get("metrics_available") is False:
+            print(f"{phase} scan metrics: unavailable", flush=True)
+
+
+def _assert_cdc_supported(warehouse: Any) -> None:
+    kind = str(getattr(warehouse, "warehouse_type", "") or "")
+    if kind != "snowflake":
+        label = kind or "this warehouse"
+        raise ConfigError(
+            f"CDC is not available for {label}. Frontier CDC requires Snowflake Streams.",
+        )
+
+
 def _pluralize_entity(entity: str) -> str:
     token = (entity or "entity").strip() or "entity"
     if token.endswith("s"):
@@ -421,7 +470,11 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         if relation is not None:
             print(f"    route: {relation.route.kind}")
     print(f"  SQL-change ready: {'yes' if sql_blockers == 0 else 'no'}")
-    print(f"  CDC ready: {'yes' if cdc_blockers == 0 else 'no'}")
+    adapter = (manifest.adapter_type or "").lower()
+    if adapter in {"bigquery", "redshift"}:
+        print(f"  CDC ready: unavailable ({adapter})")
+    else:
+        print(f"  CDC ready: {'yes' if cdc_blockers == 0 else 'no'}")
     return 0
 
 
@@ -867,8 +920,14 @@ def _generate_targeted_sql_pair(
     database, schema = isolated_location(
         model_database=model_database,
         model_schema=model_schema,
+        dialect=dialect,
     )
-    relation = affected_keys_relation(run_id, database=database, schema=schema)
+    relation = affected_keys_relation(
+        run_id,
+        database=database,
+        schema=schema,
+        dialect=dialect,
+    )
     generate_targeted_sql(
         before_sql,
         entity_key=entity_key,
@@ -991,6 +1050,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 run_id=run_id,
                 model_database=model.database,
                 model_schema=model.schema,
+                dialect=warehouse.dialect,
             )
         except Exception as error:
             log_step(
@@ -1407,6 +1467,8 @@ def cmd_prove(args: argparse.Namespace) -> int:
         elif not dry_run:
             log_step("cleanup started")
             log_step("cleanup completed", status="skipped")
+        if not dry_run:
+            _print_job_metrics(isolated, warehouse)
         warehouse.close()
 
     sql_comparison = _stamp_sql_comparison(
@@ -1792,6 +1854,7 @@ def cmd_cdc_status(args: argparse.Namespace) -> int:
         profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
         target=getattr(args, "target", None),
     )
+    _assert_cdc_supported(warehouse)
     try:
         store = SnowflakeCdcStore(warehouse, config)
         log_step("status started", prefix="cdc")
@@ -1813,6 +1876,7 @@ def cmd_cdc_consume(args: argparse.Namespace) -> int:
         profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
         target=getattr(args, "target", None),
     )
+    _assert_cdc_supported(warehouse)
     started = time.perf_counter()
     log_step("consume started", prefix="cdc")
     try:
@@ -1858,6 +1922,7 @@ def cmd_cdc_prove(args: argparse.Namespace) -> int:
         profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
         target=getattr(args, "target", None),
     )
+    _assert_cdc_supported(warehouse)
     started = time.perf_counter()
     log_step("prove started", prefix="cdc")
     try:
@@ -1924,6 +1989,7 @@ def cmd_cdc_upload(args: argparse.Namespace) -> int:
         profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
         target=getattr(args, "target", None),
     )
+    _assert_cdc_supported(warehouse)
     creds = resolve_api_credential()
     api_key, api_key_source = creds.api_key, creds.source
     api_url = _api_url(args, frontier_config, creds)
@@ -2022,10 +2088,10 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="Diagnose the local Frontier installation")
     _add_project_dir(doctor)
     doctor.add_argument("--json", action="store_true", help="Print redacted JSON for support")
-    doctor.add_argument("--skip-warehouse", action="store_true", help="Skip the live Snowflake ping")
+    doctor.add_argument("--skip-warehouse", action="store_true", help="Skip the live warehouse ping")
     doctor.set_defaults(func=cmd_doctor)
 
-    setup = sub.add_parser("setup", help="Generate GitHub, hash-key, or Snowflake permission files")
+    setup = sub.add_parser("setup", help="Generate GitHub, hash-key, or warehouse permission files")
     setup_sub = setup.add_subparsers(dest="setup_command", required=True)
     setup_github = setup_sub.add_parser("github", help="Write .github/workflows/frontier.yml")
     _add_project_dir(setup_github)
@@ -2047,6 +2113,12 @@ def build_parser() -> argparse.ArgumentParser:
     setup_snowflake.add_argument("--cdc", action="store_true", help="Include CDC stream grants")
     setup_snowflake.add_argument("--query-history", action="store_true", help="Include query history grants")
     setup_snowflake.set_defaults(func=cmd_permissions)
+    setup_bigquery = setup_sub.add_parser("bigquery", help="Print least-privilege BigQuery IAM guidance")
+    _add_project_dir(setup_bigquery)
+    setup_bigquery.set_defaults(func=cmd_permissions)
+    setup_redshift = setup_sub.add_parser("redshift", help="Print least-privilege Redshift grants")
+    _add_project_dir(setup_redshift)
+    setup_redshift.set_defaults(func=cmd_permissions)
 
     demo = sub.add_parser("demo", help="First-test PR instructions")
     demo_sub = demo.add_subparsers(dest="demo_command", required=True)
