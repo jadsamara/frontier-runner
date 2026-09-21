@@ -874,7 +874,7 @@ def test_runner_version_compatibility() -> None:
     assert version_at_least("0.1.0", "0.1.0")
     assert version_at_least("0.2.0", "0.1.0")
     assert not version_at_least("0.0.9", "0.1.0")
-    assert __version__ == "0.1.3"
+    assert __version__ == "0.2.0"
 
 
 def test_install_error_includes_stable_code() -> None:
@@ -965,7 +965,7 @@ def test_wheel_installs_and_reports_version(tmp_path: Path) -> None:
         env=env,
     )
     version = subprocess.check_output([str(frontier), "--version"], text=True, env=env)
-    assert "0.1.3" in version
+    assert "0.2.0" in version
     names = subprocess.check_output(["python3", "-m", "zipfile", "-l", str(wheels[0])], text=True)
     assert "tests/" not in names
     assert "fixtures/" not in names
