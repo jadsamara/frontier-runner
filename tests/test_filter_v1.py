@@ -528,6 +528,10 @@ def test_compare_exposes_eligibility_without_uploading_sql() -> None:
     assert comparison["modified"][0]["changeKinds"] == ["FILTER_CHANGED"]
     report = format_compare_report(comparison)
     assert "filter-v1 static eligibility: eligible" in report
+    assert "candidate SQL compiled" in report
+    assert "Narrow frontier safe: yes" not in report
+    assert "certification: pending warehouse execution" in report
+    assert "narrow frontier decision: not yet established" in report
     ingested = comparison_for_ingest(comparison)
     dumped = json.dumps(ingested)
     assert "where status" not in dumped.lower()

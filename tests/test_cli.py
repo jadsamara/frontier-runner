@@ -472,6 +472,90 @@ def test_prove_failure_overwrites_stale_run_file(dbt_project: Path, monkeypatch,
     assert stamp == "fresh-failed-001"
 
 
+def test_prove_failure_writes_artifact_without_hash_key(dbt_project: Path, monkeypatch, capsys) -> None:
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    base_path = _write_sql_change_manifests(dbt_project)
+    run_file = dbt_project / "target" / "frontier-run.json"
+    run_file.write_text(
+        json.dumps(
+            {
+                "externalRunId": "v15-success",
+                "runMode": "live",
+                "status": "passed",
+                "sqlComparison": {"certification": {"status": "SQL_CERTIFIED"}},
+            }
+        )
+    )
+
+    class ImpactFailWarehouse(FakeWarehouse):
+        def execute(self, sql: str):
+            self.last_query_id = "01c73fa8-3204-9404-0008-2c320009f2e2"
+            raise RuntimeError("SQL compilation error: invalid identifier 'CUSTOMER_NAME'")
+
+    monkeypatch.setattr(
+        "frontier.cli.connect_warehouse",
+        lambda *args, **kwargs: ImpactFailWarehouse(),
+    )
+    monkeypatch.setattr(
+        "frontier.cli.load_dbt_profile_output",
+        lambda *args, **kwargs: {"database": "DATA_AGENT_DEV", "schema": "DBT_DEV"},
+    )
+    code = main(
+        [
+            "prove",
+            "--project-dir",
+            str(dbt_project),
+            "--run-id",
+            "fresh-failed-impact-001",
+            "--base-manifest",
+            str(base_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "Could not write failed assessment" not in captured.out
+    assert "Could not write failed assessment" not in captured.err
+    assert "CUSTOMER_NAME" in captured.err or "CUSTOMER_NAME" in captured.out
+    payload = json.loads(run_file.read_text())
+    assert payload["externalRunId"] == "fresh-failed-impact-001"
+    assert payload["externalRunId"] != "v15-success"
+    assert payload["status"] == "failed"
+    metrics = payload["metrics"]
+    assert metrics.get("fullEntityCount") is None
+    assert metrics.get("frontierEntityCount") is None
+    assert metrics.get("percentRowsAvoided") is None
+    assert 1 not in {metrics.get("fullEntityCount"), metrics.get("frontierEntityCount")}
+    assert metrics.get("sqlChangeCandidateCount") is None
+    assert metrics.get("confirmedFrontierCount") is None
+    assert metrics.get("missedEntityCount") is None
+    assert metrics.get("missingFrontierEntities") is None
+    comparison = payload["sqlComparison"]
+    assert comparison["certification"]["status"] == "UNCERTIFIED"
+    assert comparison["validation"]["status"] in {"FAILED", "NOT_RUN"}
+    assert comparison["economics"]["decision"] == "NOT_EVALUATED"
+    assert comparison["execution"]["status"] == "FAILED"
+    assert comparison["execution"]["failurePhase"]
+    assert comparison["execution"]["failureCode"]
+    assert "CUSTOMER_NAME" in (comparison["execution"].get("failureReason") or "")
+    assert comparison["execution"].get("warehouseQueryId") == "01c73fa8-3204-9404-0008-2c320009f2e2"
+    assert comparison.get("sourceSnapshot")
+    stamp = (dbt_project / "target" / "frontier-run.invocation").read_text().strip()
+    assert stamp == "fresh-failed-impact-001"
+
+    restored = {
+        "externalRunId": "v15-success",
+        "runMode": "live",
+        "status": "passed",
+    }
+    run_file.write_text(json.dumps(restored))
+    monkeypatch.setenv("FRONTIER_API_KEY", "frn_test_key_not_a_password")
+    upload_code = main(["upload", "--project-dir", str(dbt_project)])
+    uploaded = capsys.readouterr()
+    assert upload_code == 1
+    assert "stale" in uploaded.err.lower()
+    assert "v15-success" in uploaded.err
+
+
 def test_inspect_real_jaffle_shop(capsys) -> None:
     if not (JAFFLE_SHOP / "target" / "manifest.json").is_file():
         return
@@ -684,6 +768,14 @@ def test_record_failure_ignores_stale_run_results(dbt_project: Path, monkeypatch
     payload = json.loads((dbt_project / "target" / "frontier-run.json").read_text())
     assert payload["status"] == "failed"
     assert payload["evidenceLevel"] == "none"
+    assert payload["metrics"]["fullEntityCount"] is None
+    assert payload["metrics"]["frontierEntityCount"] is None
+    assert payload["metrics"]["percentRowsAvoided"] is None
+    assert 1 not in {
+        payload["metrics"]["fullEntityCount"],
+        payload["metrics"]["frontierEntityCount"],
+        payload["metrics"]["percentRowsAvoided"],
+    }
     names = {item["testName"] for item in payload["validationResults"]}
     assert names == {"dbt_build"}
     assert "assert_frontier_events_resolve" not in names

@@ -7,12 +7,15 @@ from frontier.dbt_artifacts import DbtNode, Manifest
 from frontier.frontier import ChangeEvent, load_change_events_csv
 from frontier.proof import (
     MutationProof,
+    SqlChangeProof,
     apply_resolved_delete,
     extra_frontier_sql,
+    finalize_sql_change_assessment,
     mismatched_rows_sql,
     missing_frontier_sql,
     measure_mutation_proof,
     measure_sql_change_proof,
+    overlay_repair_validation,
     proof_validation_results,
     recorded_proof,
     recorded_sql_change_affected,
@@ -20,11 +23,14 @@ from frontier.proof import (
     recommended_sql_change_proof,
     required_sql_change_proof,
     failed_execution_sql_change_proof,
+    repair_summary_metrics,
+    repaired_equals_reference_result,
     sql_change_proof_validation_results,
     targeted_mismatch_sql,
+    targeted_repair_status_line,
 )
 from frontier.warehouse import FakeWarehouse
-from frontier.validation import evidence_level
+from frontier.validation import ValidationResult, evidence_level, overall_status
 from tests.conftest import FIXTURES, JAFFLE_SHOP
 
 
@@ -254,7 +260,7 @@ def test_measure_sql_change_proof_uses_targeted_tables_not_full_recompute() -> N
     warehouse = FakeWarehouse(
         {
             "frontier_rows_recomputed": [(99_621,)],
-            "mismatched_final_rows": [(0,)],
+            "mismatched_final_rows": [(926,)],
         }
     )
     proof = measure_sql_change_proof(
@@ -276,9 +282,10 @@ def test_measure_sql_change_proof_uses_targeted_tables_not_full_recompute() -> N
     assert before_sql not in executed
     assert after_sql not in executed
     assert "stg_orders" not in executed.lower()
-    assert "int_customer_orders" in executed.lower()
+    assert "int_customer_orders" not in executed.lower()
     assert "frontier_test_target_head" in executed.lower()
-    assert "frontier_test_affected_keys" in executed.lower()
+    assert "mismatched_final_rows" not in executed.lower()
+    assert "except" not in executed.lower()
     assert proof.changed_source_row_count == 732_044
     assert proof.candidate_frontier_count == 99_621
     assert proof.confirmed_frontier_count == 99_621
@@ -286,8 +293,9 @@ def test_measure_sql_change_proof_uses_targeted_tables_not_full_recompute() -> N
     assert proof.full_rows_recomputed == 150_000
     assert proof.extra_frontier_entities == 0
     assert proof.missing_frontier_entities == 0
-    assert proof.mismatched_final_rows == 0
+    assert proof.mismatched_final_rows is None
     assert proof.percent_rows_avoided == 33.586
+    assert proof.targeted_repair_safe is False
 
 
 def test_targeted_mismatch_sql_joins_pr_relation() -> None:
@@ -365,3 +373,169 @@ def test_jaffle_shop_overlays_do_not_write_sample_data() -> None:
     assert "severity='warn'" in extra.replace(" ", "") or "severity='warn'" in extra
     assert "severity='error'" not in extra
     assert (Path("/Users/jad/Desktop/data_agent_pipeline/jaffle_shop/models/staging/stg_orders.sql").read_text().count("source('tpch'")) == 1
+
+
+CHANGED_ENTITIES = 463
+PRE_REPAIR_EXCEPT_DIFF = CHANGED_ENTITIES * 2
+
+
+def _succeeded_repair(**overrides: object) -> dict:
+    payload = {
+        "status": "SUCCEEDED",
+        "mode": "DISPOSABLE_TABLE",
+        "missingRows": 0,
+        "extraRows": 0,
+        "mismatchedRows": 0,
+        "duplicateEntityKeys": 0,
+        "disposableResourcesCleaned": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _failed_repair(**overrides: object) -> dict:
+    payload = {
+        "status": "FAILED",
+        "mode": "DISPOSABLE_TABLE",
+        "missingRows": 2,
+        "extraRows": 1,
+        "mismatchedRows": 3,
+        "duplicateEntityKeys": 0,
+        "disposableResourcesCleaned": True,
+        "reason": "repaired disposable table does not equal the complete head result",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _observed_legacy_proof(*, mismatched: int | None = PRE_REPAIR_EXCEPT_DIFF) -> SqlChangeProof:
+    return SqlChangeProof(
+        full_rows_recomputed=150_000,
+        frontier_rows_recomputed=CHANGED_ENTITIES,
+        rows_avoided=150_000 - CHANGED_ENTITIES,
+        source_population_count=CHANGED_ENTITIES,
+        candidate_frontier_count=CHANGED_ENTITIES,
+        confirmed_frontier_count=CHANGED_ENTITIES,
+        before_entity_count=150_000,
+        after_entity_count=150_000,
+        changed_source_row_count=CHANGED_ENTITIES,
+        missing_frontier_entities=0,
+        extra_frontier_entities=0,
+        mismatched_final_rows=mismatched,
+        test_duration_ms=12,
+    )
+
+
+def test_pre_repair_926_does_not_fail_successful_disposable_repair() -> None:
+    mart = [(str(index), f"name-{index}", 1) for index in range(CHANGED_ENTITIES)]
+    head = [(str(index), f"name-{index}", 2) for index in range(CHANGED_ENTITIES)]
+    except_diff = len(set(mart) - set(head)) + len(set(head) - set(mart))
+    assert except_diff == PRE_REPAIR_EXCEPT_DIFF
+
+    proof = _observed_legacy_proof(mismatched=except_diff)
+    repair = _succeeded_repair()
+    overlaid, validations = finalize_sql_change_assessment(
+        proof,
+        repair,
+        [
+            ValidationResult(
+                test_name="assert_sql_frontier_covers_reference",
+                status="passed",
+                difference_count=0,
+            )
+        ],
+    )
+    assertion = next(
+        item for item in validations if item.test_name == "assert_repaired_equals_reference"
+    )
+    metrics = repair_summary_metrics(overlaid, repair)
+
+    assert overlaid.mismatched_final_rows == 0
+    assert overlaid.missing_frontier_entities == 0
+    assert overlaid.extra_frontier_entities == 0
+    assert overlaid.targeted_repair_safe is True
+    assert assertion.status == "passed"
+    assert assertion.difference_count == 0
+    assert overall_status(validations) == "passed"
+    assert metrics["mismatchedFinalRows"] == 0
+    assert metrics["missingFrontierEntities"] == 0
+    assert metrics["extraFrontierEntities"] == 0
+    assert targeted_repair_status_line(
+        repair_status="SUCCEEDED",
+        proof=overlaid,
+        skipped=False,
+    ) is None
+    assert evidence_level(validations) == "empirically_validated"
+
+
+def test_disposable_repair_failure_uses_repaired_copy_differences() -> None:
+    proof = _observed_legacy_proof(mismatched=PRE_REPAIR_EXCEPT_DIFF)
+    repair = _failed_repair()
+    overlaid, validations = finalize_sql_change_assessment(proof, repair, [])
+    assertion = next(
+        item for item in validations if item.test_name == "assert_repaired_equals_reference"
+    )
+    assert overlaid.mismatched_final_rows == 3
+    assert assertion.status == "failed"
+    assert assertion.difference_count == 6
+    assert PRE_REPAIR_EXCEPT_DIFF not in {assertion.difference_count, overlaid.mismatched_final_rows}
+    assert overall_status(validations) == "failed"
+
+
+def test_repair_not_run_skips_assertion_and_does_not_fabricate_zeros() -> None:
+    proof = _observed_legacy_proof(mismatched=None)
+    overlaid, validations = finalize_sql_change_assessment(
+        proof,
+        {"status": "NOT_RUN"},
+        [],
+    )
+    assertion = next(
+        item for item in validations if item.test_name == "assert_repaired_equals_reference"
+    )
+    metrics = repair_summary_metrics(overlaid, {"status": "NOT_RUN"})
+    assert assertion.status == "skipped"
+    assert overall_status(validations) == "passed"
+    assert metrics["mismatchedFinalRows"] is None
+    assert overlaid.targeted_repair_safe is False
+    assert targeted_repair_status_line(
+        repair_status="NOT_RUN",
+        proof=overlaid,
+        skipped=False,
+    ) == "Targeted repair: not run"
+
+
+def test_cleanup_failure_fails_assessment_without_applying_production() -> None:
+    proof = _observed_legacy_proof(mismatched=None)
+    repair = _failed_repair(
+        missingRows=0,
+        extraRows=0,
+        mismatchedRows=0,
+        disposableResourcesCleaned=False,
+        reasonCode="CLEANUP_FAILED",
+        reason="drop failed",
+    )
+    overlaid, validations = finalize_sql_change_assessment(proof, repair, [])
+    assertion = next(
+        item for item in validations if item.test_name == "assert_repaired_equals_reference"
+    )
+    assert assertion.status == "failed"
+    assert overall_status(validations) == "failed"
+    assert targeted_repair_status_line(
+        repair_status="FAILED",
+        proof=overlaid,
+        skipped=False,
+    ) is None
+
+
+def test_legacy_sql_change_proof_without_repair_keeps_recorded_mismatch() -> None:
+    proof = recorded_sql_change_proof()
+    overlaid = overlay_repair_validation(proof, None)
+    assertion = repaired_equals_reference_result(overlaid, None)
+    assert overlaid is proof
+    assert assertion.status == "passed"
+    assert assertion.difference_count == 0
+    assert targeted_repair_status_line(
+        repair_status="NOT_RUN",
+        proof=overlaid,
+        skipped=False,
+    ) == "Targeted repair: safe"

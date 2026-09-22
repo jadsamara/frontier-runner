@@ -13,6 +13,7 @@ from frontier.certification import (
     SQL_CERTIFIED,
     TARGETED_REPAIR_RECOMMENDED,
     UNCERTIFIED,
+    VALIDATION_FAILED,
     build_assessment_dimensions,
     economics_decision,
     enrich_certification_record,
@@ -22,13 +23,17 @@ from frontier.filter_v1 import (
     KEY_LINEAGE_BROKEN,
     TWO_TAINTED_JOIN_INPUTS,
     UNSUPPORTED_OPERATION,
+    PlanError,
     analyze_static_eligibility,
+    assert_candidate_sql_scopes,
 )
 from frontier.impact import CANDIDATE_SET_ANALYSIS_FAILED, CANDIDATE_SET_EMPTY
 from frontier.snapshot import (
     ASSURANCE_ADAPTER,
     MODE_TIME_TRAVEL,
+    PERMANENT_TABLE,
     SOURCE_SNAPSHOT_NOT_PINNED,
+    RelationBinding,
     SourceSnapshot,
     adapter_evidence_token,
 )
@@ -636,3 +641,175 @@ def test_economics_are_independent_of_certification_and_bytes() -> None:
     assert dims["certification"]["status"] == UNCERTIFIED
     assert dims["economics"]["decision"] == FULL_REBUILD_RECOMMENDED
     assert dims["economics"]["frontierBytesScanned"] == 288_000_000
+
+
+JAFFLE_REPAIR_BASE = """
+WITH customers AS (
+    SELECT customer_id, customer_name
+    FROM stg_customers
+),
+filtered_orders AS (
+    SELECT order_id, customer_id, ordered_at, subtotal, tax_paid, order_total
+    FROM orders
+    WHERE order_total >= 20
+)
+SELECT
+    customers.customer_id,
+    MAX(customers.customer_name) AS customer_name,
+    COUNT(filtered_orders.order_id) AS count_lifetime_orders,
+    MIN(filtered_orders.ordered_at) AS first_ordered_at,
+    MAX(filtered_orders.ordered_at) AS last_ordered_at,
+    COALESCE(SUM(filtered_orders.subtotal), 0) AS lifetime_spend_pretax,
+    COALESCE(SUM(filtered_orders.tax_paid), 0) AS lifetime_tax_paid,
+    COALESCE(SUM(filtered_orders.order_total), 0) AS lifetime_spend
+FROM customers
+LEFT JOIN filtered_orders
+    ON customers.customer_id = filtered_orders.customer_id
+GROUP BY customers.customer_id
+"""
+JAFFLE_REPAIR_PR = JAFFLE_REPAIR_BASE.replace("order_total >= 20", "order_total >= 30")
+JAFFLE_INCOMPLETE_CATALOG = {
+    "stg_customers": ("customer_id",),
+    "orders": ("order_id", "customer_id", "ordered_at", "subtotal", "tax_paid", "order_total"),
+}
+
+
+def _seed_jaffle_repair(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE stg_customers (
+          customer_id INTEGER,
+          customer_name TEXT
+        );
+        CREATE TABLE orders (
+          order_id INTEGER,
+          customer_id INTEGER,
+          ordered_at TEXT,
+          subtotal REAL,
+          tax_paid REAL,
+          order_total REAL
+        );
+        INSERT INTO stg_customers VALUES
+          (1, 'Alice'),
+          (2, 'Bob'),
+          (3, 'Carol'),
+          (4, 'Dan'),
+          (5, 'Eve');
+        INSERT INTO orders VALUES
+          (10, 1, '2020-01-01', 8, 2, 10),
+          (11, 1, '2020-01-02', 20, 5, 25),
+          (12, 1, '2020-01-03', 20, 5, 25),
+          (13, 1, '2020-01-04', 32, 8, 40),
+          (20, 2, '2020-01-01', 12, 3, 15),
+          (21, 2, '2020-01-02', 14, 4, 18),
+          (30, 3, '2020-01-01', 28, 7, 35),
+          (31, 3, '2020-01-02', 40, 10, 50),
+          (40, 4, '2020-01-01', 18, 4, 22),
+          (41, 4, '2020-01-02', 22, 6, 28),
+          (50, 5, '2020-01-01', 16, 4, 20),
+          (51, 5, '2020-01-02', 24, 6, 30);
+        """
+    )
+
+
+def test_jaffle_repair_summary_compiles_and_is_sound() -> None:
+    conn = sqlite3.connect(":memory:")
+    _seed_jaffle_repair(conn)
+    result = _analyze(JAFFLE_REPAIR_BASE, JAFFLE_REPAIR_PR, JAFFLE_INCOMPLETE_CATALOG)
+    assert result.eligible is True, result.diagnostic
+    assert result.compiled is True, result.diagnostic
+    assert result.candidate_sql
+    sql = result.candidate_sql.lower()
+    assert_candidate_sql_scopes(result.candidate_sql, dialect="snowflake")
+    assert "customer_name" not in sql
+    true_changed, candidates = assert_sound(
+        conn,
+        JAFFLE_REPAIR_BASE,
+        JAFFLE_REPAIR_PR,
+        catalog=JAFFLE_INCOMPLETE_CATALOG,
+    )
+    assert true_changed <= candidates
+    assert true_changed == {"1", "4", "5"}
+    assert "3" not in true_changed
+    assert "2" not in true_changed
+    assert "1" in candidates
+    assert "4" in candidates
+    assert "5" in candidates
+
+
+def test_generated_scope_validation_rejects_dropped_column_reference() -> None:
+    sql = """
+    select P10.CUSTOMER_ID, P10.CUSTOMER_NAME
+    from (
+        select S9.CUSTOMER_ID
+        from stg_customers as S9
+    ) as P10
+    """
+    try:
+        assert_candidate_sql_scopes(sql, dialect="snowflake")
+    except PlanError as error:
+        assert error.code == UNSUPPORTED_OPERATION
+        assert "CUSTOMER_NAME" in error.diagnostic.upper() or "customer_name" in error.diagnostic.lower()
+    else:
+        raise AssertionError("expected unresolved CUSTOMER_NAME to fail compilation")
+
+
+def test_left_side_key_only_projection_does_not_reference_dropped_descriptive_column() -> None:
+    conn = sqlite3.connect(":memory:")
+    _seed_jaffle_repair(conn)
+    result = _analyze(JAFFLE_REPAIR_BASE, JAFFLE_REPAIR_PR, JAFFLE_INCOMPLETE_CATALOG)
+    assert result.eligible is True, result.diagnostic
+    assert result.compiled is True, result.diagnostic
+    sql = result.candidate_sql or ""
+    assert sql
+    assert "customer_name" not in sql.lower()
+    assert_candidate_sql_scopes(sql, dialect="snowflake")
+    parsed = sqlglot.parse_one(sql, read="snowflake")
+    assert parsed is not None
+    true_changed, candidates = assert_sound(
+        conn,
+        JAFFLE_REPAIR_BASE,
+        JAFFLE_REPAIR_PR,
+        catalog=JAFFLE_INCOMPLETE_CATALOG,
+    )
+    assert true_changed <= candidates
+    assert true_changed == {"1", "4", "5"}
+
+
+def _certified_snapshot(identifier: str = "snap-cert-1") -> SourceSnapshot:
+    return SourceSnapshot(
+        identifier=identifier,
+        mode=MODE_TIME_TRAVEL,
+        assurance=ASSURANCE_ADAPTER,
+        captured_at="2026-01-01T00:00:00Z",
+        relation_bindings=(
+            RelationBinding(name="stg_customers", relation_type=PERMANENT_TABLE, supported=True),
+            RelationBinding(name="stg_orders", relation_type=PERMANENT_TABLE, supported=True),
+        ),
+        adapter_evidence=adapter_evidence_token(identifier),
+        phases={
+            "discovery": identifier,
+            "targeted_base": identifier,
+            "targeted_head": identifier,
+            "confirmation": identifier,
+        },
+    )
+
+
+def test_sql_certified_mart_mismatch_is_not_safe_in_place_repair() -> None:
+    result = _analyze(FLAGSHIP_BASE, FLAGSHIP_PR)
+    assert result.eligible is True
+    assert result.compiled is True
+    dims = build_assessment_dimensions(
+        snapshot=_certified_snapshot(),
+        static_certified=True,
+        candidates_confirmed=True,
+        execution_ran=True,
+        full_reference_failed=True,
+    )
+    assert dims["certification"]["status"] == SQL_CERTIFIED
+    assert dims["validation"]["status"] == VALIDATION_FAILED
+    assert dims["baselineBoundary"]["existingMaterializedMartRepresentsSnapshot"] is False
+    assert dims["baselineBoundary"]["safeInPlaceProductionRepair"] is False
+    assert dims["baselineBoundary"]["comparesSqlVersionsAtPinnedSnapshot"] is True
+

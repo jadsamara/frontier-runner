@@ -765,6 +765,30 @@ class IsolatedRun:
     phase_timings: dict[str, int] = field(default_factory=dict)
     job_metrics: list[dict[str, Any]] = field(default_factory=list)
     snapshot: Any | None = None
+    guard: Any = field(default=None, repr=False)
+    mart_baseline: dict[str, Any] = field(default_factory=dict)
+    repair_validation: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        from frontier.mutation import GuardedWarehouse, build_guard
+        from frontier.repair import empty_mart_baseline, empty_repair_validation
+
+        if not self.mart_baseline:
+            self.mart_baseline = empty_mart_baseline()
+        if not self.repair_validation:
+            self.repair_validation = empty_repair_validation()
+        if isinstance(self.warehouse, GuardedWarehouse):
+            self.guard = getattr(self.warehouse, "_guard", self.guard)
+            return
+        dialect = getattr(self.warehouse, "dialect", "snowflake")
+        self.guard = build_guard(
+            run_id=self.run_id,
+            database=self.database,
+            schema=self.schema,
+            keys_relation=self.relation,
+            dialect=dialect,
+        )
+        self.warehouse = GuardedWarehouse(self.warehouse, self.guard)
 
     def _record_job(self, phase: str) -> dict[str, Any] | None:
         query_id = getattr(self.warehouse, "last_query_id", None)
@@ -1030,6 +1054,8 @@ class IsolatedRun:
         """
         if self.warehouse.dialect == "redshift":
             try:
+                if self.guard is not None:
+                    self.guard.register(relation)
                 self.warehouse.execute(drop_relation_sql(relation))
             except Exception:
                 pass
@@ -1040,6 +1066,330 @@ class IsolatedRun:
         elif "target_head" in lowered:
             phase = "targeted_head"
         snapshot_execute(self.warehouse, create_sql, self.snapshot, phase=phase)
+        if relation not in self._created:
+            self._created.append(relation)
+
+    def mart_copy_relation(self) -> str:
+        return qualify_relation(
+            self.database,
+            self.schema,
+            isolated_table_name(self.run_id, "MART_COPY"),
+            dialect=self.warehouse.dialect,
+        )
+
+    def _note_query(self, ids: list[str]) -> None:
+        query_id = getattr(self.warehouse, "last_query_id", None)
+        if query_id:
+            ids.append(str(query_id))
+
+    def verify_mart_baseline(
+        self,
+        *,
+        target_relation: str,
+        old_sql: str,
+        entity_key_index: int = 0,
+    ) -> dict[str, Any]:
+        from frontier.repair import (
+            MART_BASELINE_FAILED,
+            MART_BASELINE_MATCHED,
+            MART_BASELINE_MISMATCHED,
+            SCHEMA_MISALIGNED,
+            SNAPSHOT_IDENTIFIER_MISMATCH,
+            TARGET_SNAPSHOT_NOT_PINNED,
+            WAREHOUSE_EXECUTION_FAILED,
+            compare_complete_results,
+            empty_mart_baseline,
+            snapshot_identifiers_consistent,
+            target_binding_is_usable,
+        )
+        from frontier.snapshot import SnapshotError
+
+        payload = empty_mart_baseline()
+        query_ids: list[str] = []
+        identifier = getattr(self.snapshot, "identifier", None)
+        payload["snapshotIdentifier"] = identifier
+        try:
+            from frontier.snapshot import include_target_in_snapshot
+
+            ok, code, reason = include_target_in_snapshot(self.snapshot, target_relation, self.warehouse)
+            if ok:
+                ok, code, reason = target_binding_is_usable(self.snapshot, target_relation)
+            if not ok:
+                payload.update(
+                    status=MART_BASELINE_FAILED,
+                    reasonCode=code or TARGET_SNAPSHOT_NOT_PINNED,
+                    reason=reason,
+                    failurePhase="baseline verification",
+                )
+                self.mart_baseline = payload
+                return payload
+            if not snapshot_identifiers_consistent(self.snapshot):
+                payload.update(
+                    status=MART_BASELINE_FAILED,
+                    reasonCode=SNAPSHOT_IDENTIFIER_MISMATCH,
+                    reason="snapshot identifiers are not identical across required reads",
+                    failurePhase="baseline verification",
+                )
+                self.mart_baseline = payload
+                return payload
+            log_step("baseline verification started")
+            started = time.perf_counter()
+            mart_sql = f"select * from {target_relation} as frontier_mart_baseline"
+            old_wrapped = f"select * from ({(old_sql or '').strip().rstrip(';')}) as frontier_old_complete"
+            mart_rows = snapshot_execute(
+                self.warehouse, mart_sql, self.snapshot, phase="baseline verification"
+            )
+            self._note_query(query_ids)
+            old_rows = snapshot_execute(
+                self.warehouse, old_wrapped, self.snapshot, phase="baseline verification"
+            )
+            self._note_query(query_ids)
+            compared = compare_complete_results(
+                mart_rows,
+                old_rows,
+                entity_key_index=entity_key_index,
+            )
+            payload["warehouseQueryIds"] = query_ids
+            payload["missingRows"] = compared.missing_rows if compared.reason_code is None else None
+            payload["extraRows"] = compared.extra_rows if compared.reason_code is None else None
+            payload["mismatchedRows"] = compared.mismatched_rows if compared.reason_code is None else None
+            payload["duplicateEntityKeys"] = compared.duplicate_entity_keys or None
+            if compared.reason_code:
+                payload.update(
+                    status=MART_BASELINE_FAILED,
+                    reasonCode=compared.reason_code,
+                    reason=compared.reason,
+                    failurePhase="baseline verification",
+                )
+                if compared.reason_code == SCHEMA_MISALIGNED:
+                    payload["missingRows"] = None
+                    payload["extraRows"] = None
+                    payload["mismatchedRows"] = None
+            elif compared.ok:
+                payload.update(status=MART_BASELINE_MATCHED, missingRows=0, extraRows=0, mismatchedRows=0, duplicateEntityKeys=0)
+            else:
+                payload.update(status=MART_BASELINE_MISMATCHED)
+            self.phase_timings["baseline verification"] = elapsed_ms(started)
+            self._record_job("baseline verification")
+            log_step("baseline verification completed", duration_ms=self.phase_timings["baseline verification"], status="ok")
+        except SnapshotError as error:
+            payload.update(
+                status=MART_BASELINE_FAILED,
+                reasonCode=getattr(error, "code", TARGET_SNAPSHOT_NOT_PINNED),
+                reason=str(error)[:512],
+                failurePhase="baseline verification",
+                warehouseQueryIds=query_ids,
+            )
+        except Exception as error:
+            payload.update(
+                status=MART_BASELINE_FAILED,
+                reasonCode=WAREHOUSE_EXECUTION_FAILED,
+                reason=str(error)[:512],
+                failurePhase="baseline verification",
+                warehouseQueryIds=query_ids,
+            )
+        self.mart_baseline = payload
+        return payload
+
+    def validate_disposable_repair(
+        self,
+        *,
+        target_relation: str,
+        new_sql: str,
+        certified: bool,
+        confirmed: bool,
+        entity_key_index: int = 0,
+    ) -> dict[str, Any]:
+        from frontier.repair import (
+            GRAIN_VIOLATED,
+            MART_BASELINE_MATCHED,
+            PREREQUISITES_NOT_MET,
+            REPAIR_FAILED,
+            REPAIR_SUCCEEDED,
+            SCHEMA_MISALIGNED,
+            SNAPSHOT_IDENTIFIER_MISMATCH,
+            WAREHOUSE_EXECUTION_FAILED,
+            compare_complete_results,
+            empty_repair_validation,
+            snapshot_identifiers_consistent,
+        )
+
+        payload = empty_repair_validation()
+        payload["snapshotIdentifier"] = getattr(self.snapshot, "identifier", None)
+        payload["candidateCount"] = self.confirmed_count
+        if not certified or not confirmed:
+            payload.update(
+                reasonCode=PREREQUISITES_NOT_MET,
+                reason="candidate certification and confirmation are required before disposable repair",
+            )
+            self.repair_validation = payload
+            return payload
+        if (self.mart_baseline or {}).get("status") != MART_BASELINE_MATCHED:
+            payload.update(
+                reasonCode=PREREQUISITES_NOT_MET,
+                reason="mart baseline is not MATCHED",
+            )
+            self.repair_validation = payload
+            return payload
+        if not snapshot_identifiers_consistent(self.snapshot):
+            payload.update(
+                status=REPAIR_FAILED,
+                reasonCode=SNAPSHOT_IDENTIFIER_MISMATCH,
+                reason="snapshot identifiers are not identical across required reads",
+                failurePhase="disposable repair",
+            )
+            self.repair_validation = payload
+            return payload
+        query_ids: list[str] = []
+        copy = self.mart_copy_relation()
+        try:
+            log_step("disposable mart creation started")
+            started = time.perf_counter()
+            self._replace_relation(
+                copy,
+                create_table_as_sql(
+                    copy,
+                    f"select * from {target_relation}",
+                    dialect=self.warehouse.dialect,
+                ),
+            )
+            self.phase_timings["disposable mart creation"] = elapsed_ms(started)
+            self._record_job("disposable mart creation")
+            self._note_query(query_ids)
+            log_step("disposable mart creation completed", duration_ms=self.phase_timings["disposable mart creation"], status="ok")
+
+            delete_count_sql = (
+                f"select count(*) as frontier_deleted_count from {copy} as frontier_deleted_count "
+                f"inner join {self.relation} as frontier_keys "
+                f"on frontier_deleted_count.{self.entity_key} = frontier_keys.{self.entity_key}"
+            )
+            deleted_rows = snapshot_execute(
+                self.warehouse, delete_count_sql, self.snapshot, phase="candidate-key delete"
+            )
+            self._note_query(query_ids)
+            deleted = int(deleted_rows[0][0]) if deleted_rows and deleted_rows[0][0] is not None else 0
+            log_step("candidate-key delete started")
+            started = time.perf_counter()
+            self.warehouse.execute(
+                f"delete from {copy} where {self.entity_key} in "
+                f"(select {self.entity_key} from {self.relation})"
+            )
+            self.phase_timings["candidate-key delete"] = elapsed_ms(started)
+            self._record_job("candidate-key delete")
+            self._note_query(query_ids)
+            log_step("candidate-key delete completed", duration_ms=self.phase_timings["candidate-key delete"], status="ok")
+
+            head_rel = self.targeted_head_relation
+            if not head_rel:
+                targeted = generate_targeted_sql(
+                    new_sql,
+                    entity_key=self.entity_key,
+                    affected_relation=self.relation,
+                    dialect=self.warehouse.dialect,
+                )
+                head_rel = targeted_phase_relation(self.relation, "head")
+                log_step("targeted head computation started")
+                started = time.perf_counter()
+                self._replace_relation(
+                    head_rel,
+                    create_table_as_sql(head_rel, targeted, dialect=self.warehouse.dialect),
+                )
+                self.targeted_head_relation = head_rel
+                self.phase_timings["targeted head computation"] = elapsed_ms(started)
+                self._record_job("targeted head computation")
+                log_step("targeted head computation completed", duration_ms=self.phase_timings["targeted head computation"], status="ok")
+            else:
+                self._record_job("targeted head computation")
+            self._note_query(query_ids)
+
+            insert_count_sql = f"select count(*) as frontier_inserted_count from {head_rel} as frontier_inserted_count"
+            inserted_rows = snapshot_execute(
+                self.warehouse, insert_count_sql, self.snapshot, phase="targeted insert"
+            )
+            self._note_query(query_ids)
+            inserted = int(inserted_rows[0][0]) if inserted_rows and inserted_rows[0][0] is not None else 0
+            log_step("targeted insert started")
+            started = time.perf_counter()
+            self.warehouse.execute(f"insert into {copy} select * from {head_rel}")
+            self.phase_timings["targeted insert"] = elapsed_ms(started)
+            self._record_job("targeted insert")
+            self._note_query(query_ids)
+            log_step("targeted insert completed", duration_ms=self.phase_timings["targeted insert"], status="ok")
+
+            log_step("complete repaired-table validation started")
+            started = time.perf_counter()
+            repaired = snapshot_execute(
+                self.warehouse,
+                f"select * from {copy} as frontier_repaired_copy",
+                None,
+                phase="complete repaired-table validation",
+            )
+            self._note_query(query_ids)
+            head_complete = snapshot_execute(
+                self.warehouse,
+                f"select * from ({(new_sql or '').strip().rstrip(';')}) as frontier_head_complete",
+                self.snapshot,
+                phase="complete head computation",
+            )
+            self._note_query(query_ids)
+            compared = compare_complete_results(
+                repaired,
+                head_complete,
+                entity_key_index=entity_key_index,
+            )
+            self.phase_timings["complete repaired-table validation"] = elapsed_ms(started)
+            self._record_job("complete repaired-table validation")
+            payload.update(
+                candidateCount=self.confirmed_count,
+                deletedRows=deleted,
+                insertedRows=inserted,
+                warehouseQueryIds=query_ids,
+            )
+            if compared.reason_code:
+                payload.update(
+                    status=REPAIR_FAILED,
+                    reasonCode=compared.reason_code,
+                    reason=compared.reason,
+                    failurePhase="complete repaired-table validation",
+                    duplicateEntityKeys=compared.duplicate_entity_keys or None,
+                )
+                if compared.reason_code not in {SCHEMA_MISALIGNED, GRAIN_VIOLATED}:
+                    payload["missingRows"] = compared.missing_rows
+                    payload["extraRows"] = compared.extra_rows
+                    payload["mismatchedRows"] = compared.mismatched_rows
+            elif compared.ok:
+                payload.update(
+                    status=REPAIR_SUCCEEDED,
+                    missingRows=0,
+                    extraRows=0,
+                    mismatchedRows=0,
+                    duplicateEntityKeys=0,
+                )
+            else:
+                payload.update(
+                    status=REPAIR_FAILED,
+                    missingRows=compared.missing_rows,
+                    extraRows=compared.extra_rows,
+                    mismatchedRows=compared.mismatched_rows,
+                    duplicateEntityKeys=compared.duplicate_entity_keys,
+                    reason="repaired disposable table does not equal the complete head result",
+                    failurePhase="complete repaired-table validation",
+                )
+            log_step(
+                "complete repaired-table validation completed",
+                duration_ms=self.phase_timings["complete repaired-table validation"],
+                status="ok" if payload["status"] == REPAIR_SUCCEEDED else "FAILED",
+            )
+        except Exception as error:
+            payload.update(
+                status=REPAIR_FAILED,
+                reasonCode=getattr(error, "code", None) or WAREHOUSE_EXECUTION_FAILED,
+                reason=str(error)[:512],
+                failurePhase=payload.get("failurePhase") or "disposable repair",
+                warehouseQueryIds=query_ids,
+            )
+        self.repair_validation = payload
+        return payload
 
     def cleanup(self) -> None:
         if self._cleaned:
@@ -1047,24 +1397,63 @@ class IsolatedRun:
         log_step("cleanup started")
         started = time.perf_counter()
         try:
-            relations = list(dict.fromkeys([*self._created, self.relation]))
+            registered = list(self.guard.registered) if self.guard is not None else []
+            relations = list(dict.fromkeys([*registered, *self._created, self.relation]))
+            failures: list[str] = []
             for relation in reversed(relations):
+                if self.guard is not None:
+                    try:
+                        self.guard.register(relation)
+                    except Exception:
+                        continue
+                dropped_ok = False
                 for attempt in range(3):
                     try:
                         self.warehouse.execute(drop_relation_sql(relation))
+                        dropped_ok = True
                         break
                     except Exception:
                         if attempt < 2:
                             time.sleep(0.05 * (attempt + 1))
+                if not dropped_ok:
+                    failures.append(relation)
             self._cleaned = True
+            self.phase_timings["cleanup"] = elapsed_ms(started)
+            self._record_job("cleanup")
+            if failures:
+                if self.repair_validation:
+                    self.repair_validation["disposableResourcesCleaned"] = False
+                    if self.repair_validation.get("status") == "SUCCEEDED":
+                        self.repair_validation["status"] = "FAILED"
+                        self.repair_validation["reasonCode"] = "CLEANUP_FAILED"
+                        self.repair_validation["reason"] = (
+                            f"cleanup failed for {len(failures)} disposable relation(s)"
+                        )[:512]
+                        self.repair_validation["failurePhase"] = "cleanup"
+                log_step(
+                    "cleanup completed",
+                    duration_ms=self.phase_timings.get("cleanup") or elapsed_ms(started),
+                    status="FAILED",
+                )
+                return
+            if self.repair_validation:
+                self.repair_validation["disposableResourcesCleaned"] = True
         except Exception as error:
+            self._cleaned = True
+            if self.repair_validation:
+                self.repair_validation["disposableResourcesCleaned"] = False
+                if self.repair_validation.get("status") == "SUCCEEDED":
+                    self.repair_validation["status"] = "FAILED"
+                    self.repair_validation["reasonCode"] = "CLEANUP_FAILED"
+                    self.repair_validation["reason"] = str(error)[:512]
+                    self.repair_validation["failurePhase"] = "cleanup"
             log_step(
                 "cleanup completed",
                 duration_ms=elapsed_ms(started),
                 status=failure_status(error),
             )
-            raise
-        log_step("cleanup completed", duration_ms=elapsed_ms(started), status="ok")
+            return
+        log_step("cleanup completed", duration_ms=self.phase_timings.get("cleanup") or elapsed_ms(started), status="ok")
 
 
 def open_isolated_run(

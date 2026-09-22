@@ -35,7 +35,7 @@ def _format_measured(value: Any) -> str:
     return _format_count(int(value))
 
 
-def _pluralize(noun: str, count: int) -> str:
+def _pluralize(noun: str, count: int | None) -> str:
     if count == 1:
         return noun
     if noun.endswith("s"):
@@ -77,8 +77,10 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
     model_name = str(model.get("name") or "unknown")
     entity_type = str(model.get("entityType") or "entity")
     metrics = payload.get("metrics") or {}
-    full_count = int(metrics.get("fullEntityCount") or 0)
-    frontier_count = int(metrics.get("frontierEntityCount") or 0)
+    full_raw = metrics.get("fullEntityCount")
+    frontier_raw = metrics.get("frontierEntityCount")
+    full_count = int(full_raw) if full_raw is not None else None
+    frontier_count = int(frontier_raw) if frontier_raw is not None else None
     percent = metrics.get("percentRowsAvoided")
     percent_text = f"{percent}%" if percent is not None else "n/a"
     events = payload.get("changeEvents") or []
@@ -114,9 +116,12 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
     after_count = metrics.get("afterEntityCount")
     recommended = bool(comparison.get("fullRebuildRecommended"))
     full_rebuild = bool(comparison.get("fullRebuildRequired") or comparison.get("narrowFrontierSafe") is False)
+    repair = comparison.get("repairValidation") or {}
+    repair_status = repair.get("status") or "NOT_RUN"
     targeted_safe = (
         int(metrics.get("mismatchedFinalRows") or 0) == 0
         and int(metrics.get("missingFrontierEntities") or 0) == 0
+        and metrics.get("mismatchedFinalRows") is not None
         and not full_rebuild
         and not recommended
     )
@@ -163,9 +168,18 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
             lines.append(
                 f"Row count: {_format_count(int(before_count))} → {_format_count(int(after_count))}"
             )
-        lines.append(
-            f"Targeted repair: {'skipped' if recommended or full_rebuild else ('safe' if targeted_safe else 'not safe')}"
-        )
+        if recommended or full_rebuild:
+            lines.append("Targeted repair: skipped")
+        elif repair_status == "SUCCEEDED":
+            pass
+        elif repair_status == "FAILED":
+            lines.append("Targeted repair procedure: failed")
+        elif targeted_safe:
+            lines.append("Targeted repair: safe")
+        elif metrics.get("mismatchedFinalRows") is None and repair_status == "NOT_RUN":
+            pass
+        else:
+            lines.append("Targeted repair: not safe")
         targeted_validation = comparison.get("targetedValidation")
         if targeted_validation:
             lines.append(f"Targeted validation: {targeted_validation}")
@@ -181,12 +195,12 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
         lines.append(f"Changed source events: {len(events)}")
         lines.append(
             f"Affected {_pluralize(entity_type, frontier_count)}: "
-            f"{_format_count(frontier_count)} of {_format_count(full_count)}"
+            f"{_format_measured(frontier_count)} of {_format_measured(full_count)}"
         )
     else:
         lines.append(
             f"Affected {_pluralize(entity_type, frontier_count)}: "
-            f"{_format_count(frontier_count)} of {_format_count(full_count)}"
+            f"{_format_measured(frontier_count)} of {_format_measured(full_count)}"
         )
     lines.extend(
         [
@@ -201,9 +215,9 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
     if event_count is not None or sql_count is not None or union_count is not None:
         lines.append(
             "Candidate keys: "
-            f"{_format_count(int(event_count or 0))} event, "
-            f"{_format_count(int(sql_count or 0))} SQL-change, "
-            f"{_format_count(int(union_count or 0))} union"
+            f"{_format_measured(event_count)} event, "
+            f"{_format_measured(sql_count)} SQL-change, "
+            f"{_format_measured(union_count)} union"
         )
     comparison = payload.get("sqlComparison") or {}
     if comparison:
@@ -313,10 +327,28 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
         if execution.get("status"):
             lines.append(f"Execution: {execution.get('status')}")
         if comparison.get("baselineBoundary"):
+            mart = comparison.get("martBaseline") or {}
+            repair = comparison.get("repairValidation") or {}
+            production = comparison.get("productionApply") or {}
+            cert = (comparison.get("certification") or {}).get("status") or "UNCERTIFIED"
+            lines.append(f"Candidate set certified: {'yes' if cert in {'SQL_CERTIFIED', 'CONTRACT_CERTIFIED'} else 'no'} ({cert})")
+            lines.append(f"Existing mart baseline: {mart.get('status') or 'NOT_RUN'}")
+            lines.append(f"Disposable repair validated: {repair.get('status') or 'NOT_RUN'}")
+            apply_status = production.get("status") or "NOT_REQUESTED"
             lines.append(
-                "Baseline: two SQL versions at one pinned source snapshot; "
-                "the existing materialized dbt mart is not that snapshot; "
-                "in-place production repair is not certified."
+                "Production repair not applied"
+                if apply_status in {"NOT_REQUESTED", "NOT_RUN"}
+                else f"Production apply: {apply_status}"
+            )
+            if (comparison.get("baselineBoundary") or {}).get("safeInPlaceProductionRepair"):
+                lines.append(
+                    "Repair procedure validated at the pinned snapshot. Production was not modified."
+                )
+        economics = comparison.get("economics") or {}
+        if economics.get("measurementBasis"):
+            lines.append(
+                f"Economics basis: {economics.get('measurementBasis')}"
+                + (f" — {economics.get('reason')}" if economics.get("reason") else " — bytes are not billed cost")
             )
         if comparison.get("failurePhase") or comparison.get("failureCode"):
             lines.append(

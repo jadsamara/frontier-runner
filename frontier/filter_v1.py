@@ -1669,6 +1669,7 @@ def compile_candidate_query(
             dialect=dialect,
         )
         sql = compiler.compile()
+        assert_candidate_sql_scopes(sql, dialect=dialect)
     except PlanError as error:
         return False, (error.code, error.diagnostic), None, None
     except SqlglotError as error:
@@ -1699,6 +1700,16 @@ class _CandidateCompiler:
         self.dialect = dialect
         self._n = 0
         self._tainted = _tainted_ids(pr_graph, changed_pr.id)
+        self._required_pr = _required_columns_for_key_cover(
+            pr_graph,
+            entity_key=entity_key.lower(),
+            dialect=dialect,
+        )
+        self._required_base = _required_columns_for_key_cover(
+            base_graph,
+            entity_key=entity_key.lower(),
+            dialect=dialect,
+        )
         self._relation_cache: dict[tuple[str, str], exp.Select] = {}
 
     def alias(self, prefix: str = "r") -> str:
@@ -1751,18 +1762,22 @@ class _CandidateCompiler:
             expression=exp.Paren(this=self._keep(new_pred)),
         )
         select = exp.Select().from_(self._subquery(inner, alias)).where(flip)
-        return self._select_node_columns(select, self.changed_pr, alias)
+        return self._select_node_columns(select, self.changed_pr, alias, self.pr_graph)
 
     def _project_cover(self, cover: exp.Select, node: PlanNode, graph: PlanGraph) -> exp.Select:
         alias = self.alias("p")
         select = exp.Select().from_(self._subquery(cover, alias))
         input_node = graph.node(node.inputs[0])
+        input_emitted = _select_emitted_names(cover)
         input_names = {name.lower() for name in input_node.columns}
-        if not node.columns:
-            return select.select(exp.Star())
+        names = self._columns_to_emit(node, graph)
+        if not names:
+            if input_emitted is None or not input_emitted:
+                return select.select(exp.Star())
+            names = tuple(sorted(input_emitted))
         exprs: list[exp.Expression] = []
         origin_by_name = {name.lower(): origin for name, origin in node.origins}
-        for name in node.columns:
+        for name in names:
             source = name.lower()
             origin = origin_by_name.get(source, "")
             if origin.startswith("expr:"):
@@ -1771,12 +1786,15 @@ class _CandidateCompiler:
                     "RowCover projection of a computed expression is not a column transfer",
                 )
             origin_col = origin.rsplit(".", 1)[-1].lower() if origin else source
-            if source in input_names:
+            if _name_is_emitted(source, input_emitted, input_names):
                 col = source
-            elif origin_col in input_names or not input_names:
+            elif _name_is_emitted(origin_col, input_emitted, input_names):
                 col = origin_col
             else:
-                col = source
+                raise PlanError(
+                    UNSUPPORTED_OPERATION,
+                    f"generated projection of {name} is not emitted by its input",
+                )
             exprs.append(exp.alias_(self._col(alias, col), name, quoted=True))
         return select.select(*exprs)
 
@@ -1857,9 +1875,22 @@ class _CandidateCompiler:
             .from_(self._subquery(left, left_alias))
             .join(self._subquery(keys, key_alias), on=on, join_type="inner")
         )
-        if left_node.columns:
-            return joined.select(*[self._col(left_alias, name) for name in left_node.columns])
-        return joined.select(exp.Star())
+        names = self._columns_to_emit(left_node, self.pr_graph)
+        emitted = _select_emitted_names(left)
+        catalog = {name.lower() for name in left_node.columns}
+        exprs: list[exp.Expression] = []
+        for name in names:
+            if not _name_is_emitted(name.lower(), emitted, catalog):
+                raise PlanError(
+                    UNSUPPORTED_OPERATION,
+                    f"generated projection of {name} is not emitted by its input",
+                )
+            exprs.append(self._col(left_alias, name))
+        if exprs:
+            return joined.select(*exprs)
+        if emitted is None:
+            return joined.select(exp.Star())
+        return joined.select(*[self._col(left_alias, name) for name in sorted(emitted)])
 
     def _equijoin(
         self,
@@ -1886,7 +1917,16 @@ class _CandidateCompiler:
         )
         left_node = graph.node(node.inputs[0])
         right_node = graph.node(node.inputs[1])
-        exprs = self._join_output_exprs(left_alias, right_alias, left_node, right_node)
+        exprs = self._join_output_exprs(
+            left_alias,
+            right_alias,
+            left_node,
+            right_node,
+            node,
+            left,
+            right,
+            graph,
+        )
         return select.select(*exprs)
 
     def _join_output_exprs(
@@ -1895,44 +1935,76 @@ class _CandidateCompiler:
         right_alias: str,
         left_node: PlanNode,
         right_node: PlanNode,
+        join_node: PlanNode,
+        left_relation: exp.Select,
+        right_relation: exp.Select,
+        graph: PlanGraph,
     ) -> list[exp.Expression]:
+        live = {name.lower() for name in self._columns_to_emit(join_node, graph)}
+        for left_key, right_key in join_node.join_keys:
+            live.add(left_key.lower())
+            live.add(right_key.lower())
+        left_emitted = _select_emitted_names(left_relation)
+        right_emitted = _select_emitted_names(right_relation)
+        left_names = {name.lower() for name in left_node.columns}
+        right_names = {name.lower() for name in right_node.columns}
         seen: set[str] = set()
         exprs: list[exp.Expression] = []
-        if not left_node.columns:
+        for source_node, alias, emitted, catalog in (
+            (left_node, left_alias, left_emitted, left_names),
+            (right_node, right_alias, right_emitted, right_names),
+        ):
+            for name in source_node.columns:
+                key = name.lower()
+                if live and key not in live:
+                    continue
+                if key in seen:
+                    continue
+                if not _name_is_emitted(key, emitted, catalog):
+                    continue
+                seen.add(key)
+                exprs.append(exp.alias_(self._col(alias, name), name, quoted=True))
+        for col in sorted(live):
+            if col in seen:
+                continue
+            if _name_is_emitted(col, left_emitted, left_names):
+                exprs.append(exp.alias_(self._col(left_alias, col), col, quoted=True))
+                seen.add(col)
+            elif _name_is_emitted(col, right_emitted, right_names):
+                exprs.append(exp.alias_(self._col(right_alias, col), col, quoted=True))
+                seen.add(col)
+            else:
+                raise PlanError(
+                    UNSUPPORTED_OPERATION,
+                    f"generated projection of {col} is not emitted by either join input",
+                )
+        if exprs:
+            return exprs
+        if not left_node.columns and left_emitted is None:
             star = exp.Star()
             star.set("table", exp.to_identifier(left_alias))
-            exprs.append(star)
-        for name in left_node.columns:
-            key = name.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            exprs.append(exp.alias_(self._col(left_alias, name), name, quoted=True))
-        if not right_node.columns and not left_node.columns:
-            star = exp.Star()
-            star.set("table", exp.to_identifier(right_alias))
-            exprs.append(star)
-            return exprs
-        for name in right_node.columns:
-            key = name.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            exprs.append(exp.alias_(self._col(right_alias, name), name, quoted=True))
-        if not exprs:
-            return [exp.Star()]
-        return exprs
+            return [star]
+        raise PlanError(
+            UNSUPPORTED_OPERATION,
+            "generated join projection is empty after required-column liveness",
+        )
 
     def _distinct_keys(self, cover: exp.Select, node: PlanNode) -> exp.Select:
         alias = self.alias("g")
         key = self.entity_key
         input_node = self.pr_graph.node(node.inputs[0])
         names = {name.lower() for name in input_node.columns}
+        emitted = _select_emitted_names(cover)
         if names and key not in names:
             for name, origin in input_node.origins:
                 if origin.rsplit(".", 1)[-1].lower() == key or name.lower() == key:
                     key = name
                     break
+        if not _name_is_emitted(key.lower(), emitted, names):
+            raise PlanError(
+                UNSUPPORTED_OPERATION,
+                f"generated projection of {key} is not emitted by its input",
+            )
         select = (
             exp.Select()
             .from_(self._subquery(cover, alias))
@@ -1957,6 +2029,9 @@ class _CandidateCompiler:
             alias = self.alias("s")
             table.set("alias", exp.TableAlias(this=exp.to_identifier(alias)))
             select = exp.Select().from_(table)
+            names = self._columns_to_emit(node, graph)
+            if names:
+                return select.select(*[self._col(alias, name) for name in names])
             if node.columns:
                 return select.select(*[self._col(alias, name) for name in node.columns])
             return select.select(exp.Star())
@@ -1965,7 +2040,7 @@ class _CandidateCompiler:
             alias = self.alias("f")
             pred = self._qualify_pred(self._parse_pred(node.payload), alias, graph.node(node.inputs[0]))
             select = exp.Select().from_(self._subquery(inner, alias)).where(pred)
-            return self._select_node_columns(select, node, alias)
+            return self._select_node_columns(select, node, alias, graph)
         if node.kind == "project":
             inner = self._relation(graph, node.inputs[0])
             return self._project_cover(inner, node, graph)
@@ -1992,11 +2067,42 @@ class _CandidateCompiler:
         select: exp.Select,
         node: PlanNode,
         alias: str,
+        graph: PlanGraph,
     ) -> exp.Select:
-        names = list(node.columns)
-        if names:
-            return select.select(*[self._col(alias, name) for name in names])
-        return select.select(exp.Star())
+        names = self._columns_to_emit(node, graph)
+        if not names:
+            names = tuple(node.columns)
+        if not names:
+            return select.select(exp.Star())
+        inner = None
+        from_expr = _from_clause(select)
+        if isinstance(from_expr, exp.Subquery):
+            inner = from_expr
+        inner_select = inner.this if isinstance(inner, exp.Subquery) else None
+        emitted = _select_emitted_names(inner_select) if isinstance(inner_select, exp.Select) else None
+        catalog = {name.lower() for name in node.columns}
+        exprs: list[exp.Expression] = []
+        for name in names:
+            if not _name_is_emitted(name.lower(), emitted, catalog if emitted is None else None):
+                raise PlanError(
+                    UNSUPPORTED_OPERATION,
+                    f"generated projection of {name} is not emitted by its input",
+                )
+            exprs.append(exp.alias_(self._col(alias, name), name, quoted=True))
+        return select.select(*exprs)
+
+    def _required_for(self, graph: PlanGraph) -> dict[str, set[str]]:
+        if graph is self.base_graph:
+            return self._required_base
+        return self._required_pr
+
+    def _columns_to_emit(self, node: PlanNode, graph: PlanGraph) -> tuple[str, ...]:
+        live = {name.lower() for name in self._required_for(graph).get(node.id, set())}
+        if not live:
+            return tuple(node.columns)
+        ordered = [name for name in node.columns if name.lower() in live]
+        extra = [name for name in sorted(live) if name not in {item.lower() for item in ordered}]
+        return tuple(ordered + extra)
 
     def _join_pairs(self, node: PlanNode, graph: PlanGraph) -> tuple[tuple[str, str], ...]:
         left = graph.node(node.inputs[0])
@@ -2087,3 +2193,231 @@ def _tainted_ids(graph: PlanGraph, changed_filter_id: str) -> set[str]:
                 tainted.add(consumer)
                 queue.append(consumer)
     return tainted
+
+
+def _required_columns_for_key_cover(
+    graph: PlanGraph,
+    *,
+    entity_key: str,
+    dialect: str,
+) -> dict[str, set[str]]:
+    """Backward liveness for a terminal key-only RowCover.
+
+    The candidate query DISTINCT-projects the entity key at the grain
+    boundary. Aggregates such as MAX(customer_name) are not required on
+    that path unless they are themselves the entity key.
+    """
+    required: dict[str, set[str]] = defaultdict(set)
+    key = entity_key.lower()
+    required[graph.root_id].add(key)
+    for node in graph.nodes.values():
+        if node.kind == "group":
+            required[node.id].add(key)
+
+    def visit(node_id: str, seen: set[str]) -> None:
+        if node_id in seen:
+            return
+        seen.add(node_id)
+        node = graph.node(node_id)
+        live = {name.lower() for name in required[node_id]}
+        if node.kind == "group":
+            required[node.inputs[0]].update({key})
+            required[node.inputs[0]].update(_group_input_columns(node))
+        elif node.kind == "project":
+            input_names = {name.lower() for name in graph.node(node.inputs[0]).columns}
+            origin_by_name = {name.lower(): origin for name, origin in node.origins}
+            for col in live:
+                origin = origin_by_name.get(col, "")
+                if origin.startswith("agg:") or origin.startswith("expr:"):
+                    required[node.inputs[0]].update(_columns_in_sql(origin.split(":", 1)[-1], dialect))
+                    if col in input_names:
+                        required[node.inputs[0]].add(col)
+                    continue
+                origin_col = origin.rsplit(".", 1)[-1].lower() if origin else col
+                if col in input_names:
+                    required[node.inputs[0]].add(col)
+                elif origin_col:
+                    required[node.inputs[0]].add(origin_col)
+                else:
+                    required[node.inputs[0]].add(col)
+        elif node.kind in {"filter", "having"}:
+            required[node.inputs[0]].update(live)
+            required[node.inputs[0]].update(_columns_in_sql(node.payload, dialect))
+        elif node.kind in JOIN_KINDS:
+            left = graph.node(node.inputs[0])
+            right = graph.node(node.inputs[1])
+            left_names = {name.lower() for name in left.columns}
+            right_names = {name.lower() for name in right.columns}
+            for left_key, right_key in node.join_keys:
+                required[node.inputs[0]].add(left_key.lower())
+                required[node.inputs[1]].add(right_key.lower())
+            for col in live:
+                if col in left_names:
+                    required[node.inputs[0]].add(col)
+                if col in right_names:
+                    required[node.inputs[1]].add(col)
+                if col not in left_names and col not in right_names:
+                    if not left_names:
+                        required[node.inputs[0]].add(col)
+                    if not right_names:
+                        required[node.inputs[1]].add(col)
+        for input_id in node.inputs:
+            visit(input_id, seen)
+
+    visit(graph.root_id, set())
+    for node in graph.nodes.values():
+        if node.kind == "group" and node.id != graph.root_id:
+            visit(node.id, set())
+    return required
+
+
+def _group_key_tokens(node: PlanNode) -> list[str]:
+    payload = node.payload or ""
+    keys_part = payload.split(";aggs=", 1)[0]
+    if keys_part.startswith("keys="):
+        keys_part = keys_part[5:]
+    tokens: list[str] = []
+    for item in keys_part.split(","):
+        token = item.strip().strip('"').strip("'")
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _group_input_columns(node: PlanNode) -> set[str]:
+    """Map GROUP BY keys onto the input relation's projected names."""
+    names: set[str] = set()
+    for token in _group_key_tokens(node):
+        last = token.rsplit(".", 1)[-1].lower()
+        matched = False
+        for name, origin in node.origins:
+            origin_col = origin.rsplit(".", 1)[-1].lower()
+            if name.lower() == last or origin_col == last:
+                names.add(name.lower())
+                matched = True
+        if not matched:
+            names.add(last)
+    return names
+
+
+def _columns_in_sql(payload: str, dialect: str) -> set[str]:
+    if not payload or not payload.strip():
+        return set()
+    try:
+        tree = sqlglot.parse_one(payload, dialect=dialect)
+    except SqlglotError:
+        return set()
+    if tree is None:
+        return set()
+    return {str(col.name or "").lower() for col in tree.find_all(exp.Column) if col.name}
+
+
+def _name_is_emitted(
+    name: str,
+    emitted: set[str] | None,
+    catalog: set[str] | None,
+) -> bool:
+    key = name.lower()
+    if emitted is not None:
+        return key in emitted
+    if catalog:
+        return key in catalog
+    return True
+
+
+def _select_emitted_names(select: exp.Select | None) -> set[str] | None:
+    if select is None or not isinstance(select, exp.Select):
+        return None
+    names: set[str] = set()
+    for expr in select.expressions or []:
+        if isinstance(expr, exp.Star):
+            return None
+        if isinstance(expr, exp.Alias) and isinstance(expr.this, exp.Star):
+            return None
+        if isinstance(expr, exp.Column) and str(expr.name or "") == "*":
+            return None
+        alias = expr.alias if isinstance(expr, exp.Alias) else None
+        name = str(alias or getattr(expr, "alias_or_name", None) or getattr(expr, "name", "") or "")
+        if name == "*":
+            return None
+        if name:
+            names.add(name.lower())
+    return names
+
+
+def assert_candidate_sql_scopes(sql: str, *, dialect: str) -> None:
+    """Fail closed if generated SQL references a column its input did not emit."""
+    try:
+        tree = sqlglot.parse_one(sql, dialect=dialect)
+    except SqlglotError as error:
+        raise PlanError(
+            UNSUPPORTED_OPERATION,
+            f"generated candidate SQL could not be parsed: {error}",
+        ) from error
+    if tree is None:
+        raise PlanError(UNSUPPORTED_OPERATION, "generated candidate SQL could not be parsed")
+    _assert_select_scopes(tree)
+
+
+def _assert_select_scopes(node: exp.Expression) -> None:
+    for child in node.iter_expressions():
+        _assert_select_scopes(child)
+    if not isinstance(node, exp.Select):
+        return
+    scopes = _alias_emitted_map(node)
+    for column in node.find_all(exp.Column):
+        table = str(column.table or "").lower()
+        name = str(column.name or "").lower()
+        if not table or not name or name == "*":
+            continue
+        parent_select = column.parent
+        while parent_select is not None and not isinstance(parent_select, exp.Select):
+            parent_select = parent_select.parent
+        if parent_select is not node:
+            continue
+        if table not in scopes:
+            continue
+        emitted = scopes[table]
+        if emitted is None:
+            continue
+        if name not in emitted:
+            raise PlanError(
+                UNSUPPORTED_OPERATION,
+                f"generated SQL references {column.sql()} which is not emitted by input {table}",
+            )
+
+
+def _from_clause(select: exp.Select) -> exp.Expression | None:
+    node = select.args.get("from") or select.args.get("from_")
+    if isinstance(node, exp.From):
+        return node.this
+    return node
+
+
+def _alias_emitted_map(select: exp.Select) -> dict[str, set[str] | None]:
+    mapping: dict[str, set[str] | None] = {}
+    from_expr = _from_clause(select)
+    if from_expr is not None:
+        _record_source_alias(from_expr, mapping)
+    for join in select.args.get("joins") or []:
+        _record_source_alias(join.this, mapping)
+    return mapping
+
+
+def _record_source_alias(source: exp.Expression | None, mapping: dict[str, set[str] | None]) -> None:
+    if source is None:
+        return
+    if isinstance(source, exp.Subquery):
+        alias = str(source.alias_or_name or "").lower()
+        inner = source.this
+        if alias:
+            mapping[alias] = _select_emitted_names(inner) if isinstance(inner, exp.Select) else None
+        return
+    if isinstance(source, exp.Table):
+        alias = str(source.alias_or_name or source.name or "").lower()
+        if alias:
+            mapping[alias] = None
+        return
+    if isinstance(source, exp.Alias):
+        _record_source_alias(source.this, mapping)
+

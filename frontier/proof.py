@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from typing import Any
 
@@ -24,9 +24,9 @@ class SqlChangeProof:
     before_entity_count: int
     after_entity_count: int
     changed_source_row_count: int
-    missing_frontier_entities: int
-    extra_frontier_entities: int
-    mismatched_final_rows: int
+    missing_frontier_entities: int | None
+    extra_frontier_entities: int | None
+    mismatched_final_rows: int | None
     test_duration_ms: int
     full_rebuild_required: bool = False
     full_rebuild_recommended: bool = False
@@ -40,6 +40,8 @@ class SqlChangeProof:
 
     @property
     def targeted_repair_safe(self) -> bool:
+        if self.mismatched_final_rows is None or self.missing_frontier_entities is None:
+            return False
         return (
             self.mismatched_final_rows == 0
             and self.missing_frontier_entities == 0
@@ -208,9 +210,10 @@ def targeted_mismatch_sql(
     entity_key: str,
     dialect: str = "snowflake",
 ) -> str:
-    """Compare the PR-built model (candidate keys only) to targeted head output.
+    """Diagnostic-only: unchanged materialized mart vs targeted head.
 
-    Uses the already-built dbt relation instead of re-running compiled SQL.
+    This is the expected pre-repair symmetric difference, not a repair
+    validation. Do not execute it as assert_repaired_equals_reference.
     """
     filtered = (
         f"select frontier_reference.* from {reference_relation} as frontier_reference "
@@ -436,8 +439,13 @@ def _measure_targeted_sql_change_proof(
     changed_source_row_count: int | None,
     full_rebuild_required: bool,
 ) -> SqlChangeProof:
-    """Prove targeted head against the already-built PR model for candidate keys."""
-    entity_key = config.model.key
+    """Prove targeted head against already-built isolated tables.
+
+    Do not compare the unchanged materialized mart with targeted head.
+    That symmetric difference is the expected pre-repair delta and is not
+    a repair-validation failure. Authoritative repaired-vs-head counts
+    come from overlay_repair_validation().
+    """
     frontier_rows = _logged_count(
         warehouse,
         (
@@ -446,19 +454,6 @@ def _measure_targeted_sql_change_proof(
         ),
         "SQL-change proof frontier count",
     )
-    started = time.perf_counter()
-    mismatched = _logged_count(
-        warehouse,
-        targeted_mismatch_sql(
-            reference_relation=reference_relation,
-            targeted_after_relation=targeted_after_relation,
-            affected_relation=affected_relation,
-            entity_key=entity_key,
-            dialect=warehouse.dialect,
-        ),
-        "SQL-change proof repair check",
-    )
-    duration_ms = max(0, round((time.perf_counter() - started) * 1000))
     confirmed = confirmed_count if confirmed_count is not None else 0
     candidate = candidate_count if candidate_count is not None else frontier_rows
     extra = max(0, candidate - confirmed)
@@ -467,6 +462,7 @@ def _measure_targeted_sql_change_proof(
         raise ConfigError("after-change SQL returned no target entities")
     if frontier_rows < 0 or frontier_rows > full_entity_count:
         raise ConfigError("frontier recompute count is outside the full mart")
+    del config, affected_relation, reference_relation
     return SqlChangeProof(
         full_rows_recomputed=full_entity_count,
         frontier_rows_recomputed=frontier_rows,
@@ -479,8 +475,8 @@ def _measure_targeted_sql_change_proof(
         changed_source_row_count=changed_source,
         missing_frontier_entities=0,
         extra_frontier_entities=extra,
-        mismatched_final_rows=mismatched,
-        test_duration_ms=duration_ms,
+        mismatched_final_rows=None,
+        test_duration_ms=0,
         full_rebuild_required=full_rebuild_required,
     )
 
@@ -502,6 +498,7 @@ def measure_sql_change_proof(
     full_entity_count: int | None = None,
     changed_source_row_count: int | None = None,
     source_snapshot: Any | None = None,
+    skip_legacy_repair_mismatch: bool = False,
 ) -> SqlChangeProof:
     """Prove targeted repair of a SQL change against the full PR model.
 
@@ -612,16 +609,21 @@ def measure_sql_change_proof(
         changed_source = candidate_count
         source_population = candidate_count
     started = time.perf_counter()
-    mismatched = _logged_count(
-        warehouse,
-        mismatched_rows_sql(
-            after_relation=f"({after_sql})",
-            repaired_relation=f"({repaired})",
-            dialect=dialect,
-        ),
-        "SQL-change proof repair check",
-    )
-    duration_ms = max(0, round((time.perf_counter() - started) * 1000))
+    mismatched: int | None
+    if skip_legacy_repair_mismatch:
+        mismatched = None
+        duration_ms = 0
+    else:
+        mismatched = _logged_count(
+            warehouse,
+            mismatched_rows_sql(
+                after_relation=f"({after_sql})",
+                repaired_relation=f"({repaired})",
+                dialect=dialect,
+            ),
+            "SQL-change proof repair check",
+        )
+        duration_ms = max(0, round((time.perf_counter() - started) * 1000))
     frontier_rows = _logged_count(
         warehouse,
         f"select count(*) as frontier_rows_recomputed from ({targeted_after}) as frontier_rows_recomputed",
@@ -664,7 +666,9 @@ def measure_sql_change_proof(
         mismatched_final_rows=mismatched,
         test_duration_ms=duration_ms,
         full_rebuild_required=full_rebuild_required,
-        full_reference_validated=missing == 0 and mismatched == 0,
+        full_reference_validated=bool(
+            missing == 0 and mismatched is not None and mismatched == 0
+        ),
     )
 
 
@@ -804,19 +808,151 @@ def apply_resolved_delete(
     return resolved
 
 
-def sql_change_proof_validation_results(proof: SqlChangeProof) -> list[ValidationResult]:
+def repair_validation_is_authoritative(repair: dict[str, Any] | None) -> bool:
+    return (repair or {}).get("status") in {"SUCCEEDED", "FAILED"}
+
+
+def repair_zero_diff(repair: dict[str, Any] | None) -> bool:
+    payload = repair or {}
+    return (
+        payload.get("status") == "SUCCEEDED"
+        and payload.get("missingRows") == 0
+        and payload.get("extraRows") == 0
+        and payload.get("mismatchedRows") == 0
+        and payload.get("duplicateEntityKeys") in {0, None}
+        and payload.get("disposableResourcesCleaned") is True
+    )
+
+
+def repair_difference_count(repair: dict[str, Any] | None) -> int:
+    payload = repair or {}
+    parts = [
+        payload.get("missingRows"),
+        payload.get("extraRows"),
+        payload.get("mismatchedRows"),
+        payload.get("duplicateEntityKeys"),
+    ]
+    if all(part is None for part in parts):
+        return 1 if payload.get("status") == "FAILED" else 0
+    return sum(int(part or 0) for part in parts)
+
+
+def overlay_repair_validation(
+    proof: SqlChangeProof,
+    repair: dict[str, Any] | None,
+) -> SqlChangeProof:
+    """Replace legacy mart-vs-head counts with disposable repaired-vs-head counts."""
+    if not repair_validation_is_authoritative(repair):
+        return proof
+    payload = repair or {}
+    return replace(
+        proof,
+        missing_frontier_entities=payload.get("missingRows"),
+        extra_frontier_entities=payload.get("extraRows"),
+        mismatched_final_rows=payload.get("mismatchedRows"),
+        full_reference_validated=repair_zero_diff(payload),
+    )
+
+
+def repair_summary_metrics(
+    proof: SqlChangeProof,
+    repair: dict[str, Any] | None,
+) -> dict[str, int | None]:
+    if repair_validation_is_authoritative(repair):
+        payload = repair or {}
+        return {
+            "missingFrontierEntities": payload.get("missingRows"),
+            "extraFrontierEntities": payload.get("extraRows"),
+            "mismatchedFinalRows": payload.get("mismatchedRows"),
+        }
+    return {
+        "missingFrontierEntities": proof.missing_frontier_entities,
+        "extraFrontierEntities": proof.extra_frontier_entities,
+        "mismatchedFinalRows": proof.mismatched_final_rows,
+    }
+
+
+def targeted_repair_status_line(
+    *,
+    repair_status: str,
+    proof: SqlChangeProof,
+    skipped: bool,
+) -> str | None:
+    if skipped:
+        return "Targeted repair: skipped"
+    if repair_status in {"SUCCEEDED", "FAILED"}:
+        return None
+    if proof.targeted_repair_safe:
+        return "Targeted repair: safe"
+    if proof.mismatched_final_rows is None:
+        return "Targeted repair: not run"
+    return "Targeted repair: not safe"
+
+
+def finalize_sql_change_assessment(
+    proof: SqlChangeProof,
+    repair: dict[str, Any] | None,
+    validations: list[ValidationResult],
+    *,
+    include_repair_assertion: bool = True,
+) -> tuple[SqlChangeProof, list[ValidationResult]]:
+    overlaid = overlay_repair_validation(proof, repair)
+    kept = [
+        item
+        for item in validations
+        if item.test_name != "assert_repaired_equals_reference"
+    ]
+    if include_repair_assertion:
+        kept.append(repaired_equals_reference_result(overlaid, repair))
+    return overlaid, kept
+
+
+def repaired_equals_reference_result(
+    proof: SqlChangeProof,
+    repair: dict[str, Any] | None = None,
+) -> ValidationResult:
+    if repair_validation_is_authoritative(repair):
+        payload = repair or {}
+        if repair_zero_diff(payload):
+            return ValidationResult(
+                test_name="assert_repaired_equals_reference",
+                status="passed",
+                difference_count=0,
+                message=f"{proof.test_duration_ms} ms",
+            )
+        return ValidationResult(
+            test_name="assert_repaired_equals_reference",
+            status="failed",
+            difference_count=max(repair_difference_count(payload), 1),
+            message=str(payload.get("reason") or payload.get("reasonCode") or "disposable repair failed")[:4000],
+        )
+    if proof.mismatched_final_rows is None:
+        return ValidationResult(
+            test_name="assert_repaired_equals_reference",
+            status="skipped",
+            difference_count=0,
+            message="disposable repair not run",
+        )
+    return ValidationResult(
+        test_name="assert_repaired_equals_reference",
+        status="passed" if proof.mismatched_final_rows == 0 else "failed",
+        difference_count=proof.mismatched_final_rows,
+        message=f"{proof.test_duration_ms} ms",
+    )
+
+
+def sql_change_proof_validation_results(
+    proof: SqlChangeProof,
+    repair: dict[str, Any] | None = None,
+) -> list[ValidationResult]:
+    missing = proof.missing_frontier_entities
     return [
         ValidationResult(
             test_name="assert_sql_frontier_covers_reference",
-            status="passed" if proof.missing_frontier_entities == 0 else "failed",
-            difference_count=proof.missing_frontier_entities,
+            status="passed" if (missing or 0) == 0 else "failed",
+            difference_count=int(missing or 0),
         ),
-        ValidationResult(
-            test_name="assert_repaired_equals_reference",
-            status="passed" if proof.mismatched_final_rows == 0 else "failed",
-            difference_count=proof.mismatched_final_rows,
-            message=f"{proof.test_duration_ms} ms",
-        ),
+        repaired_equals_reference_result(proof, repair),
     ]
 
 

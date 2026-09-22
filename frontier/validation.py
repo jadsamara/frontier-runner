@@ -180,9 +180,14 @@ def sql_change_narrow_frontier_result(
     )
 
 
+def gating_validation_results(results: list[ValidationResult]) -> list[ValidationResult]:
+    return [item for item in results if item.status != "skipped"]
+
+
 def evidence_level(results: list[ValidationResult]) -> str:
-    names = {item.test_name for item in results}
-    all_passed = all(item.status == "passed" for item in results)
+    gating = gating_validation_results(results)
+    names = {item.test_name for item in gating}
+    all_passed = all(item.status == "passed" for item in gating)
     proof_tests = {
         "assert_changed_customers_in_frontier",
         "assert_no_extra_frontier_entities",
@@ -208,4 +213,4 @@ def evidence_level(results: list[ValidationResult]) -> str:
 
 
 def overall_status(results: list[ValidationResult]) -> str:
-    return "passed" if all(item.status == "passed" for item in results) else "failed"
+    return "failed" if any(item.status == "failed" for item in results) else "passed"

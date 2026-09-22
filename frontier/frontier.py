@@ -41,9 +41,9 @@ class AffectedEntity:
 
 @dataclass
 class FrontierResult:
-    full_entity_count: int
-    frontier_entity_count: int
-    percent_rows_avoided: float
+    full_entity_count: int | None
+    frontier_entity_count: int | None
+    percent_rows_avoided: float | None
     change_events: list[ChangeEvent]
     affected_entities: list[AffectedEntity]
     frontier_sql: str
@@ -70,6 +70,11 @@ class FrontierResult:
     frontier_bytes_scanned: int | None = None
     full_comparison_bytes_scanned: int | None = None
     warehouse_credits: float | None = None
+    mart_baseline: dict[str, Any] | None = None
+    repair_validation: dict[str, Any] | None = None
+    production_apply: dict[str, Any] | None = None
+    job_metrics: list[dict[str, Any]] = field(default_factory=list)
+    full_comparison_elapsed_ms: int | None = None
 
 
 def percent_rows_avoided(full_entity_count: int, frontier_entity_count: int) -> float:
@@ -580,7 +585,8 @@ def frontier_result_to_dict(
     include_entity_ids: bool,
     hash_key: str | None,
 ) -> dict[str, Any]:
-    if not include_entity_ids and not hash_key:
+    has_entity_ids = bool(result.change_events or result.affected_entities)
+    if not include_entity_ids and not hash_key and has_entity_ids:
         raise ConfigError(
             "FRONTIER_ENTITY_HASH_KEY is required unless --include-entity-ids is set"
         )

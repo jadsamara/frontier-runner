@@ -39,6 +39,7 @@ SOURCE_RELATION_UNSUPPORTED = "SOURCE_RELATION_UNSUPPORTED"
 SOURCE_TIME_TRAVEL_UNAVAILABLE = "SOURCE_TIME_TRAVEL_UNAVAILABLE"
 SOURCE_SNAPSHOT_BINDING_FAILED = "SOURCE_SNAPSHOT_BINDING_FAILED"
 SOURCE_SNAPSHOT_VERIFICATION_FAILED = "SOURCE_SNAPSHOT_VERIFICATION_FAILED"
+TARGET_SNAPSHOT_NOT_PINNED = "TARGET_SNAPSHOT_NOT_PINNED"
 
 PERMANENT_TABLE = "permanent_table"
 TRANSIENT_TABLE = "transient_table"
@@ -62,7 +63,7 @@ UNSUPPORTED_TYPES = frozenset(
     }
 )
 
-_ISOLATED_MARKERS = ("AFFECTED_KEYS", "TARGET_BASE", "TARGET_HEAD")
+_ISOLATED_MARKERS = ("AFFECTED_KEYS", "TARGET_BASE", "TARGET_HEAD", "MART_COPY", "HEAD_REF")
 _SECRET_KEY = re.compile(
     r"(password|secret|token|credential|api[_-]?key|private[_-]?key|entity[_-]?id)",
     re.IGNORECASE,
@@ -118,6 +119,11 @@ class SourceSnapshot:
             if _relation_key(binding.name) == key:
                 return binding
         return None
+
+    def add_binding(self, binding: RelationBinding) -> None:
+        if self.binding_for(binding.name) is not None:
+            return
+        self.relation_bindings = (*self.relation_bindings, binding)
 
     @property
     def relations_checked(self) -> int:
@@ -317,6 +323,51 @@ def capture_from_catalog(
         relation_bindings=bindings,
         adapter_evidence=adapter_evidence_token(identifier),
     )
+
+
+def include_target_in_snapshot(snapshot: SourceSnapshot, target_relation: str, warehouse: Any) -> tuple[bool, str | None, str | None]:
+    """Add the physical target mart to the adapter snapshot inventory, fail closed."""
+    if snapshot is None or snapshot.assurance != ASSURANCE_ADAPTER:
+        return False, TARGET_SNAPSHOT_NOT_PINNED, "existing target cannot be read at a pinned adapter snapshot"
+    if snapshot.binding_for(target_relation) is not None:
+        binding = snapshot.binding_for(target_relation)
+        if binding is None or not binding.supported or binding.relation_type not in TIME_TRAVEL_TYPES:
+            return False, TARGET_SNAPSHOT_NOT_PINNED, "existing target is not a supported physical table with usable snapshot retention"
+        return True, None, None
+    inventory = getattr(warehouse, "inventory_relations", None) or getattr(warehouse, "_inventory_relations", None)
+    catalog: dict[str, dict[str, Any]] = {}
+    if callable(inventory):
+        try:
+            catalog = dict(inventory([target_relation]) or {})
+        except Exception as error:
+            return (
+                False,
+                TARGET_SNAPSHOT_NOT_PINNED,
+                f"adapter could not inventory the existing target: {error}"[:512],
+            )
+    else:
+        raw = getattr(warehouse, "relation_catalog", None) or {}
+        catalog = {
+            name: entry
+            for name, entry in dict(raw).items()
+            if _relation_key(str(name)) == _relation_key(target_relation)
+        }
+    if not catalog:
+        return False, TARGET_SNAPSHOT_NOT_PINNED, "existing target is not in the adapter snapshot inventory"
+    bindings, failure_code, failure_reason = _resolve_catalog_bindings(
+        [target_relation],
+        catalog,
+        fail_closed=True,
+    )
+    binding = next((item for item in bindings if _relation_key(item.name) == _relation_key(target_relation)), None)
+    if binding is None or not binding.supported or binding.relation_type not in TIME_TRAVEL_TYPES:
+        return (
+            False,
+            failure_code or TARGET_SNAPSHOT_NOT_PINNED,
+            failure_reason or "existing target is not a supported physical table with usable snapshot retention",
+        )
+    snapshot.add_binding(binding)
+    return True, None, None
 
 
 def assert_snapshot_payload_is_safe(payload: dict[str, Any], *, path: tuple[str, ...] = ()) -> None:

@@ -5,6 +5,12 @@ All notable changes to frontier-runner are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-09-22
+
+- Disposable repair validation is the authoritative repaired-vs-head check. The unchanged materialized mart versus head comparison is an expected pre-repair difference and no longer fails the run.
+- `assert_repaired_equals_reference`, mismatch counts, targeted-repair safety, GitHub comments, and run detail now follow `repairValidation`. Production apply remains not requested unless explicitly applied.
+- Mart baseline, candidate certification, disposable repair, production apply, economics, and execution stay independent dimensions. `NOT_EVALUATED` economics does not fail a correct assessment.
+
 ## [0.2.1] — 2026-09-22
 
 - Made filter-v1 eligibility and the RowCover candidate compiler authoritative for `compare` and `prove`. Ineligible plans stay `UNCERTIFIED` and are not reported as safe for targeted repair.
@@ -94,6 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SaaS commands resolve stored keychain credentials through one shared
   resolver instead of requiring `FRONTIER_API_KEY` in the environment.
 
+[0.2.2]: https://github.com/jadsamara/frontier-runner/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/jadsamara/frontier-runner/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jadsamara/frontier-runner/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/jadsamara/frontier-runner/compare/v0.1.2...v0.1.3

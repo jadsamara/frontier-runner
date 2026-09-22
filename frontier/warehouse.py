@@ -152,6 +152,8 @@ class FakeWarehouse:
         self.last_query_id: str | None = None
         self.query_ids: list[str] = []
         self.relation_catalog = dict(relation_catalog or {})
+        self.tables: dict[str, list[tuple[Any, ...]]] = {}
+        self.fail_on: dict[str, Exception] = {}
         for name, definition in (view_definitions or {}).items():
             entry = dict(self.relation_catalog.get(name) or {})
             entry.setdefault("kind", "view")
@@ -186,11 +188,33 @@ class FakeWarehouse:
 
         return verify(sql, snapshot, dialect=self.dialect)
 
+    def seed_table(self, relation: str, rows: list[tuple[Any, ...]]) -> None:
+        from frontier.mutation import canonicalize_relation
+
+        self.tables[canonicalize_relation(relation)] = [tuple(row) for row in rows]
+
+    def inventory_relations(self, relations: list[str] | tuple[str, ...]) -> dict[str, dict[str, Any]]:
+        from frontier.snapshot import _relation_key
+
+        catalog: dict[str, dict[str, Any]] = {}
+        for name in relations:
+            for raw, entry in self.relation_catalog.items():
+                if _relation_key(str(raw)) == _relation_key(str(name)):
+                    catalog[str(name)] = dict(entry)
+                    break
+        return catalog
+
     def execute(self, sql: str) -> list[tuple[Any, ...]]:
         self.executed.append(sql)
         self.last_query_id = f"fake-qid-{len(self.executed)}"
         self.query_ids.append(self.last_query_id)
         normalized = " ".join(sql.lower().split())
+        for needle, error in self.fail_on.items():
+            if needle.lower() in normalized:
+                raise error
+        stored = self._maybe_mutate_tables(sql, normalized)
+        if stored is not None and normalized.startswith(("select ", "with ")):
+            return stored
         if normalized.startswith(("create ", "drop ", "insert ", "delete ", "merge ", "create or replace")):
             return []
         if "as frontier_origin_keys" in normalized:
@@ -212,10 +236,133 @@ class FakeWarehouse:
             if matched is not None:
                 return matched
             return [(150_000,)]
+        if "as frontier_deleted_count" in normalized:
+            return self._count_join_from_tables(sql) or [(0,)]
+        if "as frontier_inserted_count" in normalized:
+            rows = self._table_from_alias(sql, "frontier_inserted_count")
+            return [(len(rows),)] if rows is not None else [(0,)]
         matched = self._match_response(normalized)
         if matched is not None:
             return matched
         raise ConfigError(f"FakeWarehouse has no response for SQL: {sql}")
+
+    def _table_from_alias(self, sql: str, alias: str) -> list[tuple[Any, ...]] | None:
+        from frontier.mutation import canonicalize_relation
+
+        match = re.search(
+            rf"from\s+([A-Za-z0-9_`.\"]+)(?:\s+at\b.*?)?\s+as\s+{re.escape(alias)}\b",
+            sql,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return None
+        return self.tables.get(canonicalize_relation(match.group(1)))
+
+    def _count_join_from_tables(self, sql: str) -> list[tuple[Any, ...]] | None:
+        from frontier.mutation import canonicalize_relation
+
+        match = re.search(
+            r"from\s+([A-Za-z0-9_`.\"]+)\s+as\s+frontier_deleted_count.*?join\s+([A-Za-z0-9_`.\"]+)",
+            sql,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return None
+        left = self.tables.get(canonicalize_relation(match.group(1)), [])
+        right = self.tables.get(canonicalize_relation(match.group(2)), [])
+        keys = {row[0] for row in right if row}
+        return [(sum(1 for row in left if row and row[0] in keys),)]
+
+    def _maybe_mutate_tables(self, sql: str, normalized: str) -> list[tuple[Any, ...]] | None:
+        from frontier.mutation import canonicalize_relation
+
+        if normalized.startswith("create schema"):
+            return None
+        if normalized.startswith(("create or replace table", "create table ", "create temporary table")):
+            target = self._created_relation(sql)
+            if not target:
+                return None
+            source = re.search(
+                r"select\s+\*\s+from\s+([A-Za-z0-9_`.\"]+)",
+                sql,
+                flags=re.IGNORECASE,
+            )
+            if source:
+                rows = self.tables.get(canonicalize_relation(source.group(1)), [])
+                self.tables[target] = [tuple(row) for row in rows]
+            elif "as frontier_keys" in normalized or "affected_keys" in target.lower():
+                keys = self._synthetic_origin_keys()
+                self.tables[target] = [(row[0],) if len(row) > 1 else row for row in keys] or [
+                    (row[0],) for row in keys
+                ]
+                if keys:
+                    self.tables[target] = list(keys)
+            else:
+                matched = self._match_response(normalized)
+                if matched is not None:
+                    self.tables[target] = [tuple(row) for row in matched]
+                else:
+                    self.tables.setdefault(target, [])
+            return None
+        if normalized.startswith("delete from"):
+            match = re.search(r"delete\s+from\s+([A-Za-z0-9_`.\"]+)", sql, flags=re.IGNORECASE)
+            keys_match = re.search(
+                r"in\s*\(\s*select\s+([A-Za-z0-9_]+)\s+from\s+([A-Za-z0-9_`.\"]+)",
+                sql,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                target = canonicalize_relation(match.group(1))
+                current = self.tables.get(target, [])
+                if keys_match:
+                    key_rows = self.tables.get(canonicalize_relation(keys_match.group(2)), [])
+                    keys = {row[0] for row in key_rows if row}
+                    self.tables[target] = [row for row in current if row and row[0] not in keys]
+                else:
+                    self.tables[target] = []
+            return None
+        if normalized.startswith("insert into"):
+            match = re.search(
+                r"insert\s+into\s+([A-Za-z0-9_`.\"]+)\s+select\s+\*\s+from\s+([A-Za-z0-9_`.\"]+)",
+                sql,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                target = canonicalize_relation(match.group(1))
+                source = self.tables.get(canonicalize_relation(match.group(2)), [])
+                self.tables.setdefault(target, []).extend(tuple(row) for row in source)
+            return None
+        if normalized.startswith("drop table"):
+            match = re.search(r"drop\s+table(?:\s+if\s+exists)?\s+([A-Za-z0-9_`.\"]+)", sql, flags=re.IGNORECASE)
+            if match:
+                self.tables.pop(canonicalize_relation(match.group(1)), None)
+            return None
+        for alias in (
+            "frontier_mart_baseline",
+            "frontier_old_complete",
+            "frontier_head_complete",
+            "frontier_repaired_copy",
+        ):
+            if f"as {alias}" in normalized:
+                matched = self._match_response(normalized)
+                if matched is not None:
+                    return matched
+                rows = self._table_from_alias(sql, alias)
+                if rows is not None:
+                    return rows
+        return None
+
+    def _created_relation(self, sql: str) -> str | None:
+        from frontier.mutation import canonicalize_relation
+
+        match = re.search(
+            r"create(?:\s+or\s+replace)?(?:\s+temporary)?\s+table\s+([A-Za-z0-9_`.\"]+)",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        return canonicalize_relation(match.group(1))
 
     def _match_response(self, normalized: str) -> list[tuple[Any, ...]] | None:
         for needle, rows in self.responses.items():

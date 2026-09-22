@@ -186,6 +186,156 @@ def test_comment_explains_sql_change_without_entity_ids() -> None:
     assert "event_001" not in body
 
 
+def test_comment_states_baseline_repair_and_production_not_applied() -> None:
+    body = format_pr_comment(
+        {
+            **PASSED_PAYLOAD,
+            "sqlComparison": {
+                "base": {
+                    "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "modelCount": 1,
+                },
+                "pr": {
+                    "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "modelCount": 1,
+                },
+                "added": [],
+                "removed": [],
+                "modified": [],
+                "certification": {"status": "SQL_CERTIFIED"},
+                "martBaseline": {"status": "MATCHED"},
+                "repairValidation": {"status": "SUCCEEDED"},
+                "productionApply": {"status": "NOT_REQUESTED"},
+                "baselineBoundary": {
+                    "comparesSqlVersionsAtPinnedSnapshot": True,
+                    "existingMaterializedMartRepresentsSnapshot": True,
+                    "safeInPlaceProductionRepair": True,
+                },
+                "economics": {
+                    "decision": "TARGETED_REPAIR_RECOMMENDED",
+                    "measurementBasis": "BYTES_AND_TIME_ONLY",
+                    "reason": "bytes processed are not billed cost",
+                },
+            },
+        },
+        run_url="https://frontier.example/runs/11111111-1111-4111-8111-111111111111",
+    )
+    assert "Candidate set certified: yes (SQL_CERTIFIED)" in body
+    assert "Existing mart baseline: MATCHED" in body
+    assert "Disposable repair validated: SUCCEEDED" in body
+    assert "Production repair not applied" in body
+    assert "Repair procedure validated at the pinned snapshot. Production was not modified." in body
+    assert "Targeted repair: not safe" not in body
+    assert "bytes processed are not billed cost" in body
+    assert "safe repair" not in body.lower() or "Existing mart baseline" in body
+
+
+def test_comment_ignores_legacy_pre_repair_926_when_disposable_succeeded() -> None:
+    body = format_pr_comment(
+        {
+            **PASSED_PAYLOAD,
+            "changeEvents": [],
+            "status": "passed",
+            "validationResults": [
+                {
+                    "testName": "assert_sql_frontier_covers_reference",
+                    "status": "passed",
+                    "differenceCount": 0,
+                },
+                {
+                    "testName": "assert_repaired_equals_reference",
+                    "status": "passed",
+                    "differenceCount": 0,
+                },
+            ],
+            "metrics": {
+                **PASSED_PAYLOAD["metrics"],
+                "frontierEntityCount": 463,
+                "candidateFrontierCount": 463,
+                "confirmedFrontierCount": 463,
+                "missingFrontierEntities": 0,
+                "extraFrontierEntities": 0,
+                "mismatchedFinalRows": 926,
+            },
+            "sqlComparison": {
+                "base": {"fingerprint": "a" * 64, "modelCount": 4},
+                "pr": {"fingerprint": "b" * 64, "modelCount": 4},
+                "added": [],
+                "removed": [],
+                "modified": [
+                    {
+                        "name": "int_customer_orders",
+                        "changeKinds": ["FILTER_CHANGED"],
+                        "impactStatus": "COMPILED",
+                    }
+                ],
+                "narrowFrontierSafe": True,
+                "fullRebuildRequired": False,
+                "certification": {"status": "SQL_CERTIFIED"},
+                "validation": {"status": "CANDIDATES_CONFIRMED"},
+                "martBaseline": {"status": "MATCHED"},
+                "repairValidation": {
+                    "status": "SUCCEEDED",
+                    "missingRows": 0,
+                    "extraRows": 0,
+                    "mismatchedRows": 0,
+                    "duplicateEntityKeys": 0,
+                    "disposableResourcesCleaned": True,
+                },
+                "productionApply": {"status": "NOT_REQUESTED"},
+                "baselineBoundary": {
+                    "comparesSqlVersionsAtPinnedSnapshot": True,
+                    "existingMaterializedMartRepresentsSnapshot": True,
+                    "safeInPlaceProductionRepair": True,
+                },
+                "economics": {"decision": "NOT_EVALUATED"},
+                "execution": {"status": "SUCCEEDED"},
+            },
+        },
+        run_url="https://frontier.example/runs/11111111-1111-4111-8111-111111111111",
+    )
+    assert "Disposable repair validated: SUCCEEDED" in body
+    assert "Production repair not applied" in body
+    assert "Repair procedure validated at the pinned snapshot. Production was not modified." in body
+    assert "Targeted repair: not safe" not in body
+    assert "Targeted repair: safe" not in body
+    assert "926" not in body
+
+
+def test_comment_historical_payload_does_not_infer_disposable_success() -> None:
+    body = format_pr_comment(
+        {
+            **PASSED_PAYLOAD,
+            "changeEvents": [],
+            "metrics": {
+                **PASSED_PAYLOAD["metrics"],
+                "mismatchedFinalRows": 0,
+                "missingFrontierEntities": 0,
+                "candidateFrontierCount": 12,
+                "confirmedFrontierCount": 8,
+            },
+            "sqlComparison": {
+                "base": {"fingerprint": "a" * 64, "modelCount": 4},
+                "pr": {"fingerprint": "b" * 64, "modelCount": 4},
+                "added": [],
+                "removed": [],
+                "modified": [
+                    {
+                        "name": "int_customer_orders",
+                        "changeKinds": ["FILTER_CHANGED"],
+                    }
+                ],
+                "narrowFrontierSafe": True,
+            },
+        },
+        run_url="https://frontier.example/runs/11111111-1111-4111-8111-111111111111",
+    )
+    assert "Disposable repair validated: SUCCEEDED" not in body
+    assert "safeInPlaceProductionRepair" not in body
+    assert "Repair procedure validated at the pinned snapshot" not in body
+    assert "Targeted repair: safe" in body
+
+
 def test_comment_reports_live_sql_change_warehouse_counts() -> None:
     body = format_pr_comment(
         {
@@ -333,6 +483,35 @@ def test_comment_renders_unmeasured_values_for_required_rebuild() -> None:
     assert "Candidate customers: 150,000" in body
     assert "Evidence: none" in body
     assert "Changed source rows: 0" not in body
+
+
+def test_comment_unknown_population_is_not_placeholder_one() -> None:
+    body = format_pr_comment(
+        {
+            "status": "failed",
+            "evidenceLevel": "none",
+            "model": PASSED_PAYLOAD["model"],
+            "metrics": {
+                "fullEntityCount": None,
+                "frontierEntityCount": None,
+                "percentRowsAvoided": None,
+            },
+            "changeEvents": [],
+            "affectedEntities": [],
+            "validationResults": [
+                {
+                    "testName": "assert_frontier_execution",
+                    "status": "failed",
+                    "differenceCount": 1,
+                }
+            ],
+        },
+        run_url="https://frontier.example/runs/11111111-1111-4111-8111-111111111111",
+    )
+    assert "Not measured of Not measured" in body
+    assert "Rows avoided: n/a" in body
+    assert "1 of 1" not in body
+    assert "Affected customers: 1" not in body
 
 
 def test_comment_reports_origin_counts_without_entity_ids() -> None:

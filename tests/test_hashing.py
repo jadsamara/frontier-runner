@@ -217,6 +217,38 @@ def test_missing_key_fails_unless_include_entity_ids(
     assert "370" in {entity["entityValue"] for entity in raw["affectedEntities"]}
 
 
+def test_empty_entity_lists_do_not_require_hash_key() -> None:
+    from frontier.frontier import FrontierResult
+
+    config = load_frontier_config(FIXTURES / "frontier.yml")
+    result = FrontierResult(
+        full_entity_count=None,
+        frontier_entity_count=None,
+        percent_rows_avoided=None,
+        change_events=[],
+        affected_entities=[],
+        frontier_sql="",
+        metrics_sql="",
+        execution_failed=True,
+    )
+    payload = frontier_result_to_dict(
+        result,
+        config=config,
+        include_entity_ids=False,
+        hash_key=None,
+    )
+    assert payload["changeEvents"] == []
+    assert payload["affectedEntities"] == []
+    assert payload["metrics"]["fullEntityCount"] is None
+    assert payload["metrics"]["frontierEntityCount"] is None
+    assert payload["metrics"]["percentRowsAvoided"] is None
+    assert 1 not in {
+        payload["metrics"]["fullEntityCount"],
+        payload["metrics"]["frontierEntityCount"],
+        payload["metrics"]["percentRowsAvoided"],
+    }
+
+
 def test_normalize_does_not_change_non_integer_identity() -> None:
     assert normalize_entity_value("CUST-370") == "CUST-370"
     assert normalize_entity_value("370.1") == "370.1"

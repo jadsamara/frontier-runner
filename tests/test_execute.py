@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from frontier.config import ConfigError, load_frontier_config
@@ -488,6 +490,58 @@ def test_cleanup_runs_on_success_and_failure() -> None:
         session.materialize(["370"])
     session.cleanup()
     assert any(sql.lower().startswith("drop table if exists") for sql in boom.executed)
+
+
+def test_isolated_run_mutates_only_frontier_tables_then_drops() -> None:
+    warehouse = FakeWarehouse({"confirmed_frontier_count": [(3,)]})
+    session = IsolatedRun(
+        warehouse=warehouse,
+        relation="DATA_AGENT_DEV.DBT_CI.FRONTIER_SYNTH_AFFECTED_KEYS",
+        database="DATA_AGENT_DEV",
+        schema="DBT_CI",
+        run_id="synth-repair",
+        entity_key="customer_id",
+    )
+    session.materialize(["1", "4", "5"])
+    confirmed = session.confirm(
+        before_sql="select customer_id, customer_name, 1 as n from customer_summary",
+        after_sql="select customer_id, customer_name, 2 as n from customer_summary",
+    )
+    assert confirmed == ()
+    session.cleanup()
+    ddl_target = re.compile(
+        r"(?:create or replace table|create table if not exists|create table|"
+        r"drop table if exists|drop table)\s+([^\s(]+)",
+        re.IGNORECASE,
+    )
+    mutated: list[str] = []
+    dropped: list[str] = []
+    for sql in warehouse.executed:
+        match = ddl_target.search(sql)
+        if not match:
+            continue
+        table = match.group(1).strip('"').strip("`").split(".")[-1]
+        mutated.append(table.upper())
+        if sql.lower().lstrip().startswith("drop"):
+            dropped.append(table.upper())
+    assert mutated
+    assert all(name.startswith("FRONTIER_") for name in mutated)
+    assert "FRONTIER_SYNTH_AFFECTED_KEYS" in mutated
+    assert any(name.endswith("TARGET_BASE") for name in mutated)
+    assert any(name.endswith("TARGET_HEAD") for name in mutated)
+    assert dropped
+    assert all(name.startswith("FRONTIER_") for name in dropped)
+    dml_target = re.compile(
+        r"\b(?:insert\s+into|delete\s+from|update|merge\s+into|truncate(?:\s+table)?|alter\s+table)\s+([^\s(]+)",
+        re.IGNORECASE,
+    )
+    for sql in warehouse.executed:
+        match = dml_target.search(sql)
+        if not match:
+            continue
+        table = match.group(1).strip('"').strip("`").split(".")[-1].upper()
+        if not table.startswith("FRONTIER_"):
+            raise AssertionError(f"isolated run must not issue customer-mart DML: {sql}")
 
 
 def test_jaffle_three_customers_without_handwritten_frontier_models(monkeypatch) -> None:

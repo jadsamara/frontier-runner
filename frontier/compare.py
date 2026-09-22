@@ -541,11 +541,22 @@ def format_compare_report(comparison: dict[str, Any]) -> str:
                 "legacy impact SQL is not evidence that repair is safe",
             ]
         )
-    elif safe is not None:
+    elif eligibility.get("eligible") is True:
         lines.extend(
             [
                 "",
-                f"Narrow frontier safe: {'yes' if safe and (not eligibility or certified) else 'no'}",
+                "certification: pending warehouse execution",
+                "narrow frontier decision: not yet established",
+            ]
+        )
+        if certified:
+            lines.append("candidate SQL: compiled")
+    elif safe is False:
+        lines.extend(
+            [
+                "",
+                "Narrow frontier safe: no — filter-v1 certification rejected this plan; "
+                "legacy impact SQL is not evidence that repair is safe",
             ]
         )
     if comparison.get("fullRebuildRequired"):

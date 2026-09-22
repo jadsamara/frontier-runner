@@ -106,6 +106,9 @@ from frontier.proof import (
     failed_execution_sql_change_proof,
     resolve_deleted_order,
     sql_change_proof_validation_results,
+    finalize_sql_change_assessment,
+    repair_summary_metrics,
+    targeted_repair_status_line,
 )
 from frontier.warehouse import (
     FakeWarehouse,
@@ -245,6 +248,8 @@ def _write_failed_prove_run(
     manifest,
     phase: str,
     code: str,
+    snapshot=None,
+    warehouse=None,
 ) -> Path | None:
     """Overwrite frontier-run.json with this invocation's failed assessment."""
     output = Path(args.output) if getattr(args, "output", None) else _target_dir(_project_dir(args)) / RUN_FILE_NAME
@@ -255,10 +260,13 @@ def _write_failed_prove_run(
     text = str(error)
     if isinstance(error, ConfigError) and ENVIRONMENT_MISMATCH in text:
         code_name = ENVIRONMENT_MISMATCH
+    query_id = getattr(warehouse, "last_query_id", None)
+    if query_id and str(query_id) not in reason:
+        reason = f"warehouse job: {query_id}; {reason}"[:512]
     result = FrontierResult(
-        full_entity_count=1,
-        frontier_entity_count=1,
-        percent_rows_avoided=0.0,
+        full_entity_count=None,
+        frontier_entity_count=None,
+        percent_rows_avoided=None,
         change_events=[],
         affected_entities=[],
         frontier_sql="",
@@ -270,6 +278,10 @@ def _write_failed_prove_run(
         failure_reason=reason[:512],
         proof_status="EXECUTION_FAILED",
         execution_reasons=(f"{code_name}: {reason}",),
+        source_snapshot=snapshot,
+        targeted_query_id=str(query_id) if query_id else None,
+        sql_change_candidate_count=None,
+        confirmed_count=None,
     )
     comparison = dict(sql_comparison) if sql_comparison else None
     if comparison is not None:
@@ -283,6 +295,20 @@ def _write_failed_prove_run(
             message=f"{phase_name}: {code_name}: {reason[:400]}",
         )
     ]
+    extra_metrics = {
+        "fullEntityCount": None,
+        "frontierEntityCount": None,
+        "percentRowsAvoided": None,
+        "sqlChangeCandidateCount": None,
+        "confirmedFrontierCount": None,
+        "confirmedEntityCount": None,
+        "missedEntityCount": None,
+        "missingFrontierEntities": None,
+        "extraFrontierEntities": None,
+        "candidateFrontierCount": None,
+        "changedSourceRowCount": None,
+        "sourcePopulationCount": None,
+    }
     try:
         path = _emit_run(
             args,
@@ -290,6 +316,7 @@ def _write_failed_prove_run(
             manifest=manifest,
             result=result,
             validations=validations,
+            extra_metrics=extra_metrics,
             sql_comparison=comparison,
         )
         print(f"Wrote failed assessment to {path}", flush=True)
@@ -816,6 +843,11 @@ def _stamp_sql_comparison(args: argparse.Namespace, comparison: dict[str, Any] |
     execution_failed = bool(getattr(result, "execution_failed", False))
     eligible = eligibility.get("eligible") is True
     snapshot = getattr(result, "source_snapshot", None)
+    failure_phase = str(getattr(result, "failure_phase", "") or "")
+    validation_attempted = execution_failed and any(
+        token in failure_phase.lower()
+        for token in ("warehouse execution", "impact", "confirm", "materializ", "snapshot")
+    )
     static_certified = filter_v1_sql_certified(
         eligible=eligible,
         compiled=compiled,
@@ -844,13 +876,18 @@ def _stamp_sql_comparison(args: argparse.Namespace, comparison: dict[str, Any] |
         full_comparison_bytes=getattr(result, "full_comparison_bytes_scanned", None),
         warehouse_credits=getattr(result, "warehouse_credits", None),
         candidates_confirmed=confirmed,
-        confirmation_failed=getattr(result, "failure_phase", None) == "CONFIRMED",
+        confirmation_failed=validation_attempted or getattr(result, "failure_phase", None) == "CONFIRMED",
         full_reference_validated=bool(getattr(result, "full_reference_validated", False)),
         full_reference_failed=getattr(result, "failure_phase", None) == "FULL_REFERENCE",
         failure_phase=getattr(result, "failure_phase", None) if execution_failed else None,
         failure_code=getattr(result, "failure_code", None) if execution_failed else None,
         failure_reason=getattr(result, "failure_reason", None) if execution_failed else None,
     )
+    query_id = getattr(result, "targeted_query_id", None)
+    if query_id:
+        execution = dict(dimensions.get("execution") or {})
+        execution["warehouseQueryId"] = str(query_id)[:128]
+        dimensions["execution"] = execution
     enrich_certification_record(
         dimensions,
         eligibility=eligibility,
@@ -858,6 +895,38 @@ def _stamp_sql_comparison(args: argparse.Namespace, comparison: dict[str, Any] |
         candidate_fingerprint=eligibility.get("candidateFingerprint"),
         execution_failed=execution_failed,
     )
+    from frontier.repair import baseline_boundary_from, economics_from_jobs, empty_production_apply
+
+    mart = getattr(result, "mart_baseline", None)
+    repair = getattr(result, "repair_validation", None)
+    production = getattr(result, "production_apply", None) or empty_production_apply()
+    if mart:
+        dimensions["martBaseline"] = mart
+    if repair:
+        dimensions["repairValidation"] = repair
+    dimensions["productionApply"] = production
+    dimensions["baselineBoundary"] = baseline_boundary_from(
+        mart_baseline=mart,
+        repair_validation=repair,
+        certification_status=(dimensions.get("certification") or {}).get("status"),
+        validation_status=(dimensions.get("validation") or {}).get("status"),
+        snapshot=snapshot,
+        cleanup_ok=(repair or {}).get("disposableResourcesCleaned"),
+        execution_failed=execution_failed,
+    )
+    jobs = getattr(result, "job_metrics", None)
+    if jobs:
+        dimensions["economics"] = {
+            **(dimensions.get("economics") or {}),
+            **economics_from_jobs(
+                jobs,
+                phase_timings=getattr(result, "phase_timings", None),
+                warehouse_credits=getattr(result, "warehouse_credits", None),
+                full_bytes=getattr(result, "full_comparison_bytes_scanned", None),
+                full_elapsed_ms=getattr(result, "full_comparison_elapsed_ms", None),
+                include_full_reference=bool(getattr(result, "full_reference_validated", False)),
+            ),
+        }
     stamped.update(dimensions)
     if (stamped.get("economics") or {}).get("decision") == FULL_REBUILD_RECOMMENDED:
         stamped["fullRebuildRecommended"] = True
@@ -959,10 +1028,34 @@ def _print_assessment_dimensions(comparison: dict[str, Any] | None) -> None:
         )
     boundary = comparison.get("baselineBoundary") or {}
     if boundary:
+        mart = comparison.get("martBaseline") or {}
+        repair = comparison.get("repairValidation") or {}
+        production = comparison.get("productionApply") or {}
         print(
-            "Baseline: this assessment compares two SQL versions at one pinned source snapshot; "
-            "the existing materialized dbt mart is not that snapshot; "
-            "in-place production repair is not certified."
+            "Candidate set: "
+            + str((comparison.get("certification") or {}).get("status") or "UNCERTIFIED")
+        )
+        print(
+            "Existing mart baseline: "
+            + str(mart.get("status") or "NOT_RUN")
+        )
+        print(
+            "Disposable repair: "
+            + str(repair.get("status") or "NOT_RUN")
+        )
+        if boundary.get("safeInPlaceProductionRepair"):
+            print("Targeted repair procedure: validated at this snapshot")
+        else:
+            print("Targeted repair procedure: not certified")
+        print(
+            "Production repair: "
+            + ("not applied" if (production.get("status") or "NOT_REQUESTED") in {"NOT_REQUESTED", "NOT_RUN"} else str(production.get("status")))
+        )
+    economics = comparison.get("economics") or {}
+    if economics.get("measurementBasis"):
+        print(
+            f"Economics basis: {economics.get('measurementBasis')} "
+            f"({economics.get('reason') or 'no monetary savings claimed from bytes alone'})"
         )
 
 
@@ -997,7 +1090,12 @@ def _emit_run(
     include_entity_ids = args.include_entity_ids or config.upload.include_entity_ids
     hash_entity_ids = args.hash_entity_ids or config.upload.hash_entity_ids
     send_raw_ids = include_entity_ids and not hash_entity_ids
-    hash_key = None if send_raw_ids else entity_hash_key_from_env()
+    has_entity_ids = bool(
+        getattr(result, "change_events", ()) or getattr(result, "affected_entities", ())
+    )
+    hash_key = None
+    if not send_raw_ids and has_entity_ids:
+        hash_key = entity_hash_key_from_env()
     details = frontier_result_to_dict(
         result,
         config=config,
@@ -1026,6 +1124,7 @@ def _emit_run(
     sql_check = sql_change_narrow_frontier_result(sql_comparison)
     if sql_check is not None:
         validations.append(sql_check)
+    payload_validations = [item for item in validations if item.status != "skipped"]
     payload = build_ingest_payload(
         external_run_id=run_id,
         project=config.project,
@@ -1047,9 +1146,9 @@ def _emit_run(
                 "differenceCount": item.difference_count,
                 **({"message": item.message} if item.message else {}),
             }
-            for item in validations
+            for item in payload_validations
         ],
-        evidence_level=evidence_level(validations),
+        evidence_level=evidence_level(payload_validations),
         status=overall_status(validations),
         git=github_source(),
         entity_ids_hashed=not send_raw_ids,
@@ -1236,9 +1335,9 @@ def cmd_record_failure(args: argparse.Namespace) -> int:
         entity_key=config.model.key,
         grain=config.model.grain,
         metrics={
-            "fullEntityCount": 1,
-            "frontierEntityCount": 0,
-            "percentRowsAvoided": 100.0,
+            "fullEntityCount": None,
+            "frontierEntityCount": None,
+            "percentRowsAvoided": None,
         },
         change_events=[
             {
@@ -1381,7 +1480,17 @@ def cmd_prove(args: argparse.Namespace) -> int:
             duration_ms=elapsed_ms(started),
             status=failure_status(error),
         )
-        raise
+        _write_failed_prove_run(
+            args,
+            config=config,
+            run_id=run_id,
+            error=error,
+            sql_comparison=sql_comparison,
+            manifest=manifest,
+            phase="canonical predicate selection",
+            code="EXECUTION_FAILED",
+        )
+        _reraise_prove_failure(error, phase="canonical predicate selection", code="EXECUTION_FAILED")
     log_step(
         "canonical predicate selection completed",
         duration_ms=elapsed_ms(started),
@@ -1398,6 +1507,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
     sql_change_queries = selected_queries if persist else ()
     sql_proof = None
     proof = None
+    skip_proof_metrics = False
     warehouse: WarehouseAdapter | None = None
     base_sql, after_sql = _proof_sql_pair(
         args,
@@ -1878,6 +1988,41 @@ def cmd_prove(args: argparse.Namespace) -> int:
         )
         if source_snapshot is not None:
             result.source_snapshot = source_snapshot
+        if isolated is not None:
+            result.job_metrics = list(isolated.job_metrics)
+            result.phase_timings = dict(isolated.phase_timings)
+            target = str(manifest.find_model(config.model.name).relation or "")
+            if target and base_sql:
+                isolated.verify_mart_baseline(target_relation=target, old_sql=base_sql)
+                result.mart_baseline = isolated.mart_baseline
+            from frontier.certification import CONTRACT_CERTIFIED, SQL_CERTIFIED, certification_status, filter_v1_sql_certified
+
+            eligibility = (sql_comparison or {}).get("staticEligibility") or {}
+            for row in (sql_comparison or {}).get("modified") or []:
+                row_eligibility = row.get("staticEligibility") or {}
+                if row_eligibility.get("eligible") or row_eligibility.get("compiled"):
+                    eligibility = {**eligibility, **row_eligibility}
+                    break
+            compiled = bool(eligibility.get("compiled"))
+            static_certified = filter_v1_sql_certified(
+                eligible=eligibility.get("eligible") is True,
+                compiled=compiled,
+                confirmed=result.proof_status == "CONFIRMED",
+                execution_failed=bool(result.execution_failed),
+            )
+            cert_status, _ = certification_status(
+                source_snapshot or isolated.snapshot,
+                static_certified=static_certified,
+            )
+            if target and after_sql:
+                isolated.validate_disposable_repair(
+                    target_relation=target,
+                    new_sql=after_sql,
+                    certified=cert_status in {SQL_CERTIFIED, CONTRACT_CERTIFIED},
+                    confirmed=result.proof_status == "CONFIRMED",
+                )
+                result.repair_validation = isolated.repair_validation
+            result.production_apply = {"status": "NOT_REQUESTED"}
         if discovered_candidates is not None:
             result.changed_source_row_count = discovered_source_rows
             if result.sql_change_candidate_count is None:
@@ -1987,6 +2132,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
                             full_entity_count=result.full_entity_count,
                             changed_source_row_count=discovered_source_rows,
                             source_snapshot=source_snapshot,
+                            skip_legacy_repair_mismatch=True,
                         )
                     except Exception as error:
                         log_step(
@@ -2061,6 +2207,8 @@ def cmd_prove(args: argparse.Namespace) -> int:
             manifest=manifest,
             phase="warehouse execution",
             code="EXECUTION_FAILED",
+            snapshot=source_snapshot,
+            warehouse=warehouse,
         )
         _reraise_prove_failure(error, phase="warehouse execution", code="EXECUTION_FAILED")
     finally:
@@ -2074,6 +2222,14 @@ def cmd_prove(args: argparse.Namespace) -> int:
         if warehouse is not None:
             warehouse.close()
 
+    if sql_proof is not None:
+        sql_proof, validations = finalize_sql_change_assessment(
+            sql_proof,
+            getattr(result, "repair_validation", None),
+            validations,
+            include_repair_assertion=not skip_proof_metrics,
+        )
+
     sql_comparison = _stamp_sql_comparison(
         args,
         _apply_rebuild_to_comparison(sql_comparison, result, validations),
@@ -2086,13 +2242,21 @@ def cmd_prove(args: argparse.Namespace) -> int:
     }
     if not rebuild_recommended and not result.full_rebuild_required:
         extra_metrics["testDurationMs"] = assessed.test_duration_ms
-        extra_metrics.update(
-            {
-                "missingFrontierEntities": assessed.missing_frontier_entities,
-                "extraFrontierEntities": assessed.extra_frontier_entities,
-                "mismatchedFinalRows": assessed.mismatched_final_rows,
-            }
-        )
+        if sql_proof is not None:
+            extra_metrics.update(
+                repair_summary_metrics(
+                    sql_proof,
+                    getattr(result, "repair_validation", None),
+                )
+            )
+        else:
+            extra_metrics.update(
+                {
+                    "missingFrontierEntities": assessed.missing_frontier_entities,
+                    "extraFrontierEntities": assessed.extra_frontier_entities,
+                    "mismatchedFinalRows": assessed.mismatched_final_rows,
+                }
+            )
     if sql_proof is not None:
         frontier_for_metrics = min(
             sql_proof.candidate_frontier_count,
@@ -2193,9 +2357,22 @@ def cmd_prove(args: argparse.Namespace) -> int:
             print("Row count: Not measured")
         else:
             print(f"Row count: {sql_proof.before_entity_count} → {sql_proof.after_entity_count}")
-        print(
-            f"Targeted repair: {'skipped' if rebuild_recommended or result.full_rebuild_required or getattr(result, 'execution_failed', False) else ('safe' if sql_proof.targeted_repair_safe else 'not safe')}"
+        repair_status = (
+            (getattr(result, "repair_validation", None) or {}).get("status")
+            or ((sql_comparison or {}).get("repairValidation") or {}).get("status")
+            or "NOT_RUN"
         )
+        repair_line = targeted_repair_status_line(
+            repair_status=str(repair_status),
+            proof=sql_proof,
+            skipped=bool(
+                rebuild_recommended
+                or result.full_rebuild_required
+                or getattr(result, "execution_failed", False)
+            ),
+        )
+        if repair_line:
+            print(repair_line)
         print(
             f"Targeted validation: {(sql_comparison or {}).get('targetedValidation') or ('NOT_RUN' if result.full_rebuild_required else 'PASSED')}"
         )
@@ -2205,15 +2382,22 @@ def cmd_prove(args: argparse.Namespace) -> int:
             print("Full backfill: recommended")
         else:
             print("Full backfill: not required")
-    print(
-        f"Missing frontier entities: {_format_measured(None if result.full_rebuild_required else assessed.missing_frontier_entities)}"
-    )
-    print(
-        f"Extra frontier entities: {_format_measured(None if result.full_rebuild_required else assessed.extra_frontier_entities)}"
-    )
-    print(
-        f"Mismatched final rows: {_format_measured(None if result.full_rebuild_required else assessed.mismatched_final_rows)}"
-    )
+    repair_payload = getattr(result, "repair_validation", None) or {}
+    repair_status = repair_payload.get("status") or "NOT_RUN"
+    if repair_status in {"SUCCEEDED", "FAILED"}:
+        print(f"Missing repaired entities: {_format_measured(repair_payload.get('missingRows'))}")
+        print(f"Extra repaired entities: {_format_measured(repair_payload.get('extraRows'))}")
+        print(f"Mismatched repaired rows: {_format_measured(repair_payload.get('mismatchedRows'))}")
+    else:
+        print(
+            f"Missing frontier entities: {_format_measured(None if result.full_rebuild_required else assessed.missing_frontier_entities)}"
+        )
+        print(
+            f"Extra frontier entities: {_format_measured(None if result.full_rebuild_required else assessed.extra_frontier_entities)}"
+        )
+        print(
+            f"Mismatched final rows: {_format_measured(None if result.full_rebuild_required else assessed.mismatched_final_rows)}"
+        )
     if result.full_rebuild_required:
         print("Test duration: Not measured")
     else:
@@ -2231,6 +2415,8 @@ def cmd_prove(args: argparse.Namespace) -> int:
             "Assessment failed; wrote diagnostics for upload.",
             file=sys.stderr,
         )
+    else:
+        print("Assessment passed; wrote results for upload.")
     return 0
 
 

@@ -272,6 +272,14 @@ def test_cte_filter_change_compiles_for_narrow_frontier() -> None:
     assert modified[0].get("legacyImpactSql") is None
     assert comparison["narrowFrontierSafe"] is True
     assert comparison["fullRebuildRequired"] is False
+    from frontier.compare import format_compare_report
+
+    report = format_compare_report(comparison)
+    assert "Narrow frontier safe: yes" not in report
+    assert "certification: pending warehouse execution" in report
+    assert "narrow frontier decision: not yet established" in report
+    assert "filter-v1 static eligibility: eligible" in report
+    assert "candidate SQL compiled" in report
 
 
 def test_select_star_filter_stays_uncertified() -> None:

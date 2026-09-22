@@ -26,12 +26,45 @@ def failure_status(error: BaseException) -> str:
     return f"failed:{type(error).__name__}"
 
 
+_SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_UUID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_SECRET_SHAPED = re.compile(
+    r"(?i)^(password|secret|token|api[_-]?key|private[_-]?key|credential|frn_|bearer\b|sk-|pk_)"
+)
+_LONG_DIGIT_RUN = re.compile(r"\b\d{6,}\b")
+
+
+def _keep_quoted_diagnostic(value: str) -> bool:
+    text = value.strip()
+    if not text or _SECRET_SHAPED.search(text):
+        return False
+    if _UUID.fullmatch(text) or _SAFE_IDENT.fullmatch(text):
+        return True
+    if re.fullmatch(r"[0-9A-Z]{5}", text):
+        return True
+    return False
+
+
+def _redact_quoted(match: re.Match[str]) -> str:
+    quote = match.group(1)
+    inner = match.group(2)
+    if _keep_quoted_diagnostic(inner):
+        return f"{quote}{inner}{quote}"
+    return f"{quote}***{quote}"
+
+
 def redact_failure_reason(error: BaseException) -> str:
-    """Keep a machine-readable reason without SQL literals, secrets, or entity IDs."""
+    """Keep structural diagnostics; strip secrets, credentials, and entity values."""
     text = f"{type(error).__name__}: {error}"
-    text = re.sub(r"'[^']{0,400}'", "'***'", text)
-    text = re.sub(r'"[^"]{0,400}"', '"***"', text)
-    text = re.sub(r"\b\d{6,}\b", "***", text)
+    text = re.sub(
+        r"(?i)((?:password|secret|token|api[_-]?key|private[_-]?key|credential)\s*[=:]\s*)(['\"])([^'\"]*)\2",
+        r"\1\2***\2",
+        text,
+    )
+    text = re.sub(r"(['\"])([^'\"]{0,400})\1", _redact_quoted, text)
+    text = _LONG_DIGIT_RUN.sub("***", text)
     lowered = text.lower()
     for part in ("password", "token", "secret", "private_key", "api_key"):
         if part in lowered:
