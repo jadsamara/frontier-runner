@@ -5,6 +5,14 @@ All notable changes to frontier-runner are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-09-22
+
+- Made filter-v1 eligibility and the RowCover candidate compiler authoritative for `compare` and `prove`. Ineligible plans stay `UNCERTIFIED` and are not reported as safe for targeted repair.
+- Failed `prove` writes a fresh uniquely identified run artifact. `upload` refuses a stale `frontier-run.json`.
+- Targeted SQL generation failures are classified as execution failures instead of being swallowed.
+- Mixed compiled dbt environments fail before warehouse execution with `ENVIRONMENT_MISMATCH`.
+- Economics stay independent of `SQL_CERTIFIED` and use measured bytes rather than a demonstrated cost saving.
+
 ## [0.2.0] — 2026-09-21
 
 - Added browser-based CLI authentication.
@@ -86,6 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SaaS commands resolve stored keychain credentials through one shared
   resolver instead of requiring `FRONTIER_API_KEY` in the environment.
 
+[0.2.1]: https://github.com/jadsamara/frontier-runner/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jadsamara/frontier-runner/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/jadsamara/frontier-runner/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/jadsamara/frontier-runner/compare/v0.1.1...v0.1.2

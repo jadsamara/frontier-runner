@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from frontier.sql_fingerprint import normalize_sql, sql_fingerprint
+from frontier.sql_fingerprint import normalize_sql, render_executable_sql, sql_fingerprint
+
+import sqlglot
 
 BASE_SQL = """
 select
@@ -64,3 +66,13 @@ def test_filter_change_is_semantic() -> None:
         FILTER_SQL,
         dialect="snowflake",
     )
+
+
+def test_snowflake_executable_sql_does_not_quote_folded_identifiers() -> None:
+    tree = sqlglot.parse_one(
+        "select customer_id from snowflake_sample_data.tpch_sf1.orders",
+        dialect="snowflake",
+    )
+    sql = render_executable_sql(tree, dialect="snowflake")
+    assert "SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.ORDERS" in sql
+    assert '"snowflake_sample_data"' not in sql

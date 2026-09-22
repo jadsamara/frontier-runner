@@ -113,7 +113,8 @@ def test_snowflake_adapter_reads_query_profile_from_history() -> None:
     text = source.read_text()
     assert "def get_query_profile" in text
     assert "bytes_scanned" in text
-    assert "partitions_scanned" in text
+    assert "total_elapsed_time" in text
+    assert '"elapsed_ms"' in text
     assert "information_schema.query_history()" in text
     assert SnowflakeAdapter().last_query_id is None
     assert SnowflakeAdapter().get_query_profile("") == {}

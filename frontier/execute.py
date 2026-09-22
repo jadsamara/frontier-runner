@@ -322,6 +322,46 @@ def origin_keys_sql(relation: str, entity_key: str) -> str:
     )
 
 
+def snapshot_execute(
+    warehouse: WarehouseAdapter,
+    sql: str,
+    snapshot: Any | None = None,
+    *,
+    phase: str | None = None,
+) -> list[tuple[Any, ...]]:
+    """Execute SQL, binding source reads to the assessment snapshot when verified."""
+    from frontier.snapshot import (
+        ASSURANCE_ADAPTER,
+        SOURCE_SNAPSHOT_VERIFICATION_FAILED,
+        SnapshotError,
+        bind_sql_to_snapshot,
+        verify_snapshot_binding,
+    )
+
+    text = sql
+    if snapshot is not None and snapshot.assurance == ASSURANCE_ADAPTER:
+        bind = getattr(warehouse, "bind_query_to_snapshot", None)
+        verify = getattr(warehouse, "verify_snapshot_binding", None)
+        text = bind(sql, snapshot) if callable(bind) else bind_sql_to_snapshot(
+            sql,
+            snapshot,
+            dialect=warehouse.dialect,
+        )
+        ok = (
+            verify(text, snapshot)
+            if callable(verify)
+            else verify_snapshot_binding(text, snapshot, dialect=warehouse.dialect)
+        )
+        if not ok:
+            raise SnapshotError(
+                SOURCE_SNAPSHOT_VERIFICATION_FAILED,
+                "bound SQL did not verify against the captured snapshot",
+            )
+    if snapshot is not None and phase:
+        snapshot.record_phase(phase)
+    return warehouse.execute(text)
+
+
 def drop_relation_sql(relation: str) -> str:
     return f"drop table if exists {relation}"
 
@@ -357,10 +397,15 @@ def _from_table_alias(select: exp.Select) -> str:
     from_ = select.args.get("from_")
     if from_ is None:
         return ""
-    table = from_.find(exp.Table)
-    if table is None:
+    this = from_.this
+    if this is None:
         return ""
-    return str(table.alias or table.name or "")
+    alias = str(getattr(this, "alias", None) or "")
+    if alias:
+        return alias
+    if isinstance(this, exp.Table):
+        return str(this.name or "")
+    return ""
 
 
 def _select_can_bind_entity_key(select: exp.Select, entity_key: str) -> bool:
@@ -370,6 +415,10 @@ def _select_can_bind_entity_key(select: exp.Select, entity_key: str) -> bool:
     target = entity_key.lower()
     if select.find(exp.Star):
         return True
+    for expr in select.expressions or []:
+        alias = str(expr.alias or "").lower()
+        if alias == target:
+            return True
     for column in select.find_all(exp.Column):
         if str(column.name or "").lower() == target:
             return True
@@ -379,6 +428,19 @@ def _select_can_bind_entity_key(select: exp.Select, entity_key: str) -> bool:
             if str(column.name or "").lower() == target:
                 return True
     return False
+
+
+def _entity_key_join_expression(select: exp.Select, entity_key: str) -> exp.Expression:
+    """Join affected keys on the physical column that produces the entity key."""
+    target = entity_key.lower()
+    for expr in select.expressions or []:
+        alias = str(expr.alias or "").lower()
+        if alias != target:
+            continue
+        source = expr.this if isinstance(expr, exp.Alias) else expr
+        return source.copy()
+    alias = _from_table_alias(select)
+    return exp.column(entity_key, table=alias) if alias else exp.column(entity_key)
 
 
 def _is_keys_join(join: exp.Join) -> bool:
@@ -445,7 +507,7 @@ def _inject_keys_join(
     if not _select_can_bind_entity_key(select, entity_key):
         return False
     alias = _from_table_alias(select)
-    key_col = exp.column(entity_key, table=alias) if alias else exp.column(entity_key)
+    key_col = _entity_key_join_expression(select, entity_key)
     keys_table = exp.alias_(
         exp.to_table(affected_relation, dialect=dialect),
         "frontier_keys",
@@ -551,6 +613,11 @@ def sql_change_impact_queries(
         return (), True
     ranked: list[tuple[int, str, str]] = []
     for row in eligible:
+        eligibility = row.get("staticEligibility") or {}
+        if eligibility.get("eligible") is False or (
+            eligibility.get("eligible") is True and eligibility.get("compiled") is False
+        ):
+            return (), True
         name = str(row.get("name") or "")
         if row.get("unsafe") or row.get("impactStatus") == "FULL_REBUILD_REQUIRED":
             return (), True
@@ -697,6 +764,7 @@ class IsolatedRun:
     confirmed_count: int | None = None
     phase_timings: dict[str, int] = field(default_factory=dict)
     job_metrics: list[dict[str, Any]] = field(default_factory=list)
+    snapshot: Any | None = None
 
     def _record_job(self, phase: str) -> dict[str, Any] | None:
         query_id = getattr(self.warehouse, "last_query_id", None)
@@ -715,6 +783,8 @@ class IsolatedRun:
             "elapsed_ms": (
                 profile["elapsed_ms"]
                 if profile.get("elapsed_ms") is not None
+                else profile["total_elapsed_ms"]
+                if profile.get("total_elapsed_ms") is not None
                 else self.phase_timings.get(phase)
             ),
             "bytes_scanned": profile.get("bytes_scanned"),
@@ -796,10 +866,20 @@ class IsolatedRun:
                     str(row[0]),
                     str(row[1]) if len(row) > 1 and row[1] is not None else ORIGIN_EVENT,
                 )
-                for row in self.warehouse.execute(origin_keys_sql(self.relation, self.entity_key))
+                for row in snapshot_execute(
+                    self.warehouse,
+                    origin_keys_sql(self.relation, self.entity_key),
+                    self.snapshot,
+                    phase="candidate_keys",
+                )
                 if row and row[0] is not None
             )
-        count_rows = self.warehouse.execute(origin_count_sql(self.relation, self.entity_key))
+        count_rows = snapshot_execute(
+            self.warehouse,
+            origin_count_sql(self.relation, self.entity_key),
+            self.snapshot,
+            phase="candidate_counts",
+        )
         event_count = 0
         sql_count = 0
         union_count = len({value for value, _origin in origin_keys})
@@ -914,7 +994,12 @@ class IsolatedRun:
                 "select count(*) as confirmed_frontier_count "
                 f"from ({sql}) as frontier_confirmed"
             )
-            rows = self.warehouse.execute(count_sql)
+            rows = snapshot_execute(
+                self.warehouse,
+                count_sql,
+                self.snapshot,
+                phase="confirmation",
+            )
         except Exception as error:
             duration = elapsed_ms(started)
             self.phase_timings["confirmation"] = duration
@@ -948,7 +1033,13 @@ class IsolatedRun:
                 self.warehouse.execute(drop_relation_sql(relation))
             except Exception:
                 pass
-        self.warehouse.execute(create_sql)
+        phase = "candidate_materialization"
+        lowered = create_sql.lower()
+        if "target_base" in lowered:
+            phase = "targeted_base"
+        elif "target_head" in lowered:
+            phase = "targeted_head"
+        snapshot_execute(self.warehouse, create_sql, self.snapshot, phase=phase)
 
     def cleanup(self) -> None:
         if self._cleaned:
@@ -984,6 +1075,7 @@ def open_isolated_run(
     model_database: str | None,
     model_schema: str | None,
     model_relation: str | None = None,
+    snapshot: Any | None = None,
 ) -> IsolatedRun:
     if model_relation:
         assert_not_prod(relation=model_relation)
@@ -1005,6 +1097,7 @@ def open_isolated_run(
         schema=schema,
         run_id=run_id,
         entity_key=entity_key,
+        snapshot=snapshot,
     )
 
 

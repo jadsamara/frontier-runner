@@ -42,6 +42,12 @@ class WarehouseAdapter(Protocol):
 
     def execute(self, sql: str) -> list[tuple[Any, ...]]: ...
 
+    def capture_snapshot(self, relations: list[str] | tuple[str, ...], **kwargs: Any) -> Any: ...
+
+    def bind_query_to_snapshot(self, sql: str, snapshot: Any) -> str: ...
+
+    def verify_snapshot_binding(self, sql: str, snapshot: Any) -> bool: ...
+
     def relation_exists(self, relation: str) -> bool: ...
 
     def estimate_query_cost(self, sql: str) -> dict[str, Any]: ...
@@ -135,6 +141,8 @@ class FakeWarehouse:
         warehouse_type: str = "snowflake",
         dialect: str | None = None,
         relations: set[str] | None = None,
+        relation_catalog: dict[str, dict[str, Any]] | None = None,
+        view_definitions: dict[str, str] | None = None,
     ):
         self.responses = responses or {}
         self.executed: list[str] = []
@@ -143,10 +151,40 @@ class FakeWarehouse:
         self.relations = relations
         self.last_query_id: str | None = None
         self.query_ids: list[str] = []
+        self.relation_catalog = dict(relation_catalog or {})
+        for name, definition in (view_definitions or {}).items():
+            entry = dict(self.relation_catalog.get(name) or {})
+            entry.setdefault("kind", "view")
+            entry["view_sql"] = definition
+            self.relation_catalog[name] = entry
+        self._snapshot_seq = 0
 
     def quote_identifier(self, value: str) -> str:
         quote = "`" if self.dialect in {"bigquery", "databricks"} else '"'
         return quote_identifier(value, quote)
+
+    def capture_snapshot(self, relations: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
+        from frontier.snapshot import capture_from_catalog, utc_now_iso
+
+        self._snapshot_seq += 1
+        identifier = f"fake-snapshot-{self._snapshot_seq}"
+        return capture_from_catalog(
+            relations,
+            catalog=self.relation_catalog,
+            identifier=identifier,
+            captured_at=utc_now_iso(),
+            attestation_source=kwargs.get("attestation_source"),
+        )
+
+    def bind_query_to_snapshot(self, sql: str, snapshot: Any) -> str:
+        from frontier.snapshot import bind_sql_to_snapshot
+
+        return bind_sql_to_snapshot(sql, snapshot, dialect=self.dialect)
+
+    def verify_snapshot_binding(self, sql: str, snapshot: Any) -> bool:
+        from frontier.snapshot import verify_snapshot_binding as verify
+
+        return verify(sql, snapshot, dialect=self.dialect)
 
     def execute(self, sql: str) -> list[tuple[Any, ...]]:
         self.executed.append(sql)

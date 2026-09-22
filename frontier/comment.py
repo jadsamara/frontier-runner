@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from frontier.certification import display_evidence_level
 from frontier.config import ConfigError
 from frontier.github import env_flag, pull_request_number
 
@@ -82,7 +83,13 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
     percent_text = f"{percent}%" if percent is not None else "n/a"
     events = payload.get("changeEvents") or []
     validations = payload.get("validationResults") or []
-    evidence = _EVIDENCE_LABELS.get(str(payload.get("evidenceLevel") or ""), "none")
+    evidence = _EVIDENCE_LABELS.get(
+        display_evidence_level(
+            str(payload.get("evidenceLevel") or ""),
+            (payload.get("sqlComparison") or {}).get("validation"),
+        ),
+        "none",
+    )
     headline = f"Frontier impact assessment: {status}"
     if status != "PASSED":
         headline = f"**{headline}**"
@@ -223,6 +230,15 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
             lines.append(f"SQL change kinds: {', '.join(kinds)}")
         if comparison.get("narrowFrontierSafe") is False:
             lines.append("Narrow frontier: not allowed")
+        certification = comparison.get("certification") or {}
+        eligibility = comparison.get("staticEligibility") or {}
+        if certification.get("status") == "UNCERTIFIED" or eligibility.get("eligible") is False:
+            reason = eligibility.get("reasonCode") or certification.get("failureCode")
+            extra = f" ({reason})" if reason else ""
+            lines.append(
+                f"filter-v1 certification: UNCERTIFIED{extra}; "
+                "legacy impact compilation is diagnostic only"
+            )
         if comparison.get("fullRebuildRequired"):
             lines.append("Impact: full rebuild required")
         elif comparison.get("fullRebuildRecommended"):
@@ -268,6 +284,40 @@ def format_pr_comment(payload: dict[str, Any], *, run_url: str) -> str:
             lines.append(f"Impact reasons: {', '.join(reasons[:8])}")
         if comparison.get("proofStatus"):
             lines.append(f"Proof status: {comparison.get('proofStatus')}")
+        certification = comparison.get("certification") or {}
+        if certification.get("status"):
+            lines.append(f"Certification: {certification.get('status')}")
+        eligibility = comparison.get("staticEligibility") or {}
+        if eligibility:
+            status = "eligible" if eligibility.get("eligible") else "ineligible"
+            reason = eligibility.get("reasonCode")
+            extra = f" ({reason})" if reason else ""
+            if eligibility.get("semanticChange") is False:
+                lines.append("filter-v1 static eligibility: no semantic change")
+            else:
+                lines.append(f"filter-v1 static eligibility: {status}{extra}")
+        validation = comparison.get("validation") or {}
+        if validation.get("status"):
+            lines.append(f"Validation: {validation.get('status')}")
+        snapshot = comparison.get("sourceSnapshot") or {}
+        if snapshot.get("mode") or snapshot.get("assurance"):
+            lines.append(
+                "Source snapshot: "
+                f"{snapshot.get('mode') or 'none'} "
+                f"({snapshot.get('assurance') or 'NONE'})"
+            )
+        economics = comparison.get("economics") or {}
+        if economics.get("decision"):
+            lines.append(f"Economics: {economics.get('decision')}")
+        execution = comparison.get("execution") or {}
+        if execution.get("status"):
+            lines.append(f"Execution: {execution.get('status')}")
+        if comparison.get("baselineBoundary"):
+            lines.append(
+                "Baseline: two SQL versions at one pinned source snapshot; "
+                "the existing materialized dbt mart is not that snapshot; "
+                "in-place production repair is not certified."
+            )
         if comparison.get("failurePhase") or comparison.get("failureCode"):
             lines.append(
                 "Execution failure: "

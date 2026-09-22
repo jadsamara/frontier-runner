@@ -955,10 +955,13 @@ def evaluate_discovery_counts(
     candidate_sql: str,
     entity_key: str,
     warehouse: WarehouseAdapter,
+    snapshot: Any | None = None,
 ) -> tuple[int, int]:
     """Return (changed_source_row_count, distinct_candidate_count)."""
+    from frontier.execute import snapshot_execute
+
     sql = discovery_counts_sql(candidate_sql, entity_key, dialect=warehouse.dialect)
-    rows = warehouse.execute(sql)
+    rows = snapshot_execute(warehouse, sql, snapshot, phase="discovery")
     if not rows or rows[0][0] is None:
         return 0, 0
     row = rows[0]

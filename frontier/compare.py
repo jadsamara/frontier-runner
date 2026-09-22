@@ -10,10 +10,21 @@ from frontier.config import ConfigError
 from frontier.dbt_artifacts import DbtNode, Manifest
 from frontier.execute import is_sql_change_impact_model
 from frontier.impact import (
+    CANDIDATE_SET_ANALYSIS_FAILED,
+    CANDIDATE_SET_NOT_EVALUATED,
+    COMPILED,
     FULL_REBUILD_REQUIRED,
+    ImpactCompileResult,
     compile_impact_query,
 )
 from frontier.sql_fingerprint import sql_dialect, sql_fingerprint, using_sql_dialect
+from frontier.filter_v1 import (
+    UNSUPPORTED_OPERATION,
+    StaticEligibility,
+    analyze_static_eligibility,
+    assert_eligibility_payload_is_safe,
+    schema_catalog_from_manifests,
+)
 from frontier.snowflake_sql import (
     classify_sql_change,
     describe_sql_change,
@@ -171,6 +182,8 @@ def _model_payload(
     impact: dict[str, Any] | None = None,
     change_summary: str | None = None,
     tags: tuple[str, ...] | list[str] | None = None,
+    static_eligibility: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "uniqueId": unique_id,
@@ -191,6 +204,10 @@ def _model_payload(
         payload.update(impact)
     if change_summary:
         payload["changeSummary"] = change_summary[:512]
+    if static_eligibility:
+        payload["staticEligibility"] = static_eligibility
+    if extra:
+        payload.update(extra)
     return payload
 
 
@@ -213,6 +230,8 @@ def compare_manifests(
     entity_key: str | None = None,
     confirmed_keys: Iterable[str] | None = None,
     target_name: str | None = None,
+    semantic_manifest_version: int | None = None,
+    semantic_manifest_fingerprint: str | None = None,
 ) -> SqlComparison:
     dialect = sql_dialect(pr.adapter_type or base.adapter_type) or "snowflake"
     with using_sql_dialect(dialect):
@@ -227,6 +246,8 @@ def compare_manifests(
             entity_key=entity_key,
             confirmed_keys=confirmed_keys,
             target_name=target_name,
+            semantic_manifest_version=semantic_manifest_version,
+            semantic_manifest_fingerprint=semantic_manifest_fingerprint,
         )
 
 
@@ -242,6 +263,8 @@ def _compare_manifests(
     entity_key: str | None,
     confirmed_keys: Iterable[str] | None,
     target_name: str | None,
+    semantic_manifest_version: int | None,
+    semantic_manifest_fingerprint: str | None,
 ) -> SqlComparison:
     base_models = base.models()
     pr_models = pr.models()
@@ -265,6 +288,7 @@ def _compare_manifests(
     added: list[dict[str, Any]] = []
     removed: list[dict[str, Any]] = []
     modified: list[dict[str, Any]] = []
+    schema_catalog = schema_catalog_from_manifests(base, pr)
     added_removed_impact = {
         "impactStatus": FULL_REBUILD_REQUIRED,
         "candidateSetState": "analysis_failed",
@@ -306,18 +330,53 @@ def _compare_manifests(
             tags=node.tags,
             target_name=target_name,
         )
-        impact = (
-            compile_impact_query(
-                base_sql,
-                pr_sql,
-                entity_key=entity_key or "",
-                confirmed_keys=confirmed_keys or (),
-                classification=classification,
-                dialect=dialect,
-            )
-            if compile_impact
-            else None
+        eligibility_result = analyze_static_eligibility(
+            base_sql,
+            pr_sql,
+            entity_key=entity_key or "",
+            dialect=dialect,
+            manifest_version=semantic_manifest_version,
+            manifest_fingerprint=semantic_manifest_fingerprint,
+            target_model=node.name,
+            schema_catalog=schema_catalog,
         )
+        eligibility = eligibility_result.to_payload()
+        assert_eligibility_payload_is_safe(eligibility)
+        impact = None
+        extra: dict[str, Any] | None = None
+        if compile_impact:
+            if eligibility_result.eligible:
+                impact = _filter_v1_impact(eligibility_result, entity_key=entity_key or "")
+            else:
+                diagnostic = compile_impact_query(
+                    base_sql,
+                    pr_sql,
+                    entity_key=entity_key or "",
+                    confirmed_keys=confirmed_keys or (),
+                    classification=classification,
+                    dialect=dialect,
+                )
+                extra = {
+                    "legacyImpactCompilation": diagnostic.status,
+                }
+                if diagnostic.candidate_sql:
+                    extra["legacyImpactSql"] = diagnostic.candidate_sql
+                reason = eligibility_result.reason_code or "UNCERTIFIED"
+                diagnostic_reason = eligibility_result.diagnostic
+                reasons = [f"filter-v1 UNCERTIFIED ({reason})"]
+                if diagnostic_reason:
+                    reasons.append(diagnostic_reason)
+                reasons.append("legacy impact compilation is diagnostic only and must not be executed")
+                impact = ImpactCompileResult(
+                    status=FULL_REBUILD_REQUIRED,
+                    reasons=tuple(reasons),
+                    entity_key=entity_key or "",
+                    candidate_sql=None,
+                    parameterized_sql=None,
+                    parameters=(),
+                    query_fingerprint=None,
+                    candidate_set_state=CANDIDATE_SET_ANALYSIS_FAILED,
+                )
         modified.append(
             _model_payload(
                 unique_id=unique_id,
@@ -331,6 +390,8 @@ def _compare_manifests(
                 impact=impact.to_payload(include_sql=True) if impact is not None else None,
                 change_summary=describe_sql_change(base_sql, pr_sql),
                 tags=node.tags,
+                static_eligibility=eligibility,
+                extra=extra,
             )
         )
 
@@ -397,6 +458,12 @@ def _compare_manifests(
         ]}),
         "fullRebuildRequired": full_rebuild,
     }
+    top_eligibility = _top_level_eligibility(modified, target_name=target_name)
+    if top_eligibility:
+        payload["staticEligibility"] = top_eligibility
+        if top_eligibility.get("eligible") is False:
+            payload["narrowFrontierSafe"] = False
+            payload["fullRebuildRequired"] = True
     return SqlComparison(payload)
 
 
@@ -444,27 +511,62 @@ def format_compare_report(comparison: dict[str, Any]) -> str:
             if reasons:
                 lines.append(f"    impact reasons: {', '.join(str(reason) for reason in reasons)}")
             if row.get("candidateSql"):
-                lines.append(f"    candidate sql: {row['candidateSql']}")
+                compiled = (row.get("staticEligibility") or {}).get("compiled")
+                label = "filter-v1 candidate sql" if compiled else "candidate sql"
+                lines.append(f"    {label}: {row['candidateSql']}")
+            if row.get("legacyImpactSql"):
+                lines.append(
+                    "    legacy impact sql (not certified; not executed): "
+                    + str(row["legacyImpactSql"])
+                )
+            if row.get("legacyImpactCompilation"):
+                lines.append(
+                    f"    legacy impact compilation: {row['legacyImpactCompilation']} (diagnostic only)"
+                )
+            eligibility = row.get("staticEligibility") or {}
+            if eligibility:
+                lines.append(_format_eligibility_line(eligibility, indent="    "))
 
     section("Added", comparison.get("added") or [])
     section("Removed", comparison.get("removed") or [])
     section("Modified", comparison.get("modified") or [])
+    eligibility = comparison.get("staticEligibility") or {}
+    certified = eligibility.get("eligible") is True and eligibility.get("compiled") is True
     safe = comparison.get("narrowFrontierSafe")
-    if safe is not None:
+    if eligibility.get("eligible") is False:
         lines.extend(
             [
                 "",
-                f"Narrow frontier safe: {'yes' if safe else 'no'}",
+                "Narrow frontier safe: no — filter-v1 certification rejected this plan; "
+                "legacy impact SQL is not evidence that repair is safe",
+            ]
+        )
+    elif safe is not None:
+        lines.extend(
+            [
+                "",
+                f"Narrow frontier safe: {'yes' if safe and (not eligibility or certified) else 'no'}",
             ]
         )
     if comparison.get("fullRebuildRequired"):
         lines.append("Full rebuild required: yes")
     if comparison.get("fullRebuildRecommended"):
         lines.append("Full rebuild recommended: yes")
+    eligibility = comparison.get("staticEligibility")
+    if eligibility:
+        lines.extend(["", _format_eligibility_line(eligibility, indent="")])
     return "\n".join(lines)
 
 
-_INGEST_STRIP_KEYS = ("candidateSql", "parameterizedSql", "parameters", "tags")
+_INGEST_STRIP_KEYS = (
+    "candidateSql",
+    "parameterizedSql",
+    "parameters",
+    "tags",
+    "legacyImpactSql",
+    "legacyImpactCompilation",
+)
+_ELIGIBILITY_STRIP_KEYS = ("predicate", "sql", "candidateSql", "baseSql", "prSql", "parameters")
 
 IMPACT_EXECUTION_EXECUTED = "EXECUTED"
 IMPACT_EXECUTION_NOT_EVALUATED = "NOT_EVALUATED"
@@ -540,4 +642,109 @@ def comparison_for_ingest(comparison: dict[str, Any] | None) -> dict[str, Any] |
         for row in copied.get(group) or []:
             for key in _INGEST_STRIP_KEYS:
                 row.pop(key, None)
+            _strip_eligibility_sql(row.get("staticEligibility"))
+    _strip_eligibility_sql(copied.get("staticEligibility"))
     return copied
+
+
+def _strip_eligibility_sql(payload: dict[str, Any] | None) -> None:
+    if not isinstance(payload, dict):
+        return
+    for key in _ELIGIBILITY_STRIP_KEYS:
+        payload.pop(key, None)
+
+
+def _filter_v1_impact(eligibility: StaticEligibility, *, entity_key: str) -> ImpactCompileResult:
+    if eligibility.compiled and eligibility.candidate_sql and eligibility.candidate_fingerprint:
+        return ImpactCompileResult(
+            status=COMPILED,
+            reasons=("filter-v1 candidate-key compiler",),
+            entity_key=entity_key,
+            candidate_sql=eligibility.candidate_sql,
+            parameterized_sql=eligibility.candidate_sql,
+            parameters=(),
+            query_fingerprint=eligibility.candidate_fingerprint,
+            candidate_set_state=CANDIDATE_SET_NOT_EVALUATED,
+        )
+    diagnostic = eligibility.diagnostic or "filter-v1 candidate compiler failed closed"
+    return ImpactCompileResult(
+        status=FULL_REBUILD_REQUIRED,
+        reasons=(diagnostic,),
+        entity_key=entity_key,
+        candidate_sql=None,
+        parameterized_sql=None,
+        parameters=(),
+        query_fingerprint=None,
+        candidate_set_state=CANDIDATE_SET_ANALYSIS_FAILED,
+    )
+
+
+def _static_eligibility_payload(
+    base_sql: str,
+    pr_sql: str,
+    *,
+    entity_key: str,
+    dialect: str,
+    manifest_version: int | None,
+    manifest_fingerprint: str | None,
+    target_model: str,
+) -> dict[str, Any]:
+    try:
+        result = analyze_static_eligibility(
+            base_sql,
+            pr_sql,
+            entity_key=entity_key,
+            dialect=dialect,
+            manifest_version=manifest_version,
+            manifest_fingerprint=manifest_fingerprint,
+            target_model=target_model,
+        )
+        payload = result.to_payload()
+        assert_eligibility_payload_is_safe(payload)
+        return payload
+    except Exception:
+        fallback = StaticEligibility(
+            eligible=False,
+            reason_code=UNSUPPORTED_OPERATION,
+            diagnostic="static eligibility analysis failed closed",
+            manifest_version=manifest_version,
+            manifest_fingerprint=manifest_fingerprint,
+        )
+        return fallback.to_payload()
+
+
+def _top_level_eligibility(
+    modified: list[dict[str, Any]],
+    *,
+    target_name: str | None,
+) -> dict[str, Any] | None:
+    if target_name:
+        for row in modified:
+            if row.get("name") == target_name and row.get("staticEligibility"):
+                return row["staticEligibility"]
+    for row in modified:
+        if row.get("impactStatus") and row.get("staticEligibility"):
+            return row["staticEligibility"]
+    for row in modified:
+        if row.get("staticEligibility"):
+            return row["staticEligibility"]
+    return None
+
+
+def _format_eligibility_line(eligibility: dict[str, Any], *, indent: str) -> str:
+    if eligibility.get("semanticChange") is False:
+        return f"{indent}filter-v1 static eligibility: no semantic change"
+    status = "eligible" if eligibility.get("eligible") else "ineligible"
+    reason = eligibility.get("reasonCode")
+    line = f"{indent}filter-v1 static eligibility: {status}"
+    if reason:
+        line += f" ({reason})"
+    if eligibility.get("eligible") and eligibility.get("compiled"):
+        line += "; candidate SQL compiled"
+    elif eligibility.get("eligible") and eligibility.get("compiled") is False:
+        compile_reason = eligibility.get("compileReasonCode") or "compiler failed"
+        line += f"; candidate SQL not compiled ({compile_reason})"
+    diagnostic = eligibility.get("diagnostic")
+    if diagnostic and not eligibility.get("eligible"):
+        line += f" — {diagnostic}"
+    return line

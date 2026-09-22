@@ -124,7 +124,8 @@ class SnowflakeAdapter(CursorAdapter):
             return {}
         try:
             rows = self.execute(
-                "select query_id, bytes_scanned, partitions_scanned, rows_produced "
+                "select query_id, bytes_scanned, rows_produced, total_elapsed_time, "
+                "credits_used_cloud_services "
                 "from table(information_schema.query_history()) "
                 f"where query_id = {sql_string(token)} "
                 "order by start_time desc limit 1"
@@ -134,12 +135,170 @@ class SnowflakeAdapter(CursorAdapter):
         if not rows:
             return {}
         row = rows[0]
+        elapsed = row[3] if len(row) > 3 else None
         return {
             "query_id": row[0],
             "bytes_scanned": row[1] if len(row) > 1 else None,
-            "partitions_scanned": row[2] if len(row) > 2 else None,
-            "rows_produced": row[3] if len(row) > 3 else None,
+            "rows_produced": row[2] if len(row) > 2 else None,
+            "elapsed_ms": elapsed,
+            "total_elapsed_ms": elapsed,
+            "cloud_services_credits": float(row[4]) if len(row) > 4 and row[4] is not None else None,
         }
+
+    def capture_snapshot(self, relations: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
+        from frontier.snapshot import capture_from_catalog, utc_now_iso
+
+        identifier = self._current_timestamp_literal()
+        catalog = self._inventory_relations(relations)
+        return capture_from_catalog(
+            relations,
+            catalog=catalog,
+            identifier=identifier,
+            captured_at=utc_now_iso(),
+            attestation_source=kwargs.get("attestation_source"),
+        )
+
+    def bind_query_to_snapshot(self, sql: str, snapshot: Any) -> str:
+        from frontier.snapshot import bind_sql_to_snapshot
+
+        return bind_sql_to_snapshot(sql, snapshot, dialect=self.dialect)
+
+    def verify_snapshot_binding(self, sql: str, snapshot: Any) -> bool:
+        from frontier.snapshot import verify_snapshot_binding as verify
+
+        return verify(sql, snapshot, dialect=self.dialect)
+
+    def _current_timestamp_literal(self) -> str:
+        rows = self.execute(
+            "select to_varchar(current_timestamp(), 'YYYY-MM-DD HH24:MI:SS.FF3 TZHTZM')"
+        )
+        if not rows or rows[0][0] is None:
+            from frontier.snapshot import SnapshotError, SOURCE_SNAPSHOT_NOT_PINNED
+
+            raise SnapshotError(SOURCE_SNAPSHOT_NOT_PINNED, "Snowflake did not return a snapshot timestamp")
+        return str(rows[0][0]).strip()
+
+    def _inventory_relations(self, relations: list[str] | tuple[str, ...]) -> dict[str, dict[str, Any]]:
+        from frontier.snapshot import DYNAMIC_TABLE, EXTERNAL_TABLE, MATERIALIZED_VIEW, VIEW
+        from frontier.warehouse import split_relation_parts
+
+        catalog: dict[str, dict[str, Any]] = {}
+        pending = [str(item).strip() for item in relations if str(item).strip()]
+        seen: set[str] = set()
+        while pending:
+            name = pending.pop(0)
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            database, schema, table = split_relation_parts(name)
+            if not table:
+                continue
+            entry = self._lookup_table(database, schema, table)
+            if entry is None:
+                continue
+            kind = str(entry.get("kind") or "")
+            if kind == VIEW:
+                definition = self._view_definition(database, schema, table)
+                if definition:
+                    entry["view_sql"] = definition
+                    from frontier.snapshot import collect_source_relations
+
+                    pending.extend(collect_source_relations(definition, dialect="snowflake"))
+            elif kind in {MATERIALIZED_VIEW, EXTERNAL_TABLE, DYNAMIC_TABLE}:
+                entry["kind"] = kind
+            catalog[name] = entry
+            dynamic = self._is_dynamic_table(database, schema, table)
+            if dynamic:
+                catalog[name]["kind"] = DYNAMIC_TABLE
+        return catalog
+
+    def _lookup_table(
+        self,
+        database: str | None,
+        schema: str | None,
+        table: str,
+    ) -> dict[str, Any] | None:
+        sql = (
+            "select table_catalog, table_schema, table_name, table_type, "
+            "is_transient, retention_time "
+            "from information_schema.tables "
+            f"where lower(table_name) = lower({sql_string(table)})"
+        )
+        if schema:
+            sql += f" and lower(table_schema) = lower({sql_string(schema)})"
+        if database:
+            sql += f" and lower(table_catalog) = lower({sql_string(database)})"
+        sql += " limit 1"
+        try:
+            rows = self.execute(sql)
+        except Exception:
+            return None
+        if not rows:
+            return None
+        row = rows[0]
+        table_type = str(row[3] or "").strip().upper()
+        is_transient = str(row[4] or "").strip().upper() == "YES"
+        retention = row[5] if len(row) > 5 else None
+        kind = table_type.lower()
+        if table_type == "BASE TABLE" and is_transient:
+            kind = "transient"
+        elif table_type == "BASE TABLE":
+            kind = "permanent_table"
+        return {
+            "kind": kind,
+            "retention_days": int(retention) if retention is not None else None,
+        }
+
+    def _view_definition(
+        self,
+        database: str | None,
+        schema: str | None,
+        table: str,
+    ) -> str | None:
+        sql = (
+            "select view_definition from information_schema.views "
+            f"where lower(table_name) = lower({sql_string(table)})"
+        )
+        if schema:
+            sql += f" and lower(table_schema) = lower({sql_string(schema)})"
+        if database:
+            sql += f" and lower(table_catalog) = lower({sql_string(database)})"
+        sql += " limit 1"
+        try:
+            rows = self.execute(sql)
+        except Exception:
+            return None
+        if not rows or rows[0][0] is None:
+            return None
+        text = str(rows[0][0]).strip().rstrip(";")
+        if text.lower().startswith("create "):
+            lowered = text.lower()
+            marker = " as "
+            index = lowered.find(marker)
+            if index != -1:
+                text = text[index + len(marker) :].strip()
+        return text or None
+
+    def _is_dynamic_table(
+        self,
+        database: str | None,
+        schema: str | None,
+        table: str,
+    ) -> bool:
+        sql = (
+            "select 1 from information_schema.dynamic_tables "
+            f"where lower(table_name) = lower({sql_string(table)})"
+        )
+        if schema:
+            sql += f" and lower(table_schema) = lower({sql_string(schema)})"
+        if database:
+            sql += f" and lower(table_catalog) = lower({sql_string(database)})"
+        sql += " limit 1"
+        try:
+            return bool(self.execute(sql))
+        except Exception:
+            return False
 
     def describe(self) -> dict[str, Any]:
         if self._config is None:

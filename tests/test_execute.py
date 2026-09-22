@@ -77,6 +77,22 @@ def test_prod_schema_is_rejected(monkeypatch) -> None:
         )
 
 
+def test_targeted_sql_joins_physical_column_for_aliased_entity_key() -> None:
+    sql = generate_targeted_sql(
+        """
+        select c_custkey as customer_id
+        from FRONTIER_TEST.DBT_DEV.FRONTIER_21C_CUSTOMER
+        """,
+        entity_key="customer_id",
+        affected_relation="FRONTIER_TEST.DBT_DEV.FRONTIER_RUN_AFFECTED_KEYS",
+    )
+    lowered = sql.lower()
+    assert "c_custkey" in lowered
+    assert "frontier_keys.customer_id" in lowered
+    assert "c_custkey" in lowered.split("frontier_keys")[0] or "c_custkey =" in lowered
+    assert restriction_is_pushed(sql, entity_key="customer_id")
+
+
 def test_targeted_sql_pushes_join_into_sources() -> None:
     sql = generate_targeted_sql(
         CUSTOMER_SUMMARY_SQL,
@@ -748,6 +764,29 @@ def test_sql_change_impact_queries_fail_closed_without_candidate_sql() -> None:
     none_queries, none_required = sql_change_impact_queries(None)
     assert none_required is False
     assert none_queries == ()
+
+
+def test_sql_change_impact_queries_skip_ineligible_filter_v1() -> None:
+    queries, required = sql_change_impact_queries(
+        {
+            "modified": [
+                {
+                    "name": "customers",
+                    "changeKinds": ["FILTER_CHANGED"],
+                    "impactStatus": "FULL_REBUILD_REQUIRED",
+                    "legacyImpactSql": "select customer_id from FRONTIER_LAB.DBT_DEV.orders",
+                    "staticEligibility": {
+                        "eligible": False,
+                        "reasonCode": "KEY_LINEAGE_BROKEN",
+                        "compiled": False,
+                    },
+                }
+            ]
+        },
+        target_name="customers",
+    )
+    assert required is True
+    assert queries == ()
 
 
 def test_query_profile_shows_reduction_for_pushed_restriction() -> None:

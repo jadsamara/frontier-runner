@@ -183,6 +183,23 @@ class BigQueryAdapter:
             "location": self.location,
         }
 
+    def capture_snapshot(self, relations: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
+        from frontier.snapshot import SOURCE_SNAPSHOT_NOT_PINNED, unpinned_snapshot
+
+        del relations, kwargs
+        return unpinned_snapshot(
+            failure_code=SOURCE_SNAPSHOT_NOT_PINNED,
+            failure_reason="BigQuery source snapshots are not implemented",
+        )
+
+    def bind_query_to_snapshot(self, sql: str, snapshot: Any) -> str:
+        del snapshot
+        return sql
+
+    def verify_snapshot_binding(self, sql: str, snapshot: Any) -> bool:
+        del sql, snapshot
+        return False
+
     def close(self) -> None:
         client = self._client
         if client is not None and hasattr(client, "close"):

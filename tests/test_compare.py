@@ -111,10 +111,15 @@ def test_filter_change_marks_model_modified() -> None:
     assert comparison["base"]["fingerprint"] != comparison["pr"]["fingerprint"]
     assert modified[0]["changeKinds"] == ["FILTER_CHANGED"]
     assert modified[0]["unsafe"] is False
-    assert modified[0]["impactStatus"] == "COMPILED"
-    assert "is distinct from" in (modified[0].get("candidateSql") or "").lower()
-    assert "FILTER_CHANGED" in (modified[0].get("changeSummary") or "")
-    assert comparison["narrowFrontierSafe"] is True
+    assert modified[0]["impactStatus"] == "FULL_REBUILD_REQUIRED"
+    assert modified[0].get("candidateSql") in (None, "")
+    assert "legacy impact compilation is diagnostic only" in " ".join(
+        modified[0].get("impactReasons") or []
+    )
+    assert "is distinct from" in (modified[0].get("legacyImpactSql") or "").lower()
+    assert modified[0]["staticEligibility"]["eligible"] is False
+    assert comparison["narrowFrontierSafe"] is False
+    assert comparison["fullRebuildRequired"] is True
 
 
 def test_removed_model_reports_downstream_consumers() -> None:
@@ -179,7 +184,8 @@ def test_compiled_sql_falls_back_to_compiled_dir(tmp_path: Path) -> None:
         entity_key="customer_id",
     ).to_dict()
     assert comparison["modified"][0]["uniqueId"] == "model.jaffle_shop.stg_orders"
-    assert comparison["modified"][0]["impactStatus"] == "COMPILED"
+    assert comparison["modified"][0]["impactStatus"] == "FULL_REBUILD_REQUIRED"
+    assert comparison["modified"][0]["staticEligibility"]["eligible"] is False
 
 
 def test_alias_only_sql_is_not_modified() -> None:
@@ -236,10 +242,12 @@ def test_unparseable_sql_is_unsupported_not_empty() -> None:
 def test_cte_filter_change_compiles_for_narrow_frontier() -> None:
     base_sql = """
         with customers as (
-            select c.* from stg_customers c
+            select c.customer_id from stg_customers c
         ),
         orders as (
-            select o.* from stg_orders o where o.order_status = 'F'
+            select o.order_id, o.customer_id, o.order_status
+            from stg_orders o
+            where o.order_status = 'F'
         )
         select c.customer_id, count(o.order_id) as total_orders
         from customers c
@@ -258,9 +266,28 @@ def test_cte_filter_change_compiles_for_narrow_frontier() -> None:
     assert modified[0]["changeKinds"] == ["FILTER_CHANGED"]
     assert modified[0]["unsafe"] is False
     assert modified[0]["impactStatus"] == "COMPILED"
+    assert modified[0]["staticEligibility"]["eligible"] is True
+    assert modified[0]["staticEligibility"]["compiled"] is True
     assert "is distinct from" in (modified[0].get("candidateSql") or "").lower()
+    assert modified[0].get("legacyImpactSql") is None
     assert comparison["narrowFrontierSafe"] is True
     assert comparison["fullRebuildRequired"] is False
+
+
+def test_select_star_filter_stays_uncertified() -> None:
+    from frontier.compare import format_compare_report
+
+    comparison = compare_manifests(
+        _manifest(*_graph()),
+        _manifest(*_graph(orders_sql=STG_ORDERS_FILTER_SQL)),
+        entity_key="customer_id",
+    ).to_dict()
+    report = format_compare_report(comparison)
+    assert "Narrow frontier safe: yes" not in report
+    assert "filter-v1 certification rejected this plan" in report
+    assert "legacy impact sql (not certified; not executed)" in report
+    assert comparison["staticEligibility"]["eligible"] is False
+    assert comparison["modified"][0].get("candidateSql") in (None, "")
 
 
 def test_empty_base_sql_is_rebuild_not_added_filter() -> None:
@@ -320,8 +347,19 @@ def test_compiled_sql_pair_prefers_changed_production_model() -> None:
 
 
 def test_compare_does_not_compile_demo_or_mutation_models() -> None:
-    base_prod = "select customer_id from orders where status = 'F'"
-    pr_prod = "select customer_id from orders where status in ('F', 'O')"
+    base_prod = """
+with orders as (
+  select id, customer_id, status
+  from stg_orders
+  where status = 'F'
+)
+select c.customer_id, count(o.id) as order_count
+from stg_customers as c
+left join orders as o
+  on c.customer_id = o.customer_id
+group by c.customer_id
+"""
+    pr_prod = base_prod.replace("where status = 'F'", "where status in ('F', 'O')")
     demo_base = (
         "select o.customer_id from orders o "
         "join frontier_affected_customers f on o.customer_id = f.customer_id "

@@ -73,6 +73,9 @@ def build_ingest_payload(
     semantic_manifest_version: int | None = None,
     semantic_manifest_fingerprint: str | None = None,
     manifest_source: str | None = None,
+    runner_version: str | None = None,
+    dbt_target: str | None = None,
+    assessment_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "externalRunId": external_run_id,
@@ -121,6 +124,12 @@ def build_ingest_payload(
             payload["semanticManifestFingerprint"] = semantic_manifest_fingerprint
         if manifest_source:
             payload["manifestSource"] = manifest_source
+    if runner_version:
+        payload["runnerVersion"] = runner_version
+    if dbt_target:
+        payload["dbtTarget"] = dbt_target
+    if assessment_identity:
+        payload["assessmentIdentity"] = assessment_identity
     assert_payload_has_no_secrets(payload)
     assert_no_raw_rows(payload)
     return payload

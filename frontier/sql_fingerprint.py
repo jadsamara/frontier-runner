@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from collections.abc import Iterator
 
 import sqlglot
+from sqlglot import exp
 from sqlglot.errors import SqlglotError
 
 _DIALECTS = {
@@ -101,6 +102,34 @@ def _strip_comments_and_whitespace(sql: str) -> str:
         out.append(char.lower())
         i += 1
     return _WHITESPACE.sub(" ", "".join(out)).strip()
+
+
+def render_executable_sql(expression: exp.Expression, *, dialect: str, pretty: bool = False) -> str:
+    """Render SQL that the warehouse can execute.
+
+    Snowflake unquoted names fold to uppercase. sqlglot's identify+normalize path
+    quotes them as lowercase, which Snowflake then treats as a different object.
+    """
+    copied = expression.copy()
+    if dialect == "snowflake":
+        for ident in copied.find_all(exp.Identifier):
+            ident.set("this", str(ident.this or "").upper())
+            ident.set("quoted", False)
+        return copied.sql(
+            dialect=dialect,
+            comments=False,
+            pretty=pretty,
+            normalize=False,
+            identify=False,
+        ).strip()
+    return copied.sql(
+        dialect=dialect,
+        comments=False,
+        pretty=pretty,
+        normalize=True,
+        normalize_functions="lower",
+        identify=True,
+    ).strip()
 
 
 def normalize_sql(sql: str, *, dialect: str | None = None) -> str:

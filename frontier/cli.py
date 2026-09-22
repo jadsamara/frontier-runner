@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -42,6 +43,7 @@ from frontier.dbt_artifacts import (
     load_run_results,
 )
 from frontier.frontier import (
+    FrontierResult,
     current_frontier_metrics_sql,
     frontier_result_to_dict,
     load_change_events_csv,
@@ -53,15 +55,26 @@ from frontier.execute import (
     generate_targeted_sql,
     isolated_location,
     open_isolated_run,
+    snapshot_execute,
     sql_change_impact_queries,
 )
+from frontier.certification import (
+    FULL_REBUILD_RECOMMENDED,
+    build_assessment_dimensions,
+    enrich_certification_record,
+    filter_v1_sql_certified,
+)
 from frontier.hashing import entity_hash_key_from_env, hmac_entity_id
-from frontier.impact import evaluate_discovery_counts
+from frontier.environment import ENVIRONMENT_MISMATCH, assess_artifact_environment
+from frontier.impact import CANDIDATE_SET_ANALYSIS_FAILED, CANDIDATE_SET_EMPTY, CANDIDATE_SET_NONEMPTY, evaluate_discovery_counts
+from frontier.sql_fingerprint import sql_dialect
+from frontier.snapshot import collect_source_relations
 from frontier.progress import (
     configure_stdio,
     elapsed_ms,
     failure_status,
     log_step,
+    redact_failure_reason,
 )
 from frontier.cdc.config import cdc_config_path, load_cdc_config, overlay_cdc_with_manifest
 from frontier.cdc.consume import consume_all, project_name_for
@@ -99,6 +112,7 @@ from frontier.warehouse import (
     WarehouseAdapter,
     connect_warehouse,
     describe_adapter,
+    load_dbt_profile_output,
     normalize_warehouse_type,
 )
 from frontier.onboard.commands import (
@@ -133,6 +147,7 @@ from frontier.validation import (
 )
 
 RUN_FILE_NAME = "frontier-run.json"
+INVOCATION_FILE_NAME = "frontier-run.invocation"
 
 PHASE_ARTIFACT = "artifact comparison"
 PHASE_IMPACT = "impact-query execution"
@@ -143,8 +158,190 @@ PHASE_CONFIRM = "confirmation"
 PHASE_UPLOAD = "upload"
 
 
-def _print_job_metrics(isolated: Any | None, warehouse: Any) -> None:
-    records = list(getattr(isolated, "job_metrics", None) or [])
+def _filter_v1_executable(comparison: dict[str, Any] | None) -> bool:
+    eligibility = (comparison or {}).get("staticEligibility") or {}
+    if eligibility.get("eligible") is True and eligibility.get("compiled") is True:
+        return True
+    for row in (comparison or {}).get("modified") or []:
+        row_eligibility = row.get("staticEligibility") or {}
+        if row_eligibility.get("eligible") is True and row_eligibility.get("compiled") is True:
+            return True
+    return False
+
+
+def _invocation_path(run_file: Path) -> Path:
+    return run_file.with_name(INVOCATION_FILE_NAME)
+
+
+def _write_invocation_stamp(run_file: Path, run_id: str) -> None:
+    run_file.parent.mkdir(parents=True, exist_ok=True)
+    _invocation_path(run_file).write_text(run_id.strip() + "\n")
+
+
+def _read_invocation_stamp(run_file: Path) -> str:
+    path = _invocation_path(run_file)
+    if not path.is_file():
+        return ""
+    return path.read_text().strip()
+
+
+def _redacted_failure_reason(error: BaseException) -> str:
+    text = redact_failure_reason(error)
+    return text[:512] if text else type(error).__name__
+
+
+def _collect_warehouse_job(warehouse: Any, phase: str) -> dict[str, Any] | None:
+    query_id = getattr(warehouse, "last_query_id", None)
+    if not query_id:
+        return None
+    profile: dict[str, Any] = {}
+    getter = getattr(warehouse, "get_query_profile", None)
+    if callable(getter):
+        try:
+            profile = dict(getter(str(query_id)) or {})
+        except Exception:
+            profile = {}
+    elapsed = profile.get("elapsed_ms")
+    if elapsed is None:
+        elapsed = profile.get("total_elapsed_ms")
+    return {
+        "phase": phase,
+        "query_id": str(query_id),
+        "elapsed_ms": elapsed,
+        "bytes_scanned": profile.get("bytes_scanned"),
+        "total_bytes_processed": profile.get("total_bytes_processed"),
+        "cloud_services_credits": profile.get("cloud_services_credits"),
+    }
+
+
+def _sum_job_bytes(isolated: Any | None, extra: Sequence[dict[str, Any]] | None = None) -> int | None:
+    records = list(extra or [])
+    records.extend(getattr(isolated, "job_metrics", None) or [])
+    total = 0
+    found = False
+    for record in records:
+        value = record.get("bytes_scanned")
+        if value is None:
+            value = record.get("total_bytes_processed")
+        if value is not None:
+            total += int(value)
+            found = True
+    return total if found else None
+
+
+def _reraise_prove_failure(error: BaseException, *, phase: str, code: str) -> None:
+    if isinstance(error, ConfigError):
+        raise error
+    raise ConfigError(f"{phase}: {code}: {_redacted_failure_reason(error)}") from error
+
+
+def _write_failed_prove_run(
+    args: argparse.Namespace,
+    *,
+    config,
+    run_id: str,
+    error: BaseException,
+    sql_comparison: dict[str, Any] | None,
+    manifest,
+    phase: str,
+    code: str,
+) -> Path | None:
+    """Overwrite frontier-run.json with this invocation's failed assessment."""
+    output = Path(args.output) if getattr(args, "output", None) else _target_dir(_project_dir(args)) / RUN_FILE_NAME
+    args.run_id = run_id
+    reason = _redacted_failure_reason(error)
+    phase_name = (phase or "execution")[:64]
+    code_name = (code or "EXECUTION_FAILED")[:64]
+    text = str(error)
+    if isinstance(error, ConfigError) and ENVIRONMENT_MISMATCH in text:
+        code_name = ENVIRONMENT_MISMATCH
+    result = FrontierResult(
+        full_entity_count=1,
+        frontier_entity_count=1,
+        percent_rows_avoided=0.0,
+        change_events=[],
+        affected_entities=[],
+        frontier_sql="",
+        metrics_sql="",
+        full_rebuild_required=True,
+        execution_failed=True,
+        failure_phase=phase_name,
+        failure_code=code_name,
+        failure_reason=reason[:512],
+        proof_status="EXECUTION_FAILED",
+        execution_reasons=(f"{code_name}: {reason}",),
+    )
+    comparison = dict(sql_comparison) if sql_comparison else None
+    if comparison is not None:
+        comparison["fullRebuildRequired"] = True
+        comparison["narrowFrontierSafe"] = False
+    validations = [
+        ValidationResult(
+            test_name="assert_frontier_execution",
+            status="failed",
+            difference_count=1,
+            message=f"{phase_name}: {code_name}: {reason[:400]}",
+        )
+    ]
+    try:
+        path = _emit_run(
+            args,
+            config=config,
+            manifest=manifest,
+            result=result,
+            validations=validations,
+            sql_comparison=comparison,
+        )
+        print(f"Wrote failed assessment to {path}", flush=True)
+        return path
+    except Exception as write_error:
+        try:
+            if output.is_file():
+                output.unlink()
+            _write_invocation_stamp(output, run_id)
+        except OSError:
+            pass
+        print(
+            f"Could not write failed assessment ({type(write_error).__name__}); "
+            "invalidated the previous run file.",
+            flush=True,
+        )
+        return None
+
+
+def _assessment_identity(
+    *,
+    run_id: str,
+    dbt_target: str | None = None,
+    profile_database: str | None = None,
+    profile_schema: str | None = None,
+    pinned_version: int | None = None,
+    pinned_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    identity: dict[str, Any] = {
+        "runnerVersion": __version__,
+        "invocationId": run_id,
+    }
+    if dbt_target:
+        identity["dbtTarget"] = dbt_target
+    if profile_database:
+        identity["profileDatabase"] = profile_database
+    if profile_schema:
+        identity["profileSchema"] = profile_schema
+    if pinned_version is not None:
+        identity["pinnedManifestVersion"] = pinned_version
+    if pinned_fingerprint:
+        identity["pinnedManifestFingerprint"] = pinned_fingerprint
+    return identity
+
+
+def _print_job_metrics(
+    isolated: Any | None,
+    warehouse: Any,
+    extra: Sequence[dict[str, Any]] | None = None,
+) -> None:
+    records = list(extra or [])
+    records.extend(getattr(isolated, "job_metrics", None) or [])
     if not records:
         query_id = getattr(warehouse, "last_query_id", None)
         if query_id:
@@ -273,7 +470,21 @@ def _resolve_runtime_config(
         api_url=api_url,
         api_key=api_key,
     )
+    model_name = (getattr(args, "model", None) or "").strip()
+    if model_name:
+        config = replace(config, model=replace(config.model, name=model_name))
     return config
+
+
+def _pinned_compare_fields(config) -> tuple[int | None, str | None]:
+    pinned = getattr(config, "pinned", None) if config is not None else None
+    version = getattr(pinned, "version", None)
+    fingerprint = getattr(pinned, "fingerprint", None)
+    if not isinstance(version, int):
+        version = None
+    if not isinstance(fingerprint, str) or not fingerprint.strip():
+        fingerprint = None
+    return version, fingerprint
 
 
 def _ingest_manifest_fields(config) -> dict[str, Any]:
@@ -333,6 +544,7 @@ def _load_sql_comparison(
         else ()
     )
     target_name = runtime.model.name if runtime else None
+    manifest_version, manifest_fingerprint = _pinned_compare_fields(runtime)
     comparison = compare_manifests(
         base_manifest,
         pr_manifest,
@@ -343,6 +555,8 @@ def _load_sql_comparison(
         entity_key=entity_key,
         confirmed_keys=confirmed_keys,
         target_name=target_name,
+        semantic_manifest_version=manifest_version,
+        semantic_manifest_fingerprint=manifest_fingerprint,
     )
     return comparison.to_dict()
 
@@ -569,7 +783,7 @@ def _impact_attempted(result) -> bool:
 
 
 def _stamp_sql_comparison(args: argparse.Namespace, comparison: dict[str, Any] | None, result) -> dict[str, Any] | None:
-    return stamp_impact_execution(
+    stamped = stamp_impact_execution(
         comparison,
         run_mode=_run_mode(args),
         full_rebuild_required=bool(getattr(result, "full_rebuild_required", False)),
@@ -581,6 +795,101 @@ def _stamp_sql_comparison(args: argparse.Namespace, comparison: dict[str, Any] |
         failure_code=getattr(result, "failure_code", None),
         failure_reason=getattr(result, "failure_reason", None),
     )
+    if stamped is None:
+        return None
+    eligibility = stamped.get("staticEligibility") or {}
+    for row in stamped.get("modified") or []:
+        row_eligibility = row.get("staticEligibility") or {}
+        if row_eligibility.get("eligible") or row_eligibility.get("candidateFingerprint"):
+            eligibility = {**eligibility, **row_eligibility}
+            break
+    compiled = bool(eligibility.get("compiled") and eligibility.get("candidateFingerprint"))
+    if not compiled:
+        for row in stamped.get("modified") or []:
+            if row.get("queryFingerprint") and (row.get("staticEligibility") or {}).get("compiled"):
+                compiled = True
+                eligibility = {**eligibility, **(row.get("staticEligibility") or {})}
+                if row.get("queryFingerprint"):
+                    eligibility.setdefault("candidateFingerprint", row["queryFingerprint"])
+                break
+    confirmed = getattr(result, "proof_status", None) == "CONFIRMED"
+    execution_failed = bool(getattr(result, "execution_failed", False))
+    eligible = eligibility.get("eligible") is True
+    snapshot = getattr(result, "source_snapshot", None)
+    static_certified = filter_v1_sql_certified(
+        eligible=eligible,
+        compiled=compiled,
+        confirmed=confirmed,
+        execution_failed=execution_failed,
+    )
+    dimensions = build_assessment_dimensions(
+        snapshot=snapshot,
+        static_certified=static_certified,
+        execution_failed=execution_failed,
+        execution_ran=bool(
+            getattr(result, "sql_change_candidate_count", None) is not None
+            or getattr(result, "changed_source_row_count", None) is not None
+            or getattr(result, "proof_status", None)
+            in {
+                "CONFIRMED",
+                "CANDIDATES_EXECUTED",
+                "TARGETED_BASE_EXECUTED",
+                "TARGETED_HEAD_EXECUTED",
+            }
+        ),
+        full_rebuild_recommended=bool(getattr(result, "full_rebuild_recommended", False)),
+        targeted_ran=getattr(result, "proof_status", None)
+        in {"CONFIRMED", "TARGETED_HEAD_EXECUTED", "TARGETED_BASE_EXECUTED"},
+        frontier_bytes=getattr(result, "frontier_bytes_scanned", None),
+        full_comparison_bytes=getattr(result, "full_comparison_bytes_scanned", None),
+        warehouse_credits=getattr(result, "warehouse_credits", None),
+        candidates_confirmed=confirmed,
+        confirmation_failed=getattr(result, "failure_phase", None) == "CONFIRMED",
+        full_reference_validated=bool(getattr(result, "full_reference_validated", False)),
+        full_reference_failed=getattr(result, "failure_phase", None) == "FULL_REFERENCE",
+        failure_phase=getattr(result, "failure_phase", None) if execution_failed else None,
+        failure_code=getattr(result, "failure_code", None) if execution_failed else None,
+        failure_reason=getattr(result, "failure_reason", None) if execution_failed else None,
+    )
+    enrich_certification_record(
+        dimensions,
+        eligibility=eligibility,
+        snapshot=snapshot,
+        candidate_fingerprint=eligibility.get("candidateFingerprint"),
+        execution_failed=execution_failed,
+    )
+    stamped.update(dimensions)
+    if (stamped.get("economics") or {}).get("decision") == FULL_REBUILD_RECOMMENDED:
+        stamped["fullRebuildRecommended"] = True
+    _stamp_candidate_set_state(
+        stamped,
+        compiled=compiled,
+        execution_failed=execution_failed,
+        candidate_count=getattr(result, "sql_change_candidate_count", None),
+    )
+    return stamped
+
+
+def _stamp_candidate_set_state(
+    comparison: dict[str, Any],
+    *,
+    compiled: bool,
+    execution_failed: bool,
+    candidate_count: int | None,
+) -> None:
+    """Empty is genuine only after successful compile and execution."""
+    if execution_failed:
+        for row in comparison.get("modified") or []:
+            if row.get("candidateSetState") == CANDIDATE_SET_EMPTY and not compiled:
+                row["candidateSetState"] = CANDIDATE_SET_ANALYSIS_FAILED
+        return
+    if not compiled or candidate_count is None:
+        return
+    state = CANDIDATE_SET_EMPTY if candidate_count == 0 else CANDIDATE_SET_NONEMPTY
+    for row in comparison.get("modified") or []:
+        if row.get("queryFingerprint") or (row.get("staticEligibility") or {}).get("compiled"):
+            if row.get("candidateSetState") in {None, "not_evaluated"}:
+                row["candidateSetState"] = state
 
 
 def _apply_rebuild_to_comparison(
@@ -612,6 +921,49 @@ def _apply_rebuild_to_comparison(
 
 def _format_measured(value: Any) -> str:
     return "Not measured" if value is None else str(value)
+
+
+def _print_assessment_dimensions(comparison: dict[str, Any] | None) -> None:
+    if not comparison:
+        return
+    certification = comparison.get("certification") or {}
+    if certification.get("status"):
+        line = f"Certification: {certification.get('status')}"
+        if certification.get("failureCode"):
+            line += f" ({certification.get('failureCode')})"
+        print(line)
+        if certification.get("oldPlanFingerprint"):
+            print(f"Old plan fingerprint: {certification.get('oldPlanFingerprint')}")
+        if certification.get("newPlanFingerprint"):
+            print(f"New plan fingerprint: {certification.get('newPlanFingerprint')}")
+        if certification.get("changedFilterNodeId"):
+            print(f"Changed filter node: {certification.get('changedFilterNodeId')}")
+        if certification.get("candidateQueryFingerprint"):
+            print(f"Candidate query fingerprint: {certification.get('candidateQueryFingerprint')}")
+    validation = comparison.get("validation") or {}
+    if validation.get("status"):
+        print(f"Validation status: {validation.get('status')}")
+    economics = comparison.get("economics") or {}
+    if economics.get("decision"):
+        print(f"Economics: {economics.get('decision')}")
+    execution = comparison.get("execution") or {}
+    if execution.get("status"):
+        print(f"Execution: {execution.get('status')}")
+    snapshot = comparison.get("sourceSnapshot") or {}
+    if snapshot:
+        print(
+            "Source snapshot: "
+            f"{snapshot.get('mode') or 'none'} "
+            f"{snapshot.get('assurance') or 'NONE'} "
+            f"{snapshot.get('identifier') or ''}".strip()
+        )
+    boundary = comparison.get("baselineBoundary") or {}
+    if boundary:
+        print(
+            "Baseline: this assessment compares two SQL versions at one pinned source snapshot; "
+            "the existing materialized dbt mart is not that snapshot; "
+            "in-place production repair is not certified."
+        )
 
 
 def _print_origin_counts(result) -> None:
@@ -665,7 +1017,12 @@ def _emit_run(
         full_rebuild_required=bool(getattr(result, "full_rebuild_required", False)),
         sql_change_executed=getattr(result, "sql_change_candidate_count", None) is not None,
         impact_attempted=_impact_attempted(result),
+        proof_status=getattr(result, "proof_status", None),
+        failure_phase=getattr(result, "failure_phase", None),
+        failure_code=getattr(result, "failure_code", None),
+        failure_reason=getattr(result, "failure_reason", None),
     )
+    sql_comparison = _stamp_sql_comparison(args, sql_comparison, result)
     sql_check = sql_change_narrow_frontier_result(sql_comparison)
     if sql_check is not None:
         validations.append(sql_check)
@@ -704,6 +1061,16 @@ def _emit_run(
             sql_comparison,
         ),
         **_ingest_manifest_fields(config),
+        runner_version=__version__,
+        dbt_target=getattr(args, "target", None) or getattr(config, "environment", None),
+        assessment_identity=_assessment_identity(
+            run_id=run_id,
+            dbt_target=getattr(args, "target", None) or getattr(config, "environment", None),
+            profile_database=str(model.database) if model.database else None,
+            profile_schema=str(model.schema) if model.schema else None,
+            pinned_version=_pinned_compare_fields(config)[0],
+            pinned_fingerprint=_pinned_compare_fields(config)[1],
+        ),
     )
     output = Path(args.output) if args.output else _target_dir(_project_dir(args)) / RUN_FILE_NAME
     _write_run_file(output, payload)
@@ -760,6 +1127,20 @@ def cmd_run(args: argparse.Namespace) -> int:
             persist=persist,
             target_name=config.model.name,
         )
+        source_snapshot = None
+        if persist:
+            model = manifest.find_model(config.model.name)
+            capture = getattr(warehouse, "capture_snapshot", None)
+            if callable(capture):
+                source_snapshot = capture(
+                    collect_source_relations(
+                        *sql_change_queries,
+                        base_sql or "",
+                        after_sql or "",
+                        f"select * from {model.relation}",
+                        dialect=warehouse.dialect,
+                    )
+                )
         result = run_frontier(
             config,
             manifest=manifest,
@@ -771,6 +1152,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             sql_change_required=sql_change_required,
             before_sql=base_sql,
             after_sql=after_sql,
+            source_snapshot=source_snapshot,
         )
         validations = collect_validation_results(
             config=config,
@@ -800,6 +1182,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"Frontier: {result.frontier_entity_count}")
     print(f"Rows avoided: {result.percent_rows_avoided}%")
     _print_origin_counts(result)
+    _print_assessment_dimensions(sql_comparison)
     print("Validation:")
     for item in validations:
         print(f"  - {item.test_name}: {item.status} (differences={item.difference_count})")
@@ -949,6 +1332,11 @@ def cmd_prove(args: argparse.Namespace) -> int:
     config = _resolve_runtime_config(args, project_dir, dbt_manifest=manifest)
     run_results = load_run_results(_target_dir(project_dir) / "run_results.json")
     run_id = args.run_id or default_external_run_id(config.project)
+    args.run_id = run_id
+    output = Path(args.output) if args.output else _target_dir(project_dir) / RUN_FILE_NAME
+    _write_invocation_stamp(output, run_id)
+    if output.is_file():
+        output.unlink()
     log_step("compare started")
     started = time.perf_counter()
     try:
@@ -964,7 +1352,17 @@ def cmd_prove(args: argparse.Namespace) -> int:
             duration_ms=elapsed_ms(started),
             status=failure_status(error),
         )
-        raise
+        _write_failed_prove_run(
+            args,
+            config=config,
+            run_id=run_id,
+            error=error,
+            sql_comparison=None,
+            manifest=manifest,
+            phase="artifact comparison",
+            code="EXECUTION_FAILED",
+        )
+        _reraise_prove_failure(error, phase="artifact comparison", code="EXECUTION_FAILED")
     log_step("compare completed", duration_ms=elapsed_ms(started), status="ok")
     _print_phase(PHASE_ARTIFACT, elapsed_ms(started))
     events = _load_events(args, project_dir, sql_comparison)
@@ -996,11 +1394,11 @@ def cmd_prove(args: argparse.Namespace) -> int:
             "FRONTIER_DRY_RUN is not allowed in GitHub Actions prove. "
             "Customer CI must execute against DATA_AGENT_DEV.DBT_CI."
         )
-    warehouse: WarehouseAdapter
     persist = not dry_run
     sql_change_queries = selected_queries if persist else ()
     sql_proof = None
     proof = None
+    warehouse: WarehouseAdapter | None = None
     base_sql, after_sql = _proof_sql_pair(
         args,
         config=config,
@@ -1008,7 +1406,188 @@ def cmd_prove(args: argparse.Namespace) -> int:
         project_dir=project_dir,
         sql_comparison=sql_comparison,
     )
+    skip_certified = persist and not _filter_v1_executable(sql_comparison)
+    if skip_certified:
+        sql_change_queries = ()
     impact_unavailable = sql_change_required and not selected_queries
+    dialect = sql_dialect(manifest.adapter_type) or "snowflake"
+    if dry_run:
+        log_step("Snowflake connector import started")
+        log_step("Snowflake connector import completed", status="skipped:dry-run")
+        log_step("Snowflake connection started")
+        log_step("Snowflake connected", status="skipped:dry-run")
+        warehouse = FakeWarehouse(
+            {
+                "full_entity_count": [(150_000, 3 if not sql_change_demo else 12)],
+                "order_id in (1)": [(36901,)],
+                "order_id in (5)": [(781,)],
+                "difference_count": [(0,)],
+            }
+        )
+        print("Using in-memory warehouse (--dry-run). No live warehouse session.", flush=True)
+        if sql_change_demo:
+            sql_proof = recorded_sql_change_proof()
+        else:
+            proof = recorded_proof()
+            events = apply_resolved_delete(
+                events,
+                order_id=proof.deleted_order_id,
+                customer_id=proof.deleted_order_customer_id,
+            )
+    elif skip_certified:
+        log_step("Snowflake connector import started")
+        log_step("Snowflake connection started")
+        live: WarehouseAdapter | None = None
+        try:
+            live = connect_warehouse(
+                project_dir,
+                profiles_path=Path(args.profiles).expanduser() if args.profiles else None,
+                target=args.target,
+            )
+            profile: dict[str, Any] = {}
+            try:
+                profile = load_dbt_profile_output(
+                    project_dir,
+                    profiles_path=Path(args.profiles).expanduser() if args.profiles else None,
+                    target=args.target,
+                )
+            except ConfigError:
+                profile = {}
+            model = manifest.find_model(config.model.name)
+            env = assess_artifact_environment(
+                base_sql=base_sql or "",
+                pr_sql=after_sql or "",
+                candidate_sql="",
+                base_database=model.database,
+                pr_database=model.database,
+                profile_database=str(profile.get("database") or ""),
+                dialect=live.dialect or dialect,
+            )
+            if env.ok:
+                warehouse = live
+                live = None
+                dialect = warehouse.dialect or dialect
+                print(
+                    f"{warehouse.warehouse_type}: " + json.dumps(describe_adapter(warehouse)),
+                    flush=True,
+                )
+                log_step("Snowflake connected", status="ok:metrics-only uncertified")
+                print(
+                    "Skipping targeted warehouse execution: filter-v1 certification rejected "
+                    "this plan; legacy impact SQL is diagnostic only and must not be executed.",
+                    flush=True,
+                )
+            else:
+                log_step(
+                    "Snowflake connected",
+                    status="skipped:environment mismatch uncertified",
+                )
+                print(
+                    "Skipping warehouse execution: filter-v1 certification rejected this plan; "
+                    f"{env.reason or ENVIRONMENT_MISMATCH}. "
+                    "legacy impact SQL is diagnostic only.",
+                    flush=True,
+                )
+                warehouse = FakeWarehouse(
+                    {"full_entity_count": [(1, 1)], "difference_count": [(0,)]}
+                )
+        except Exception as error:
+            log_step(
+                "Snowflake connected",
+                status=failure_status(error),
+            )
+            warehouse = FakeWarehouse(
+                {"full_entity_count": [(1, 1)], "difference_count": [(0,)]}
+            )
+            print(
+                "Skipping warehouse execution: filter-v1 certification rejected this plan; "
+                "legacy impact SQL is diagnostic only.",
+                flush=True,
+            )
+        finally:
+            if live is not None:
+                live.close()
+    else:
+        try:
+            warehouse = connect_warehouse(
+                project_dir,
+                profiles_path=Path(args.profiles).expanduser() if args.profiles else None,
+                target=args.target,
+            )
+        except Exception as error:
+            _write_failed_prove_run(
+                args,
+                config=config,
+                run_id=run_id,
+                error=error,
+                sql_comparison=sql_comparison,
+                manifest=manifest,
+                phase="warehouse connection",
+                code="EXECUTION_FAILED",
+            )
+            _reraise_prove_failure(error, phase="warehouse connection", code="EXECUTION_FAILED")
+        print(f"{warehouse.warehouse_type}: " + json.dumps(describe_adapter(warehouse)), flush=True)
+        dialect = warehouse.dialect or dialect
+        if persist and sql_change_queries:
+            profile = {}
+            try:
+                profile = load_dbt_profile_output(
+                    project_dir,
+                    profiles_path=Path(args.profiles).expanduser() if args.profiles else None,
+                    target=args.target,
+                )
+            except ConfigError:
+                profile = {}
+            model = manifest.find_model(config.model.name)
+            env = assess_artifact_environment(
+                base_sql=base_sql or "",
+                pr_sql=after_sql or "",
+                candidate_sql=sql_change_queries[0] if sql_change_queries else "",
+                base_database=model.database,
+                pr_database=model.database,
+                profile_database=str(profile.get("database") or ""),
+                dialect=dialect,
+            )
+            if not env.ok:
+                warehouse.close()
+                _write_failed_prove_run(
+                    args,
+                    config=config,
+                    run_id=run_id,
+                    error=ConfigError(env.reason or ENVIRONMENT_MISMATCH),
+                    sql_comparison=sql_comparison,
+                    manifest=manifest,
+                    phase="environment check",
+                    code=ENVIRONMENT_MISMATCH,
+                )
+                raise ConfigError(env.reason or ENVIRONMENT_MISMATCH)
+        if not sql_change_demo:
+            try:
+                deleted_order_id, deleted_customer_id = resolve_deleted_order(
+                    manifest,
+                    warehouse,
+                    proof=config.proof,
+                    source_key=mutation_source_key(config),
+                    entity_key=config.model.key,
+                )
+            except ConfigError as error:
+                warehouse.close()
+                _write_failed_prove_run(
+                    args,
+                    config=config,
+                    run_id=run_id,
+                    error=error,
+                    sql_comparison=sql_comparison,
+                    manifest=manifest,
+                    phase="mutation proof",
+                    code="EXECUTION_FAILED",
+                )
+                _reraise_prove_failure(error, phase="mutation proof", code="EXECUTION_FAILED")
+            events = apply_resolved_delete(
+                events,
+                order_id=deleted_order_id,
+                customer_id=deleted_customer_id,
+            )
     if persist and selected_queries:
         changed_models = [
             str(row.get("name") or "")
@@ -1034,11 +1613,11 @@ def cmd_prove(args: argparse.Namespace) -> int:
             )
     log_step("targeted SQL generation started")
     started = time.perf_counter()
-    if impact_unavailable:
+    if impact_unavailable or skip_certified:
         log_step(
             "targeted SQL generation completed",
             duration_ms=elapsed_ms(started),
-            status="skipped:impact SQL unavailable",
+            status="skipped:filter-v1 uncertified" if skip_certified else "skipped:impact SQL unavailable",
         )
     elif base_sql and after_sql:
         try:
@@ -1050,7 +1629,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 run_id=run_id,
                 model_database=model.database,
                 model_schema=model.schema,
-                dialect=warehouse.dialect,
+                dialect=warehouse.dialect if warehouse is not None else dialect,
             )
         except Exception as error:
             log_step(
@@ -1058,70 +1637,58 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 duration_ms=elapsed_ms(started),
                 status=failure_status(error),
             )
-        else:
-            log_step(
-                "targeted SQL generation completed",
-                duration_ms=elapsed_ms(started),
-                status="ok",
+            if warehouse is not None:
+                warehouse.close()
+            _write_failed_prove_run(
+                args,
+                config=config,
+                run_id=run_id,
+                error=error,
+                sql_comparison=sql_comparison,
+                manifest=manifest,
+                phase="targeted SQL generation",
+                code="EXECUTION_FAILED",
             )
+            _reraise_prove_failure(error, phase="targeted SQL generation", code="EXECUTION_FAILED")
+        log_step(
+            "targeted SQL generation completed",
+            duration_ms=elapsed_ms(started),
+            status="ok",
+        )
     else:
         log_step(
             "targeted SQL generation completed",
             duration_ms=elapsed_ms(started),
             status="skipped",
         )
-    if dry_run:
-        log_step("Snowflake connector import started")
-        log_step("Snowflake connector import completed", status="skipped:dry-run")
-        log_step("Snowflake connection started")
-        log_step("Snowflake connected", status="skipped:dry-run")
-        warehouse = FakeWarehouse(
-            {
-                "full_entity_count": [(150_000, 3 if not sql_change_demo else 12)],
-                "order_id in (1)": [(36901,)],
-                "order_id in (5)": [(781,)],
-                "difference_count": [(0,)],
-            }
-        )
-        print("Using in-memory warehouse (--dry-run). No live warehouse session.", flush=True)
-        if sql_change_demo:
-            sql_proof = recorded_sql_change_proof()
-        else:
-            proof = recorded_proof()
-            events = apply_resolved_delete(
-                events,
-                order_id=proof.deleted_order_id,
-                customer_id=proof.deleted_order_customer_id,
-            )
-    else:
-        warehouse = connect_warehouse(
-            project_dir,
-            profiles_path=Path(args.profiles).expanduser() if args.profiles else None,
-            target=args.target,
-        )
-        print(f"{warehouse.warehouse_type}: " + json.dumps(describe_adapter(warehouse)), flush=True)
-        if not sql_change_demo:
-            try:
-                deleted_order_id, deleted_customer_id = resolve_deleted_order(
-                    manifest,
-                    warehouse,
-                    proof=config.proof,
-                    source_key=mutation_source_key(config),
-                    entity_key=config.model.key,
-                )
-            except ConfigError:
-                warehouse.close()
-                raise
-            events = apply_resolved_delete(
-                events,
-                order_id=deleted_order_id,
-                customer_id=deleted_customer_id,
-            )
 
     isolated = None
+    prove_jobs: list[dict[str, Any]] = []
     rebuild_recommended = False
     discovered_source_rows: int | None = None
     discovered_candidates: int | None = None
+    source_snapshot = None
+    if persist and warehouse is not None and sql_change_queries:
+        model = manifest.find_model(config.model.name)
+        capture = getattr(warehouse, "capture_snapshot", None)
+        if callable(capture):
+            relations = collect_source_relations(
+                *(sql_change_queries or ()),
+                base_sql or "",
+                after_sql or "",
+                f"select * from {model.relation}",
+                dialect=warehouse.dialect,
+            )
+            source_snapshot = capture(relations)
+            log_step(
+                "source snapshot captured",
+                status=getattr(source_snapshot, "assurance", "NONE"),
+            )
+    elif persist and not sql_change_queries:
+        log_step(
+            "source snapshot captured",
+            status="skipped:filter-v1 uncertified",
+        )
     try:
         if persist and sql_change_demo and sql_change_queries:
             log_step("impact query submission started")
@@ -1132,7 +1699,11 @@ def cmd_prove(args: argparse.Namespace) -> int:
                     sql_change_queries[0],
                     config.model.key,
                     warehouse,
+                    snapshot=source_snapshot,
                 )
+                job = _collect_warehouse_job(warehouse, "impact-query")
+                if job:
+                    prove_jobs.append(job)
             except Exception as error:
                 log_step(
                     "impact query completed",
@@ -1157,7 +1728,15 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 dialect=warehouse.dialect,
             )
             try:
-                metric_rows = warehouse.execute(metrics_sql)
+                metric_rows = snapshot_execute(
+                    warehouse,
+                    metrics_sql,
+                    source_snapshot,
+                    phase="discovery",
+                )
+                job = _collect_warehouse_job(warehouse, "threshold-metrics")
+                if job:
+                    prove_jobs.append(job)
             except Exception as error:
                 log_step(
                     "threshold decision completed",
@@ -1279,6 +1858,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 model_database=model.database,
                 model_schema=model.schema,
                 model_relation=model.relation,
+                snapshot=source_snapshot,
             )
         result = run_frontier(
             config,
@@ -1294,7 +1874,10 @@ def cmd_prove(args: argparse.Namespace) -> int:
             isolated_run=isolated,
             confirm=not skip_targeted,
             full_rebuild_recommended=rebuild_recommended,
+            source_snapshot=source_snapshot,
         )
+        if source_snapshot is not None:
+            result.source_snapshot = source_snapshot
         if discovered_candidates is not None:
             result.changed_source_row_count = discovered_source_rows
             if result.sql_change_candidate_count is None:
@@ -1403,6 +1986,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
                             ),
                             full_entity_count=result.full_entity_count,
                             changed_source_row_count=discovered_source_rows,
+                            source_snapshot=source_snapshot,
                         )
                     except Exception as error:
                         log_step(
@@ -1415,6 +1999,9 @@ def cmd_prove(args: argparse.Namespace) -> int:
                         "SQL-change proof completed",
                         duration_ms=elapsed_ms(started),
                         status="ok",
+                    )
+                    result.full_reference_validated = bool(
+                        getattr(sql_proof, "full_reference_validated", False)
                     )
             if dry_run:
                 result.affected_entities = recorded_sql_change_affected(
@@ -1461,6 +2048,21 @@ def cmd_prove(args: argparse.Namespace) -> int:
             )
             raise
         log_step("validation completed", duration_ms=elapsed_ms(started), status="ok")
+        bytes_scanned = _sum_job_bytes(isolated, prove_jobs)
+        if bytes_scanned is not None:
+            result.frontier_bytes_scanned = bytes_scanned
+    except Exception as error:
+        _write_failed_prove_run(
+            args,
+            config=config,
+            run_id=run_id,
+            error=error,
+            sql_comparison=sql_comparison,
+            manifest=manifest,
+            phase="warehouse execution",
+            code="EXECUTION_FAILED",
+        )
+        _reraise_prove_failure(error, phase="warehouse execution", code="EXECUTION_FAILED")
     finally:
         if isolated is not None:
             isolated.cleanup()
@@ -1468,8 +2070,9 @@ def cmd_prove(args: argparse.Namespace) -> int:
             log_step("cleanup started")
             log_step("cleanup completed", status="skipped")
         if not dry_run:
-            _print_job_metrics(isolated, warehouse)
-        warehouse.close()
+            _print_job_metrics(isolated, warehouse, extra=prove_jobs)
+        if warehouse is not None:
+            warehouse.close()
 
     sql_comparison = _stamp_sql_comparison(
         args,
@@ -1591,7 +2194,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
         else:
             print(f"Row count: {sql_proof.before_entity_count} → {sql_proof.after_entity_count}")
         print(
-            f"Targeted repair: {'skipped' if rebuild_recommended or result.full_rebuild_required else ('safe' if sql_proof.targeted_repair_safe else 'not safe')}"
+            f"Targeted repair: {'skipped' if rebuild_recommended or result.full_rebuild_required or getattr(result, 'execution_failed', False) else ('safe' if sql_proof.targeted_repair_safe else 'not safe')}"
         )
         print(
             f"Targeted validation: {(sql_comparison or {}).get('targetedValidation') or ('NOT_RUN' if result.full_rebuild_required else 'PASSED')}"
@@ -1615,6 +2218,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
         print("Test duration: Not measured")
     else:
         print(f"Test duration: {assessed.test_duration_ms} ms")
+    _print_assessment_dimensions(sql_comparison)
     print("Validation:")
     for item in validations:
         print(f"  - {item.test_name}: {item.status} (differences={item.difference_count})")
@@ -1650,6 +2254,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         )
     )
     target_name = config.model.name
+    manifest_version, manifest_fingerprint = _pinned_compare_fields(config)
     comparison = compare_manifests(
         base_manifest,
         pr_manifest,
@@ -1660,6 +2265,8 @@ def cmd_compare(args: argparse.Namespace) -> int:
         entity_key=entity_key,
         confirmed_keys=confirmed_keys,
         target_name=target_name,
+        semantic_manifest_version=manifest_version,
+        semantic_manifest_fingerprint=manifest_fingerprint,
     ).to_dict()
     print(format_compare_report(comparison))
     output = Path(args.output) if args.output else _target_dir(project_dir) / "frontier-compare.json"
@@ -1677,6 +2284,27 @@ def cmd_upload(args: argparse.Namespace) -> int:
             f"Missing run file {run_file}. Run `frontier prove`, `frontier run`, or `frontier record-failure` first.",
         )
     payload = json.loads(run_file.read_text())
+    stamp = _read_invocation_stamp(run_file)
+    original_id = str(payload.get("externalRunId") or "")
+    identity = payload.get("assessmentIdentity") or {}
+    if stamp:
+        if original_id != stamp:
+            raise ConfigError(
+                f"Refusing to upload stale run file {run_file}: "
+                f"externalRunId {original_id or '(missing)'} does not match the current "
+                f"invocation {stamp}. Run `frontier prove` again."
+            )
+        invocation = str(identity.get("invocationId") or "")
+        if invocation and invocation != stamp:
+            raise ConfigError(
+                f"Refusing to upload stale run file {run_file}: "
+                f"assessmentIdentity.invocationId {invocation} does not match {stamp}."
+            )
+        if not payload.get("runnerVersion") and not identity:
+            raise ConfigError(
+                "Refusing to upload a run file that predates this invocation stamp. "
+                "The current prove did not write a fresh frontier-run.json."
+            )
     if (
         payload.get("runMode") == "fixture"
         and os.environ.get("GITHUB_ACTIONS") == "true"
@@ -1796,6 +2424,7 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--events", help="Change-events CSV (default: seeds/change_events.csv)")
     parser.add_argument("--output", help="Where to write frontier-run.json")
     parser.add_argument("--run-id", help="externalRunId for the resulting payload")
+    parser.add_argument("--model", help="Target dbt model name")
     parser.add_argument(
         "--include-entity-ids",
         action="store_true",
@@ -2154,6 +2783,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="manifest.json compiled from the pull request (default: target/manifest.json)",
     )
     compare.add_argument("--output", help="Where to write frontier-compare.json")
+    compare.add_argument("--model", help="Target dbt model name")
     _add_manifest_flags(compare)
     compare.set_defaults(func=cmd_compare)
 

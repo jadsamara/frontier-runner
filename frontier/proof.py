@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from typing import Any
+
 from frontier.config import ConfigError, FrontierConfig, ProofConfig
 from frontier.dbt_artifacts import Manifest
 from frontier.frontier import AffectedEntity, ChangeEvent
@@ -28,6 +30,7 @@ class SqlChangeProof:
     test_duration_ms: int
     full_rebuild_required: bool = False
     full_rebuild_recommended: bool = False
+    full_reference_validated: bool = False
 
     @property
     def percent_rows_avoided(self) -> float:
@@ -64,18 +67,36 @@ class MutationProof:
         return round((1 - self.frontier_rows_recomputed / self.full_rows_recomputed) * 100, 3)
 
 
-def _count(warehouse: WarehouseAdapter, sql: str) -> int:
-    rows = warehouse.execute(sql)
+def _count(
+    warehouse: WarehouseAdapter,
+    sql: str,
+    snapshot: Any | None = None,
+    *,
+    phase: str | None = None,
+) -> int:
+    if snapshot is None:
+        rows = warehouse.execute(sql)
+    else:
+        from frontier.execute import snapshot_execute
+
+        rows = snapshot_execute(warehouse, sql, snapshot, phase=phase)
     if not rows or rows[0][0] is None:
         return 0
     return int(rows[0][0])
 
 
-def _logged_count(warehouse: WarehouseAdapter, sql: str, label: str) -> int:
+def _logged_count(
+    warehouse: WarehouseAdapter,
+    sql: str,
+    label: str,
+    snapshot: Any | None = None,
+    *,
+    phase: str | None = None,
+) -> int:
     log_step(f"{label} started")
     started = time.perf_counter()
     try:
-        value = _count(warehouse, sql)
+        value = _count(warehouse, sql, snapshot, phase=phase)
     except Exception as error:
         log_step(
             f"{label} completed",
@@ -480,6 +501,7 @@ def measure_sql_change_proof(
     reference_relation: str | None = None,
     full_entity_count: int | None = None,
     changed_source_row_count: int | None = None,
+    source_snapshot: Any | None = None,
 ) -> SqlChangeProof:
     """Prove targeted repair of a SQL change against the full PR model.
 
@@ -562,11 +584,15 @@ def measure_sql_change_proof(
         warehouse,
         f"select count(*) as before_entity_count from ({before_sql}) as before_entity_count",
         "SQL-change proof base count",
+        source_snapshot,
+        phase="full_reference",
     )
     after_count = _logged_count(
         warehouse,
         f"select count(*) as after_entity_count from ({after_sql}) as after_entity_count",
         "SQL-change proof head count",
+        source_snapshot,
+        phase="full_reference",
     )
     from frontier.impact import source_row_count_sql
 
@@ -638,6 +664,7 @@ def measure_sql_change_proof(
         mismatched_final_rows=mismatched,
         test_duration_ms=duration_ms,
         full_rebuild_required=full_rebuild_required,
+        full_reference_validated=missing == 0 and mismatched == 0,
     )
 
 

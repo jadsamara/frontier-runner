@@ -120,14 +120,19 @@ def test_prove_dry_run_records_mutation_metrics(dbt_project: Path, monkeypatch, 
 def _write_sql_change_manifests(project: Path) -> Path:
     pr_path = project / "target" / "manifest.json"
     payload = json.loads(pr_path.read_text())
-    after_sql = (
-        "select customer_id from DATA_AGENT_DEV.DBT_DEV.stg_orders "
-        "where order_status in ('F', 'O')"
-    )
-    before_sql = (
-        "select customer_id from DATA_AGENT_DEV.DBT_DEV.stg_orders "
-        "where order_status = 'F'"
-    )
+    after_sql = """
+with orders as (
+  select id, customer_id, status
+  from stg_orders
+  where status in ('F', 'O')
+)
+select c.customer_id, count(o.id) as order_count
+from stg_customers as c
+left join orders as o
+  on c.customer_id = o.customer_id
+group by c.customer_id
+"""
+    before_sql = after_sql.replace("where status in ('F', 'O')", "where status = 'F'")
     payload["nodes"]["model.jaffle_shop.int_customer_orders"]["compiled_code"] = after_sql
     pr_path.write_text(json.dumps(payload))
     base = json.loads(json.dumps(payload))
@@ -226,9 +231,9 @@ def test_prove_dry_run_sql_change_without_events(dbt_project: Path, monkeypatch,
     prove_marks = [
         "prove: compare started",
         "prove: canonical predicate selection started",
-        "prove: targeted SQL generation started",
         "prove: Snowflake connector import started",
         "prove: Snowflake connection started",
+        "prove: targeted SQL generation started",
         "prove: impact query submission started",
         "prove: candidate count calculated",
         "prove: threshold decision started",
@@ -280,6 +285,10 @@ def test_prove_source_changed_writes_full_rebuild_instead_of_crashing(
         "frontier.cli.connect_warehouse",
         lambda *args, **kwargs: FakeWarehouse({"full_entity_count": [(150_000,)]}),
     )
+    monkeypatch.setattr(
+        "frontier.cli.load_dbt_profile_output",
+        lambda *args, **kwargs: {"database": "DATA_AGENT_DEV", "schema": "DBT_DEV"},
+    )
     code = main(
         [
             "prove",
@@ -296,7 +305,9 @@ def test_prove_source_changed_writes_full_rebuild_instead_of_crashing(
     assert code == 0
     assert "SQL-change proof requires compiled base/PR SQL" not in captured.err
     assert "SQL-change proof requires compiled base/PR SQL" not in captured.out
-    assert "prove: targeted SQL generation completed skipped:impact SQL unavailable" in captured.out
+    assert "prove: targeted SQL generation completed skipped:filter-v1 uncertified" in captured.out or (
+        "prove: targeted SQL generation completed skipped:impact SQL unavailable" in captured.out
+    )
     assert "prove: SQL-change proof completed skipped:FULL_REBUILD_REQUIRED" in captured.out
     assert "Impact: FULL_REBUILD_REQUIRED" in captured.out
     assert "Full backfill: required" in captured.out
@@ -399,6 +410,66 @@ def test_upload_uses_run_file(dbt_project: Path, monkeypatch, capsys) -> None:
     assert "frn_test_key_not_a_password" not in out
     assert "FRONTIER_API_KEY" in out
     assert TEST_HASH_KEY not in out
+
+
+def test_upload_refuses_stale_run_after_new_invocation(dbt_project: Path, monkeypatch, capsys) -> None:
+    run_file = dbt_project / "target" / "frontier-run.json"
+    run_file.write_text(
+        json.dumps({"externalRunId": "v15-stale", "runMode": "live", "status": "passed"})
+    )
+    (dbt_project / "target" / "frontier-run.invocation").write_text("fresh-invocation\n")
+    monkeypatch.setenv("FRONTIER_API_KEY", "frn_test_key_not_a_password")
+    code = main(["upload", "--project-dir", str(dbt_project)])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "stale" in captured.err.lower()
+    assert "v15-stale" in captured.err
+    assert "fresh-invocation" in captured.err
+
+
+def test_prove_failure_overwrites_stale_run_file(dbt_project: Path, monkeypatch, capsys) -> None:
+    monkeypatch.delenv(ENTITY_HASH_KEY_ENV, raising=False)
+    base_path = _write_sql_change_manifests(dbt_project)
+    run_file = dbt_project / "target" / "frontier-run.json"
+    run_file.write_text(
+        json.dumps(
+            {
+                "externalRunId": "v15-stale",
+                "runMode": "live",
+                "status": "passed",
+            }
+        )
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("warehouse.dialect")
+
+    monkeypatch.setattr("frontier.cli.connect_warehouse", boom)
+    code = main(
+        [
+            "prove",
+            "--project-dir",
+            str(dbt_project),
+            "--include-entity-ids",
+            "--run-id",
+            "fresh-failed-001",
+            "--base-manifest",
+            str(base_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "EXECUTION_FAILED" in captured.err
+    assert "RuntimeError" in captured.err
+    payload = json.loads(run_file.read_text())
+    assert payload["externalRunId"] == "fresh-failed-001"
+    assert payload["externalRunId"] != "v15-stale"
+    assert payload["runnerVersion"]
+    assert payload["assessmentIdentity"]["invocationId"] == "fresh-failed-001"
+    assert payload["sqlComparison"]["proofStatus"] == "EXECUTION_FAILED"
+    assert payload["sqlComparison"]["execution"]["status"] == "FAILED"
+    stamp = (dbt_project / "target" / "frontier-run.invocation").read_text().strip()
+    assert stamp == "fresh-failed-001"
 
 
 def test_inspect_real_jaffle_shop(capsys) -> None:
@@ -777,16 +848,18 @@ def test_compare_cli_classifies_filter_and_removed(tmp_path: Path, capsys) -> No
     assert comparison["modified"][0]["name"] == "stg_orders"
     assert comparison["modified"][0]["changeKinds"] == ["FILTER_CHANGED"]
     assert comparison["modified"][0]["unsafe"] is False
-    assert comparison["modified"][0]["impactStatus"] == "COMPILED"
-    assert "is distinct from" in (comparison["modified"][0].get("candidateSql") or "").lower()
-    assert comparison["narrowFrontierSafe"] is True
+    assert comparison["modified"][0]["impactStatus"] == "FULL_REBUILD_REQUIRED"
+    assert comparison["modified"][0].get("candidateSql") in (None, "")
+    assert "is distinct from" in (comparison["modified"][0].get("legacyImpactSql") or "").lower()
+    assert comparison["narrowFrontierSafe"] is False
     assert comparison["removed"][0]["name"] == "stg_legacy"
     assert comparison["removed"][0]["impactStatus"] == "FULL_REBUILD_REQUIRED"
     assert comparison["fullRebuildRequired"] is True
     assert "affectedEntities" not in comparison
     assert "FILTER_CHANGED" in out
-    assert "COMPILED" in out
-    assert "Narrow frontier safe: yes" in out
+    assert "FULL_REBUILD_REQUIRED" in out
+    assert "Narrow frontier safe: yes" not in out
+    assert "filter-v1 certification rejected this plan" in out
 
 
 def test_run_attaches_both_artifact_fingerprints(dbt_project: Path, monkeypatch) -> None:

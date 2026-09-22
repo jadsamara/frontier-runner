@@ -163,7 +163,7 @@ def fetch_runner_versions(api_url: str) -> RunnerVersions:
         )
     return RunnerVersions(
         minimum_supported=str(body.get("minimumSupported") or "0.1.1"),
-        latest_stable=str(body.get("latestStable") or "0.2.0"),
+        latest_stable=str(body.get("latestStable") or "0.2.1"),
     )
 
 

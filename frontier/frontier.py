@@ -12,7 +12,7 @@ from sqlglot import exp
 
 from frontier.config import ConfigError, FrontierConfig
 from frontier.dbt_artifacts import Manifest
-from frontier.execute import IsolatedRun, ORIGIN_SQL_CHANGE, SQL_CHANGE_REASON, merge_unique_keys, open_isolated_run
+from frontier.execute import IsolatedRun, ORIGIN_SQL_CHANGE, SQL_CHANGE_REASON, merge_unique_keys, open_isolated_run, snapshot_execute
 from frontier.hashing import entity_type_from_key, hmac_entity_id
 from frontier.progress import elapsed_ms, failure_status, log_step, redact_failure_reason
 from frontier.warehouse import WarehouseAdapter
@@ -65,6 +65,11 @@ class FrontierResult:
     targeted_query_id: str | None = None
     changed_source_row_count: int | None = None
     phase_timings: dict[str, int] = field(default_factory=dict)
+    source_snapshot: Any | None = None
+    full_reference_validated: bool = False
+    frontier_bytes_scanned: int | None = None
+    full_comparison_bytes_scanned: int | None = None
+    warehouse_credits: float | None = None
 
 
 def percent_rows_avoided(full_entity_count: int, frontier_entity_count: int) -> float:
@@ -291,6 +296,7 @@ def run_frontier(
     isolated_run: IsolatedRun | None = None,
     confirm: bool = True,
     full_rebuild_recommended: bool = False,
+    source_snapshot: Any | None = None,
 ) -> FrontierResult:
     affected, frontier_sql = resolve_affected_entities(
         config,
@@ -345,6 +351,7 @@ def run_frontier(
                     model_database=model.database,
                     model_schema=model.schema,
                     model_relation=model.relation,
+                    snapshot=source_snapshot,
                 )
                 owns_session = True
             keys = merge_unique_keys(
@@ -365,7 +372,7 @@ def run_frontier(
                     execution_failed = True
                     proof_status = "EXECUTION_FAILED"
                     failure_phase = "CANDIDATES_EXECUTED"
-                    failure_code = type(error).__name__
+                    failure_code = getattr(error, "code", None) or type(error).__name__
                     failure_reason = redact_failure_reason(error)
                     execution_reasons.append("candidate materialization failed")
                     log_step(
@@ -409,7 +416,7 @@ def run_frontier(
                                 failure_phase = "TARGETED_HEAD_EXECUTED"
                             else:
                                 failure_phase = "CONFIRMED"
-                            failure_code = type(error).__name__
+                            failure_code = getattr(error, "code", None) or type(error).__name__
                             failure_reason = redact_failure_reason(error)
                             execution_reasons.append("targeted execution failed")
                         else:
@@ -459,7 +466,12 @@ def run_frontier(
         log_step("frontier metrics started")
         started = time.perf_counter()
         try:
-            metric_rows = warehouse.execute(metrics_sql)
+            metric_rows = snapshot_execute(
+                warehouse,
+                metrics_sql,
+                source_snapshot or (session.snapshot if session is not None else None),
+                phase="metrics",
+            )
         except Exception as error:
             log_step(
                 "frontier metrics completed",
@@ -505,6 +517,7 @@ def run_frontier(
             proof_status=proof_status,
             targeted_query_id=targeted_query_id,
             phase_timings=dict(session.phase_timings) if session is not None else {},
+            source_snapshot=source_snapshot or (session.snapshot if session is not None else None),
         )
     finally:
         if owns_session and session is not None:
