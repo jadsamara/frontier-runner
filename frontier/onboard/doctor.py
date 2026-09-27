@@ -7,11 +7,12 @@ from typing import Any, Callable
 
 from frontier import __version__
 from frontier.config import redact
-from frontier.credentials import try_resolve_api_credential
+from frontier.context import resolve_execution_context
 from frontier.errors import InstallError
+from frontier.identity import has_canonical_ids, identities_equal, tenant_identity
 from frontier.local_config import load_local_config
 from frontier.semantic import default_pin_path
-from frontier.onboard.constants import DEFAULT_API_URL, SUPPORTED_PYTHON
+from frontier.onboard.constants import SUPPORTED_PYTHON
 from frontier.onboard.detect import ProjectDetection, detect_project, schema_looks_like_production
 from frontier.onboard.saas import (
     fetch_active_manifest_summary,
@@ -71,16 +72,20 @@ def run_doctor(
     *,
     connect: ConnectFn = connect_warehouse,
     skip_warehouse: bool = False,
+    args: Any | None = None,
 ) -> list[DoctorCheck]:
     checks: list[DoctorCheck] = []
     detection = detect_project(project_dir)
     local = load_local_config(project_dir)
-    creds = try_resolve_api_credential()
-    api_url = (
-        (local.api_url if local else None)
-        or (creds.api_url if creds else None)
-        or DEFAULT_API_URL
+    ns = args if args is not None else type("Args", (), {})()
+    ctx = resolve_execution_context(
+        ns,
+        project_dir,
+        honor_local_config_target=True,
+        require_credential=False,
     )
+    creds = ctx.creds
+    api_url = ctx.api_url
 
     checks.append(
         DoctorCheck(
@@ -185,10 +190,13 @@ def run_doctor(
     identity = None
     if creds:
         try:
-            identity = whoami(creds.api_url, creds.api_key)
+            identity = whoami(creds.api_url or api_url, creds.api_key)
             auth_ok = True
         except InstallError:
             auth_ok = False
+    auth_next = "Run `frontier login --api-key`."
+    if ctx.profile_name:
+        auth_next = f"Run `frontier login --api-key --profile {ctx.profile_name}`."
     checks.append(
         DoctorCheck(
             id="auth",
@@ -196,9 +204,114 @@ def run_doctor(
             ok=auth_ok,
             required=True,
             detail=identity.api_key_prefix if identity else "not authenticated",
-            next_action=None if auth_ok else "Run `frontier login --api-key`.",
+            next_action=None if auth_ok else auth_next,
         )
     )
+    if ctx.profile_name:
+        from frontier.profiles import profile_credential_status
+
+        cred_status = profile_credential_status(ctx.profile_name)
+        cred_ok = cred_status != "missing" and "FRONTIER_PROFILE_CREDENTIAL_MISSING" not in ctx.issues
+        checks.append(
+            DoctorCheck(
+                id="frontier_profile",
+                label="Frontier profile",
+                ok=True,
+                required=True,
+                detail=ctx.profile_name,
+            )
+        )
+        checks.append(
+            DoctorCheck(
+                id="frontier_profile_credential",
+                label="Frontier profile credential",
+                ok=cred_ok,
+                required=True,
+                detail=cred_status if cred_ok else "missing",
+                next_action=None if cred_ok else auth_next,
+            )
+        )
+        identity_ok = False
+        identity_detail = "immutable IDs unavailable"
+        identity_next = (
+            "Run `frontier profile create NAME --api-key --force` against a SaaS version that returns organization and project IDs."
+        )
+        identity_warn = False
+        if not cred_ok:
+            identity_detail = "credential missing"
+            identity_next = auth_next
+        elif identity is not None and has_canonical_ids(identity.organization_id, identity.project_id):
+            live_ids = f"{identity.organization_id} / {identity.project_id}"
+            if has_canonical_ids(ctx.organization_id, ctx.project_id):
+                identity_ok = identities_equal(
+                    tenant_identity(
+                        api_origin=ctx.api_url,
+                        organization_id=ctx.organization_id,
+                        project_id=ctx.project_id,
+                    ),
+                    tenant_identity(
+                        api_origin=identity.api_url or ctx.api_url,
+                        organization_id=identity.organization_id,
+                        project_id=identity.project_id,
+                    ),
+                    include_origin=False,
+                )
+                identity_detail = live_ids
+                identity_next = None if identity_ok else (
+                    "Stored organization/project IDs differ from whoami. Recreate the profile with `--force`."
+                )
+            else:
+                identity_detail = live_ids
+                identity_ok = False
+                identity_next = "Re-run a named-profile command so the stored credential can backfill immutable IDs."
+        elif identity is None:
+            identity_warn = True
+            identity_detail = "SaaS unavailable; identity not revalidated"
+            identity_next = "Retry `frontier doctor` when Frontier SaaS is reachable."
+            if not has_canonical_ids(ctx.organization_id, ctx.project_id):
+                identity_warn = False
+                identity_detail = "immutable IDs unavailable"
+                identity_next = (
+                    "Retry when SaaS is reachable so the named profile can store immutable organization and project IDs."
+                )
+        checks.append(
+            DoctorCheck(
+                id="frontier_profile_identity",
+                label="Frontier profile identity",
+                ok=identity_ok,
+                required=True,
+                detail=identity_detail,
+                warn=identity_warn,
+                next_action=identity_next,
+            )
+        )
+        target_name = ctx.dbt_target
+        target_ok = True
+        target_detail = target_name or "profiles.yml default"
+        target_next = None
+        if target_name and detection.profile_name:
+            try:
+                load_dbt_profile_output(
+                    project_dir,
+                    profiles_path=ctx.profiles_path,
+                    target=target_name,
+                )
+            except Exception:
+                target_ok = False
+                target_detail = f"{target_name} not found in {detection.profile_name}"
+                target_next = (
+                    f"Add target `{target_name}` to dbt profile `{detection.profile_name}`."
+                )
+        checks.append(
+            DoctorCheck(
+                id="dbt_target",
+                label="dbt target",
+                ok=target_ok,
+                required=True,
+                detail=target_detail,
+                next_action=target_next,
+            )
+        )
 
     active = None
     if creds and auth_ok:
@@ -352,9 +465,17 @@ def run_doctor(
     schema = None
     if not skip_warehouse and adapter in SQL_CHANGE_ADAPTERS:
         try:
-            output = load_dbt_profile_output(project_dir, target=local.dbt_target if local else None)
+            output = load_dbt_profile_output(
+                project_dir,
+                profiles_path=ctx.profiles_path,
+                target=ctx.dbt_target,
+            )
             schema = str(output.get("dataset") or output.get("schema") or "")
-            warehouse = connect(project_dir, target=local.dbt_target if local else None)
+            warehouse = connect(
+                project_dir,
+                profiles_path=ctx.profiles_path,
+                target=ctx.dbt_target,
+            )
             try:
                 if hasattr(warehouse, "scalar"):
                     warehouse.scalar("select 1")
@@ -431,6 +552,9 @@ def run_doctor(
 
 
 NEXT_ACTION_PRIORITY = (
+    "frontier_profile_credential",
+    "frontier_profile_identity",
+    "dbt_target",
     "auth",
     "local_config",
     "active_manifest",

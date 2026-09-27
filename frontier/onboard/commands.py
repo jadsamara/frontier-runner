@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from frontier.context import resolve_execution_context
 from frontier.credentials import (
     StoredCredentials,
     default_fallback_path,
@@ -20,6 +21,7 @@ from frontier.credentials import (
     save_credentials,
     try_resolve_api_credential,
 )
+from frontier.onboard.profile_commands import store_profile_credential
 from frontier.dbt_artifacts import load_manifest
 from frontier.errors import InstallError
 from frontier.local_config import (
@@ -82,7 +84,14 @@ def cmd_signup(args: Any) -> int:
     return 0
 
 
+def _project_dir_from_args(args: Any) -> Path:
+    flag = getattr(args, "project_dir_opt", None)
+    value = flag or getattr(args, "project_dir", ".") or "."
+    return Path(value).expanduser().resolve()
+
+
 def cmd_login(args: Any) -> int:
+    profile_name = (getattr(args, "frontier_profile", None) or "").strip() or None
     api_url = (getattr(args, "api_url", None) or DEFAULT_API_URL).rstrip("/")
     if not getattr(args, "api_key", False):
         print("Browser login is not available in this runner version.")
@@ -110,16 +119,35 @@ def cmd_login(args: Any) -> int:
         )
     identity = whoami(api_url, api_key)
     creds = StoredCredentials(
-        api_url=api_url,
+        api_url=identity.api_url or api_url.rstrip("/"),
         api_key=api_key,
         project=identity.project,
         organization=identity.organization,
+        organization_id=identity.organization_id,
+        project_id=identity.project_id,
     )
-    backend = save_credentials(creds)
-    print("Authenticated")
-    print(f"Organization: {identity.organization or '(unknown)'}")
-    print(f"Project: {identity.project}")
-    print(f"API key: {identity.api_key_prefix}")
+    if profile_name:
+        from frontier.profiles import validate_profile_name
+
+        name = validate_profile_name(profile_name)
+        record, backend = store_profile_credential(
+            name=name,
+            creds=creds,
+            dbt_target=(getattr(args, "target", None) or "").strip() or None,
+            profiles_path=(getattr(args, "profiles", None) or "").strip() or None,
+            force=True,
+        )
+        print("Authenticated")
+        print(f"Frontier profile: {record.name}")
+        print(f"Organization: {record.organization_name or '(unknown)'}")
+        print(f"Project: {record.project_name}")
+        print(f"API key: {key_prefix(creds.api_key)}")
+    else:
+        backend = save_credentials(creds)
+        print("Authenticated")
+        print(f"Organization: {creds.organization or '(unknown)'}")
+        print(f"Project: {creds.project}")
+        print(f"API key: {key_prefix(creds.api_key)}")
     if backend == "file":
         path = default_fallback_path()
         print(
@@ -129,26 +157,50 @@ def cmd_login(args: Any) -> int:
     return 0
 
 
-def cmd_logout(_args: Any) -> int:
+def cmd_logout(args: Any) -> int:
+    profile_name = (getattr(args, "frontier_profile", None) or "").strip() or None
+    if profile_name:
+        from frontier.profiles import validate_profile_name
+
+        name = validate_profile_name(profile_name)
+        delete_credentials(profile_name=name)
+        if bool(getattr(args, "remove_metadata", False)):
+            from frontier.profiles import clear_selected_profile_if_matches, remove_profile_metadata
+
+            remove_profile_metadata(name)
+            clear_selected_profile_if_matches(_project_dir_from_args(args), name)
+            print(f"Signed out. Removed Frontier profile '{name}' and its credential.")
+        else:
+            print(f"Signed out. Removed the credential for Frontier profile '{name}'.")
+        return 0
     delete_credentials()
     print("Signed out. Local API credentials were removed.")
     return 0
 
 
-def cmd_auth_status(_args: Any) -> int:
-    creds = try_resolve_api_credential()
+def cmd_auth_status(args: Any) -> int:
+    ctx = resolve_execution_context(args, _project_dir_from_args(args), require_credential=False)
+    creds = ctx.creds
     if not creds:
         print("Not authenticated")
-        print("Next: frontier login --api-key")
+        if ctx.profile_name:
+            print(f"Frontier profile: {ctx.profile_name}")
+            print(f"Next: frontier login --api-key --profile {ctx.profile_name}")
+        else:
+            print("Next: frontier login --api-key")
         return 1
     try:
-        identity = whoami(creds.api_url, creds.api_key)
+        identity = whoami(creds.api_url or ctx.api_url, creds.api_key)
     except InstallError:
         print("Credentials stored, but Frontier rejected them.")
+        if ctx.profile_name:
+            print(f"Frontier profile: {ctx.profile_name}")
         print(f"API key: {key_prefix(creds.api_key)}")
         print("Next: frontier login --api-key")
         return 1
     print("Authenticated")
+    if ctx.profile_name:
+        print(f"Frontier profile: {ctx.profile_name}")
     print(f"Organization: {identity.organization or creds.organization or '(unknown)'}")
     print(f"Project: {identity.project}")
     print(f"API key: {identity.api_key_prefix}")
@@ -204,7 +256,7 @@ def cmd_init(args: Any) -> int:
         print(f"GitHub: {detection.github_origin}")
     if detection.adapter_type:
         print(f"Adapter: {detection.adapter_type}")
-    if try_resolve_api_credential():
+    if try_resolve_api_credential() or resolve_execution_context(args, project_dir, require_credential=False).creds:
         print("Next: frontier discover")
     else:
         print("Next: frontier login --api-key")
@@ -278,6 +330,29 @@ def _require_credentials() -> StoredCredentials:
         api_key=creds.api_key,
         project=identity.project or creds.project,
         organization=identity.organization or creds.organization,
+        organization_id=identity.organization_id or creds.organization_id,
+        project_id=identity.project_id or creds.project_id,
+    )
+
+
+def _require_command_credentials(args: Any, project_dir: Path) -> StoredCredentials:
+    ctx = resolve_execution_context(args, project_dir, require_credential=False)
+    if not ctx.selected:
+        return _require_credentials()
+    creds = ctx.creds
+    if creds is None:
+        from frontier.config import ConfigError
+        from frontier.credentials import AUTH_REQUIRED_MESSAGE
+
+        raise ConfigError(AUTH_REQUIRED_MESSAGE)
+    identity = whoami(creds.api_url or ctx.api_url, creds.api_key)
+    return StoredCredentials(
+        api_url=creds.api_url or ctx.api_url,
+        api_key=creds.api_key,
+        project=identity.project or creds.project,
+        organization=identity.organization or creds.organization,
+        organization_id=identity.organization_id or creds.organization_id,
+        project_id=identity.project_id or creds.project_id,
     )
 
 
@@ -341,7 +416,7 @@ def cmd_discover(args: Any) -> int:
         model=getattr(args, "model", None),
     )
     print(f"Detected model: {selected.model}")
-    creds = _require_credentials()
+    creds = _require_command_credentials(args, project_dir)
     local = load_local_config(project_dir)
     if local and local.project and local.project != creds.project:
         print(
@@ -460,7 +535,11 @@ def cmd_discover(args: Any) -> int:
 
 def cmd_doctor(args: Any) -> int:
     project_dir = Path(getattr(args, "project_dir_opt", None) or args.project_dir or ".").expanduser().resolve()
-    checks = run_doctor(project_dir, skip_warehouse=bool(getattr(args, "skip_warehouse", False)))
+    checks = run_doctor(
+        project_dir,
+        skip_warehouse=bool(getattr(args, "skip_warehouse", False)),
+        args=args,
+    )
     if getattr(args, "json", False):
         print(json.dumps(doctor_json(checks), indent=2))
     else:
@@ -526,7 +605,8 @@ def cmd_setup_github(args: Any) -> int:
             docs_path="/docs/github",
         )
     local = load_local_config(project_dir)
-    creds = try_resolve_api_credential()
+    ctx = resolve_execution_context(args, project_dir, honor_local_config_target=True, require_credential=False)
+    creds = ctx.creds
     assume = _assume_yes(args)
     blocking = bool(getattr(args, "blocking", False))
     path = workflow_path(project_dir, detection.git_root)
@@ -538,6 +618,30 @@ def cmd_setup_github(args: Any) -> int:
         ):
             print(f"Kept existing {path}")
             return 0
+    from frontier.profiles import load_registry
+
+    registry = load_registry()
+    print(
+        "GitHub Actions uses repository secrets FRONTIER_API_KEY and FRONTIER_API_URL. "
+        "It does not follow `frontier profile use` or `.frontier/state.yml`."
+    )
+    if ctx.profile_name:
+        print(
+            f"Local Frontier profile: {ctx.profile_name} "
+            f"(organization {ctx.organization_name or '(unknown)'}, "
+            f"project {ctx.project_name or '(unknown)'})"
+        )
+        if ctx.dbt_target:
+            print(
+                f"Profile default dbt target is `{ctx.dbt_target}`. "
+                "The generated workflow still writes `frontier prove --target ci`."
+            )
+    if len(registry.profiles) > 1:
+        print(
+            "Multiple local Frontier profiles exist. CI will not automatically "
+            "switch between them; configure FRONTIER_API_KEY on the repository."
+        )
+    print("Workflow dbt target written: ci")
     database, warehouse, schema = "DEV", "COMPUTE_WH", "DBT_CI"
     project = "my-gcp-project"
     dataset = "dbt_ci"
@@ -546,7 +650,8 @@ def cmd_setup_github(args: Any) -> int:
     try:
         output = load_dbt_profile_output(
             project_dir,
-            target=local.dbt_target if local else None,
+            profiles_path=ctx.profiles_path,
+            target=ctx.dbt_target if ctx.selected else (local.dbt_target if local else None),
         )
         adapter = str(output.get("type") or adapter).strip().lower() or adapter
         database = str(output.get("dbname") or output.get("database") or database)
@@ -713,14 +818,9 @@ def cmd_demo_change(args: Any) -> int:
 
 
 def cmd_update_check(args: Any) -> int:
-    local = None
     project_dir = Path(getattr(args, "project_dir_opt", None) or getattr(args, "project_dir", ".") or ".").expanduser().resolve()
-    try:
-        local = load_local_config(project_dir)
-    except Exception:
-        local = None
-    creds = try_resolve_api_credential()
-    api_url = (getattr(args, "api_url", None) or (local.api_url if local else None) or (creds.api_url if creds else DEFAULT_API_URL))
+    ctx = resolve_execution_context(args, project_dir, require_credential=False)
+    api_url = ctx.api_url
     versions = fetch_runner_versions(str(api_url))
     current = current_runner_version()
     print(f"Installed: {current}")

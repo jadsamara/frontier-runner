@@ -17,11 +17,16 @@ def isolate_frontier_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("FRONTIER_KEYRING_FILE", str(tmp_path / "frontier-keyring"))
     monkeypatch.setenv("FRONTIER_CREDENTIALS_FILE", str(tmp_path / "frontier-credentials"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("PYTHON_KEYRING_BACKEND", "keyring.backends.fail.Keyring")
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     monkeypatch.delenv("FRONTIER_API_KEY", raising=False)
     monkeypatch.delenv("FRONTIER_DEMO_API_KEY", raising=False)
     monkeypatch.delenv("FRONTIER_API_URL", raising=False)
+    monkeypatch.delenv("FRONTIER_PROFILE", raising=False)
+    monkeypatch.delenv("FRONTIER_DBT_TARGET", raising=False)
+    monkeypatch.delenv("FRONTIER_PROJECT", raising=False)
 
 
 def copy_dbt_project(tmp_path: Path) -> Path:

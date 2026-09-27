@@ -34,7 +34,7 @@ Until the package is on PyPI, install the GitHub Release wheel for a version
 tag. You do not need a commit SHA:
 
 ```bash
-pipx install \ "frontier-runner[snowflake] @ https://github.com/jadsamara/frontier-runner/releases/download/v0.2.2/frontier_runner-0.2.2-py3-none-any.whl"
+pipx install \ "frontier-runner[snowflake] @ https://github.com/jadsamara/frontier-runner/releases/download/v0.2.3/frontier_runner-0.2.3-py3-none-any.whl"
 pipx inject frontier-runner "snowflake-connector-python>=3.12,<4"
 ```
 
@@ -60,6 +60,31 @@ the pinned semantic manifest.
 API keys are stored in the OS keychain (or `~/.config/frontier/credentials`
 mode 0600). They are never written to `frontier.yml`, `dbt_project.yml`,
 `profiles.yml`, Git, or generated workflows.
+
+## Frontier profiles
+
+A **Frontier profile** is a local named execution context. It selects one
+Frontier SaaS project credential and may default the dbt target and
+`profiles.yml` path. It does **not** replace the dbt `profile:` in
+`dbt_project.yml`. A **dbt target** is an output such as `dev`, `ci`, or
+`benchmark`.
+
+```bash
+frontier profile create repair --target dev --api-key
+frontier profile create benchmark --target benchmark --api-key
+frontier profile use benchmark
+frontier auth status
+frontier doctor
+```
+
+`--api-key` prompts securely; never pass the raw key as an argument.
+Selection is gitignored in `.frontier/state.yml` and is local to this
+repository. GitHub Actions ignores that file unless `FRONTIER_PROFILE` or
+`--profile` is set; CI continues to use `FRONTIER_API_KEY` /
+`FRONTIER_API_URL` repository secrets. `frontier upload` refuses a run
+generated for another origin, organization, project, dbt project, target, or
+semantic manifest (`ARTIFACT_PROFILE_MISMATCH`). Legacy login without a
+named profile is unchanged.
 
 ## Developer setup
 
@@ -142,11 +167,12 @@ assessment.
 
 `frontier upload` posts `target/frontier-run.json` to `POST /api/v1/runs`. It
 retries HTTP 429/5xx and network errors, and honors `Retry-After`. SaaS
-commands resolve credentials in this order: `FRONTIER_API_KEY`, the OS
-keychain, the `0600` fallback file, then `FRONTIER_DEMO_API_KEY` only when
-`FRONTIER_ALLOW_LOCAL_MANIFEST` is set outside GitHub Actions. If none are
-present, the CLI exits with `AUTH_REQUIRED: Run \`frontier login --api-key\``.
-Hashed uploads set `entityIdsHashed: true`.
+commands resolve credentials in this order: `FRONTIER_API_KEY`, the selected
+Frontier profile credential, the OS keychain, the `0600` fallback file, then
+`FRONTIER_DEMO_API_KEY` only when `FRONTIER_ALLOW_LOCAL_MANIFEST` is set
+outside GitHub Actions. If none are present, the CLI exits with
+`AUTH_REQUIRED: Run \`frontier login --api-key\``. Hashed uploads set
+`entityIdsHashed: true`.
 
 In GitHub Actions, assessments use `{project}-{GITHUB_SHA}` as `externalRunId`
 and record repository, branch, commit, and PR number. After a successful
@@ -164,9 +190,9 @@ workflow uses `FRONTIER_BLOCKING=false` unless you pass `--blocking`.
 Pin an immutable released version:
 
 ```bash
-pip install "frontier-runner[snowflake]==0.2.2"
+pip install "frontier-runner[snowflake]==0.2.3"
 # or
-pip install "frontier-runner[bigquery]==0.2.2"
+pip install "frontier-runner[bigquery]==0.2.3"
 ```
 
 Until PyPI trusted publishing is reviewed and live, install the GitHub Release

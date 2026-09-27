@@ -18,6 +18,8 @@ class WhoAmI:
     project: str
     api_key_prefix: str
     api_url: str
+    organization_id: str = ""
+    project_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -128,8 +130,8 @@ def whoami(api_url: str, api_key: str) -> WhoAmI:
             next_action="Confirm the API URL and key, then retry `frontier login --api-key`.",
             docs_path="/docs/troubleshooting#auth-invalid",
         )
-    project = str(body.get("project") or "").strip()
-    organization = str(body.get("organization") or "").strip()
+    project = str(body.get("projectName") or body.get("project") or "").strip()
+    organization = str(body.get("organizationName") or body.get("organization") or "").strip()
     if not project:
         raise InstallError(
             "AUTH_INVALID",
@@ -144,6 +146,8 @@ def whoami(api_url: str, api_key: str) -> WhoAmI:
         project=project,
         api_key_prefix=prefix,
         api_url=origin,
+        organization_id=str(body.get("organizationId") or "").strip(),
+        project_id=str(body.get("projectId") or "").strip(),
     )
 
 
@@ -163,7 +167,7 @@ def fetch_runner_versions(api_url: str) -> RunnerVersions:
         )
     return RunnerVersions(
         minimum_supported=str(body.get("minimumSupported") or "0.1.1"),
-        latest_stable=str(body.get("latestStable") or "0.2.2"),
+        latest_stable=str(body.get("latestStable") or "0.2.3"),
     )
 
 

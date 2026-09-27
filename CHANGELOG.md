@@ -5,6 +5,13 @@ All notable changes to frontier-runner are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.2.3] — 2026-09-27
+
+- Named Frontier profiles: local execution contexts that bind a SaaS project credential, API origin, optional dbt target, and optional profiles.yml path without replacing `dbt_project.yml` `profile:`.
+- Named-profile identity uses immutable SaaS organization and project IDs from `whoami`. Names are display-only. Cross-project upload and ingest compare IDs, not names.
+
 ## [0.2.2] — 2026-09-22
 
 - Disposable repair validation is the authoritative repaired-vs-head check. The unchanged materialized mart versus head comparison is an expected pre-repair difference and no longer fails the run.
@@ -100,6 +107,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SaaS commands resolve stored keychain credentials through one shared
   resolver instead of requiring `FRONTIER_API_KEY` in the environment.
 
+[0.2.3]: https://github.com/jadsamara/frontier-runner/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/jadsamara/frontier-runner/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/jadsamara/frontier-runner/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jadsamara/frontier-runner/compare/v0.1.3...v0.2.0

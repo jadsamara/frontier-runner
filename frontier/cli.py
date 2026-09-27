@@ -15,6 +15,13 @@ from frontier.api import (
     redact_api_key,
     upload_run,
 )
+from frontier.context import (
+    assert_artifact_matches_context,
+    assessment_identity_fields,
+    print_execution_banner,
+    resolve_execution_context,
+    warehouse_connect_kwargs,
+)
 from frontier.credentials import resolve_api_credential, try_resolve_api_credential
 from frontier.comment import maybe_upsert_pr_comment
 from frontier.config import (
@@ -132,6 +139,14 @@ from frontier.onboard.commands import (
     cmd_signup,
     cmd_update_check,
     maybe_version_notice,
+)
+from frontier.onboard.profile_commands import (
+    FRONTIER_PROFILE_HELP,
+    cmd_profile_create,
+    cmd_profile_list,
+    cmd_profile_remove,
+    cmd_profile_status,
+    cmd_profile_use,
 )
 from frontier.onboard.constants import DEFAULT_API_URL
 from frontier.onboard.routes import (
@@ -344,6 +359,7 @@ def _assessment_identity(
     profile_schema: str | None = None,
     pinned_version: int | None = None,
     pinned_fingerprint: str | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     identity: dict[str, Any] = {
         "runnerVersion": __version__,
@@ -359,6 +375,13 @@ def _assessment_identity(
         identity["pinnedManifestVersion"] = pinned_version
     if pinned_fingerprint:
         identity["pinnedManifestFingerprint"] = pinned_fingerprint
+    if extra:
+        for key, value in extra.items():
+            if value in (None, ""):
+                continue
+            if key in {"credential_ref", "profiles_path"}:
+                continue
+            identity.setdefault(key, value)
     return identity
 
 
@@ -442,6 +465,60 @@ def _config_path(args: argparse.Namespace, project_dir: Path) -> Path:
     return project_dir / "frontier.yml"
 
 
+def _execution_context(args: argparse.Namespace, project_dir: Path):
+    return resolve_execution_context(args, project_dir)
+
+
+def _connect_warehouse(args: argparse.Namespace, project_dir: Path, ctx=None):
+    current = ctx or _execution_context(args, project_dir)
+    return connect_warehouse(project_dir, **warehouse_connect_kwargs(args, current))
+
+
+def _resolved_dbt_target_label(args: argparse.Namespace, project_dir: Path, config) -> str | None:
+    ctx = _execution_context(args, project_dir)
+    return getattr(args, "target", None) or ctx.dbt_target or getattr(config, "environment", None)
+
+
+def _identity_extra(args: argparse.Namespace, project_dir: Path, config) -> dict[str, Any]:
+    ctx = _execution_context(args, project_dir)
+    if not ctx.selected:
+        return {}
+    version, fingerprint = _pinned_compare_fields(config)
+    return assessment_identity_fields(
+        ctx,
+        dbt_target=_resolved_dbt_target_label(args, project_dir, config),
+        dbt_project=ctx.dbt_project_name or getattr(config, "project", None),
+        pinned_version=version,
+        pinned_fingerprint=fingerprint,
+    )
+
+
+def _print_warehouse_context(args: argparse.Namespace, project_dir: Path, ctx, warehouse=None) -> None:
+    if not ctx.selected:
+        return
+    database = schema = warehouse_type = None
+    try:
+        output = load_dbt_profile_output(
+            project_dir,
+            **warehouse_connect_kwargs(args, ctx),
+        )
+        database = str(output.get("database") or output.get("dbname") or output.get("project") or "") or None
+        schema = str(output.get("schema") or output.get("dataset") or "") or None
+        warehouse_type = str(output.get("type") or "") or None
+    except Exception:
+        pass
+    if warehouse is not None:
+        warehouse_type = warehouse.warehouse_type or warehouse_type
+    print_execution_banner(
+        ctx,
+        dbt_profile=ctx.dbt_profile_name,
+        dbt_target=ctx.dbt_target or getattr(args, "target", None),
+        warehouse_type=warehouse_type,
+        database=database,
+        schema=schema,
+    )
+
+
 def _api_url(args: argparse.Namespace, config=None, creds=None, local=None) -> str:
     return str(
         getattr(args, "api_url", None)
@@ -467,9 +544,10 @@ def _resolve_runtime_config(
     *,
     dbt_manifest=None,
 ):
-    local = load_local_config(project_dir)
+    ctx = _execution_context(args, project_dir)
+    local = ctx.local
     explicit = getattr(args, "manifest_file", None)
-    creds = None if explicit else try_resolve_api_credential()
+    creds = None if explicit else ctx.creds
     api_key = creds.api_key if creds else None
     use_local_yml = allow_local_manifest(args) and not api_key and not explicit
     legacy_path = _config_path(args, project_dir)
@@ -480,14 +558,21 @@ def _resolve_runtime_config(
         # Explicit --config without SaaS credentials still loads the legacy mapping.
         if getattr(args, "config", None):
             legacy = load_frontier_config(legacy_path)
-    api_url = _api_url(args, legacy, creds, local)
+    if ctx.selected:
+        api_url = ctx.api_url
+    else:
+        api_url = _api_url(args, legacy, creds, local)
     if legacy is not None:
         config = legacy
     else:
         config = saas_runtime_config(
-            project=_saas_project_name(project_dir, creds, local),
+            project=_saas_project_name(project_dir, creds, local) if not ctx.selected else (ctx.project_name or _saas_project_name(project_dir, creds, local)),
             api_url=api_url,
-            environment=local.dbt_target if local else "dev",
+            environment=(
+                ctx.dbt_target
+                if ctx.selected and ctx.dbt_target
+                else (local.dbt_target if local else "dev")
+            ),
         )
     config, _pinned = resolve_semantic_manifest(
         args,
@@ -1161,14 +1246,15 @@ def _emit_run(
         ),
         **_ingest_manifest_fields(config),
         runner_version=__version__,
-        dbt_target=getattr(args, "target", None) or getattr(config, "environment", None),
+        dbt_target=_resolved_dbt_target_label(args, _project_dir(args), config),
         assessment_identity=_assessment_identity(
             run_id=run_id,
-            dbt_target=getattr(args, "target", None) or getattr(config, "environment", None),
+            dbt_target=_resolved_dbt_target_label(args, _project_dir(args), config),
             profile_database=str(model.database) if model.database else None,
             profile_schema=str(model.schema) if model.schema else None,
             pinned_version=_pinned_compare_fields(config)[0],
             pinned_fingerprint=_pinned_compare_fields(config)[1],
+            extra=_identity_extra(args, _project_dir(args), config),
         ),
     )
     output = Path(args.output) if args.output else _target_dir(_project_dir(args)) / RUN_FILE_NAME
@@ -1204,12 +1290,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             }
         )
         print("Using in-memory warehouse (--dry-run). No live warehouse session.")
+        _print_warehouse_context(args, project_dir, _execution_context(args, project_dir))
     else:
-        warehouse = connect_warehouse(
-            project_dir,
-            profiles_path=Path(args.profiles).expanduser() if args.profiles else None,
-            target=args.target,
-        )
+        warehouse = _connect_warehouse(args, project_dir)
+        ctx = _execution_context(args, project_dir)
+        _print_warehouse_context(args, project_dir, ctx, warehouse)
         print(f"{warehouse.warehouse_type}: " + json.dumps(describe_adapter(warehouse)))
 
     base_sql, after_sql = _proof_sql_pair(
@@ -1535,6 +1620,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
             }
         )
         print("Using in-memory warehouse (--dry-run). No live warehouse session.", flush=True)
+        _print_warehouse_context(args, project_dir, _execution_context(args, project_dir))
         if sql_change_demo:
             sql_proof = recorded_sql_change_proof()
         else:
@@ -1549,17 +1635,12 @@ def cmd_prove(args: argparse.Namespace) -> int:
         log_step("Snowflake connection started")
         live: WarehouseAdapter | None = None
         try:
-            live = connect_warehouse(
-                project_dir,
-                profiles_path=Path(args.profiles).expanduser() if args.profiles else None,
-                target=args.target,
-            )
+            live = _connect_warehouse(args, project_dir)
             profile: dict[str, Any] = {}
             try:
                 profile = load_dbt_profile_output(
                     project_dir,
-                    profiles_path=Path(args.profiles).expanduser() if args.profiles else None,
-                    target=args.target,
+                    **warehouse_connect_kwargs(args, _execution_context(args, project_dir)),
                 )
             except ConfigError:
                 profile = {}
@@ -1619,10 +1700,12 @@ def cmd_prove(args: argparse.Namespace) -> int:
                 live.close()
     else:
         try:
-            warehouse = connect_warehouse(
+            warehouse = _connect_warehouse(args, project_dir)
+            _print_warehouse_context(
+                args,
                 project_dir,
-                profiles_path=Path(args.profiles).expanduser() if args.profiles else None,
-                target=args.target,
+                _execution_context(args, project_dir),
+                warehouse,
             )
         except Exception as error:
             _write_failed_prove_run(
@@ -1643,8 +1726,7 @@ def cmd_prove(args: argparse.Namespace) -> int:
             try:
                 profile = load_dbt_profile_output(
                     project_dir,
-                    profiles_path=Path(args.profiles).expanduser() if args.profiles else None,
-                    target=args.target,
+                    **warehouse_connect_kwargs(args, _execution_context(args, project_dir)),
                 )
             except ConfigError:
                 profile = {}
@@ -2502,9 +2584,26 @@ def cmd_upload(args: argparse.Namespace) -> int:
         )
     if args.run_id:
         payload["externalRunId"] = args.run_id
-    creds = resolve_api_credential()
+    ctx = _execution_context(args, project_dir)
+    identity = payload.get("assessmentIdentity") or {}
+    pinned_version = payload.get("semanticManifestVersion")
+    pinned_fingerprint = payload.get("semanticManifestFingerprint")
+    if isinstance(identity, dict):
+        pinned_version = identity.get("pinnedManifestVersion", pinned_version)
+        pinned_fingerprint = identity.get("pinnedManifestFingerprint", pinned_fingerprint)
+    assert_artifact_matches_context(
+        payload,
+        ctx,
+        dbt_project=ctx.dbt_project_name,
+        dbt_target=ctx.dbt_target or getattr(args, "target", None),
+        pinned_version=pinned_version if isinstance(pinned_version, int) else None,
+        pinned_fingerprint=str(pinned_fingerprint) if pinned_fingerprint else None,
+    )
+    creds = ctx.creds
+    if creds is None:
+        creds = resolve_api_credential()
     api_key, api_key_source = creds.api_key, creds.source
-    api_url = _api_url(args, None, creds, local)
+    api_url = ctx.api_url if ctx.selected else _api_url(args, None, creds, local)
     print(
         f"Uploading {payload.get('externalRunId')} to {api_url} "
         f"as {redact_api_key(api_key)} ({api_key_source})",
@@ -2541,11 +2640,11 @@ def cmd_upload(args: argparse.Namespace) -> int:
 
 def cmd_manifest_fetch(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
-    local = load_local_config(project_dir)
-    creds = resolve_api_credential()
+    ctx = _execution_context(args, project_dir)
+    creds = ctx.creds or resolve_api_credential()
     api_key = creds.api_key
-    api_url = _api_url(args, None, creds, local)
-    project = _saas_project_name(project_dir, creds, local)
+    api_url = ctx.api_url if ctx.selected else _api_url(args, None, creds, ctx.local)
+    project = ctx.project_name or _saas_project_name(project_dir, creds, ctx.local)
     output = Path(args.output).expanduser().resolve() if args.output else default_pin_path(project_dir)
     started = time.perf_counter()
     log_step("manifest fetch started", prefix="manifest")
@@ -2581,6 +2680,17 @@ def _add_project_dir(parser: argparse.ArgumentParser) -> None:
         "--project-dir",
         dest="project_dir_opt",
         help="dbt project directory (same as the positional path)",
+    )
+    _add_profile_option(parser)
+
+
+def _add_profile_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--profile",
+        dest="frontier_profile",
+        metavar="NAME",
+        default=None,
+        help=FRONTIER_PROFILE_HELP,
     )
 
 
@@ -2641,6 +2751,7 @@ def cmd_cdc_inspect(args: argparse.Namespace) -> int:
         _config_path(args, project_dir).is_file()
         or getattr(args, "manifest_file", None)
         or try_resolve_api_credential() is not None
+        or _execution_context(args, project_dir).creds is not None
     ):
         dbt_path = _target_dir(project_dir) / "manifest.json"
         dbt_manifest = load_manifest(dbt_path) if dbt_path.is_file() else None
@@ -2664,11 +2775,8 @@ def cmd_cdc_inspect(args: argparse.Namespace) -> int:
 def cmd_cdc_status(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
     config = load_cdc_config(_cdc_path(args, project_dir))
-    warehouse = connect_warehouse(
-        project_dir,
-        profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
-        target=getattr(args, "target", None),
-    )
+    warehouse = _connect_warehouse(args, project_dir)
+    _print_warehouse_context(args, project_dir, _execution_context(args, project_dir), warehouse)
     _assert_cdc_supported(warehouse)
     try:
         store = SnowflakeCdcStore(warehouse, config)
@@ -2686,11 +2794,8 @@ def cmd_cdc_status(args: argparse.Namespace) -> int:
 def cmd_cdc_consume(args: argparse.Namespace) -> int:
     project_dir = _project_dir(args)
     config = load_cdc_config(_cdc_path(args, project_dir))
-    warehouse = connect_warehouse(
-        project_dir,
-        profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
-        target=getattr(args, "target", None),
-    )
+    warehouse = _connect_warehouse(args, project_dir)
+    _print_warehouse_context(args, project_dir, _execution_context(args, project_dir), warehouse)
     _assert_cdc_supported(warehouse)
     started = time.perf_counter()
     log_step("consume started", prefix="cdc")
@@ -2732,11 +2837,8 @@ def cmd_cdc_prove(args: argparse.Namespace) -> int:
     cdc_config = load_cdc_config(_cdc_path(args, project_dir))
     frontier_config = _resolve_runtime_config(args, project_dir, dbt_manifest=manifest)
     cdc_config = overlay_cdc_with_manifest(cdc_config, frontier_config.pinned)
-    warehouse = connect_warehouse(
-        project_dir,
-        profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
-        target=getattr(args, "target", None),
-    )
+    warehouse = _connect_warehouse(args, project_dir)
+    _print_warehouse_context(args, project_dir, _execution_context(args, project_dir), warehouse)
     _assert_cdc_supported(warehouse)
     started = time.perf_counter()
     log_step("prove started", prefix="cdc")
@@ -2799,15 +2901,13 @@ def cmd_cdc_upload(args: argparse.Namespace) -> int:
     cdc_config = load_cdc_config(_cdc_path(args, project_dir))
     frontier_config = _resolve_runtime_config(args, project_dir, dbt_manifest=manifest)
     cdc_config = overlay_cdc_with_manifest(cdc_config, frontier_config.pinned)
-    warehouse = connect_warehouse(
-        project_dir,
-        profiles_path=Path(args.profiles).expanduser() if getattr(args, "profiles", None) else None,
-        target=getattr(args, "target", None),
-    )
+    warehouse = _connect_warehouse(args, project_dir)
+    _print_warehouse_context(args, project_dir, _execution_context(args, project_dir), warehouse)
     _assert_cdc_supported(warehouse)
-    creds = resolve_api_credential()
+    ctx = _execution_context(args, project_dir)
+    creds = ctx.creds or resolve_api_credential()
     api_key, api_key_source = creds.api_key, creds.source
-    api_url = _api_url(args, frontier_config, creds)
+    api_url = ctx.api_url if ctx.selected else _api_url(args, frontier_config, creds)
     print(
         f"Uploading CDC assessment to {api_url} "
         f"as {redact_api_key(api_key)} ({api_key_source})",
@@ -2852,9 +2952,15 @@ def cmd_cdc_upload(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="frontier",
-        description="Run a change-frontier assessment in the customer environment.",
+        description=(
+            "Run a change-frontier assessment in the customer environment. "
+            "A Frontier profile is a local named execution context. It selects a Frontier "
+            "SaaS project credential and may provide a default dbt target and profiles.yml "
+            "path. It does not replace the dbt `profile:` declared by dbt_project.yml."
+        ),
     )
     parser.add_argument("--version", action="version", version=f"frontier {__version__}")
+    _add_profile_option(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="Detect the dbt project and write .frontier/config.yml")
@@ -2874,17 +2980,73 @@ def build_parser() -> argparse.ArgumentParser:
     signup.set_defaults(func=cmd_signup)
 
     login = sub.add_parser("login", help="Store a project API key in the OS keychain")
-    login.add_argument("--api-key", action="store_true", help="Paste a project API key (hidden input)")
+    login.add_argument("--api-key", action="store_true", help="Paste a project API key (hidden input). Never pass the key as a positional argument.")
     login.add_argument("--api-url", help="SaaS origin")
+    _add_profile_option(login)
     login.set_defaults(func=cmd_login)
 
     logout = sub.add_parser("logout", help="Remove stored Frontier API credentials")
+    _add_profile_option(logout)
+    logout.add_argument(
+        "--remove-metadata",
+        action="store_true",
+        help="Also delete the named Frontier profile metadata (profile logout only)",
+    )
     logout.set_defaults(func=cmd_logout)
 
     auth = sub.add_parser("auth", help="Show authentication status")
     auth_sub = auth.add_subparsers(dest="auth_command", required=True)
     auth_status = auth_sub.add_parser("status", help="Show whether the CLI is authenticated")
+    _add_profile_option(auth_status)
     auth_status.set_defaults(func=cmd_auth_status)
+
+    profile = sub.add_parser(
+        "profile",
+        help=(
+            "Create and select named Frontier profiles. A Frontier profile is a local "
+            "execution context for a SaaS project credential; it does not replace the "
+            "dbt `profile:` in dbt_project.yml."
+        ),
+    )
+    profile_sub = profile.add_subparsers(dest="profile_command", required=True)
+    profile_create = profile_sub.add_parser(
+        "create",
+        help="Verify a project API key and store a named Frontier profile",
+    )
+    profile_create.add_argument("name", help="Frontier profile name")
+    profile_create.add_argument("--api-url", help="SaaS origin")
+    profile_create.add_argument("--target", help="Default dbt target for this Frontier profile")
+    profile_create.add_argument("--profiles", help="Optional profiles.yml path for this Frontier profile")
+    profile_create.add_argument(
+        "--api-key",
+        action="store_true",
+        help="Prompt securely for the project API key (never pass the key as an argument)",
+    )
+    profile_create.add_argument("--force", action="store_true", help="Replace an existing Frontier profile")
+    profile_create.add_argument("--yes", action="store_true", help="Accept the default API origin")
+    _add_project_dir(profile_create)
+    profile_create.set_defaults(func=cmd_profile_create)
+    profile_list = profile_sub.add_parser("list", help="List local Frontier profiles")
+    _add_project_dir(profile_list)
+    profile_list.set_defaults(func=cmd_profile_list)
+    profile_use = profile_sub.add_parser("use", help="Select a Frontier profile for this dbt project")
+    profile_use.add_argument("name", help="Frontier profile name")
+    profile_use.add_argument(
+        "--offline",
+        action="store_true",
+        help="Skip SaaS revalidation when the credential is present",
+    )
+    _add_project_dir(profile_use)
+    profile_use.set_defaults(func=cmd_profile_use)
+    profile_status = profile_sub.add_parser("status", help="Show the resolved Frontier execution context")
+    _add_project_dir(profile_status)
+    profile_status.set_defaults(func=cmd_profile_status)
+    profile_remove = profile_sub.add_parser("remove", help="Remove a named Frontier profile")
+    profile_remove.add_argument("name", help="Frontier profile name")
+    profile_remove.add_argument("--force", action="store_true", help="Remove even if this profile is selected")
+    profile_remove.add_argument("--yes", action="store_true", help="Delete the stored credential without prompting")
+    _add_project_dir(profile_remove)
+    profile_remove.set_defaults(func=cmd_profile_remove)
 
     discover = sub.add_parser(
         "discover",
@@ -3113,7 +3275,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     command = getattr(args, "command", None)
-    if command not in {"update-check", "doctor", "login", "logout", "signup"}:
+    if command not in {"update-check", "doctor", "login", "logout", "signup", "profile"}:
         from frontier.onboard.constants import DEFAULT_API_URL
 
         maybe_version_notice(str(getattr(args, "api_url", None) or DEFAULT_API_URL))

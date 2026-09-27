@@ -9,6 +9,10 @@ import yaml
 
 from frontier.config import ConfigError, redact
 
+def default_profiles_path() -> Path:
+    return Path.home() / ".dbt" / "profiles.yml"
+
+
 DEFAULT_PROFILES_PATH = Path.home() / ".dbt" / "profiles.yml"
 
 WAREHOUSE_TYPES = (
@@ -483,7 +487,7 @@ def load_dbt_profile_output(
     elif os.environ.get("DBT_PROFILES_DIR"):
         path = Path(os.environ["DBT_PROFILES_DIR"]) / "profiles.yml"
     else:
-        path = DEFAULT_PROFILES_PATH
+        path = default_profiles_path()
 
     if not path.is_file():
         raise ConfigError(f"Missing dbt profiles.yml at {path}")

@@ -17,4 +17,5 @@ GITIGNORE_ENTRIES = (
     "target/frontier-*.json",
     ".frontier/cache/",
     ".frontier/credentials*",
+    ".frontier/state.yml",
 )
