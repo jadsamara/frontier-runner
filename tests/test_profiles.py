@@ -1144,3 +1144,116 @@ def test_profile_status_shows_verified_ids(tmp_path: Path, monkeypatch, capsys) 
     assert BENCH_KEY not in out
     assert "frn_" not in out
 
+
+def test_argparse_global_profile_is_not_clobbered_by_subcommand_default() -> None:
+    parser = build_parser()
+    local_selected = parser.parse_args(["profile", "status"])
+    assert getattr(local_selected, "frontier_profile", None) is None
+    prefixed = parser.parse_args(["--profile", "b", "profile", "status"])
+    assert prefixed.frontier_profile == "b"
+    trailing = parser.parse_args(["profile", "status", "--profile", "b"])
+    assert trailing.frontier_profile == "b"
+    env_overridden = parser.parse_args(
+        ["--profile", "b", "profile", "status"],
+    )
+    assert env_overridden.frontier_profile == "b"
+    prove_prefixed = parser.parse_args(["--profile", "b", "prove"])
+    assert prove_prefixed.frontier_profile == "b"
+    prove_trailing = parser.parse_args(["prove", "--profile", "b"])
+    assert prove_trailing.frontier_profile == "b"
+    upload_prefixed = parser.parse_args(["--profile", "b", "upload"])
+    assert upload_prefixed.frontier_profile == "b"
+    project_list = parser.parse_args(["--profile", "b", "project", "list"])
+    assert project_list.frontier_profile == "b"
+
+
+def test_profile_status_honors_explicit_selectors(tmp_path: Path, monkeypatch, capsys) -> None:
+    _patch_whoami(monkeypatch)
+    from frontier.cli import main
+    from frontier.context import SOURCE_ENV_PROFILE, SOURCE_FLAG, SOURCE_LOCAL
+    from frontier.onboard.profile_commands import cmd_profile_create, cmd_profile_use
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    for name, key in (("a", REPAIR_KEY), ("b", BENCH_KEY)):
+        cmd_profile_create(
+            _args(
+                name=name,
+                api_key=True,
+                api_url="https://frontier.example.com",
+                _getpass=lambda prompt, stored=key: stored,
+                force=True,
+                project_dir=str(project),
+            )
+        )
+    cmd_profile_use(_args(name="a", project_dir=str(project), offline=True))
+    monkeypatch.chdir(project)
+
+    local_name, local_source = select_frontier_profile_name(_args(), project)
+    assert local_name == "a" and local_source == SOURCE_LOCAL
+
+    flag_ctx = resolve_execution_context(
+        build_parser().parse_args(["--profile", "b", "profile", "status", "--project-dir", str(project)]),
+        project,
+        require_credential=False,
+    )
+    assert flag_ctx.profile_name == "b"
+    assert flag_ctx.profile_source == SOURCE_FLAG
+
+    monkeypatch.setenv("FRONTIER_PROFILE", "b")
+    env_ctx = resolve_execution_context(
+        build_parser().parse_args(["profile", "status", "--project-dir", str(project)]),
+        project,
+        require_credential=False,
+    )
+    assert env_ctx.profile_name == "b"
+    assert env_ctx.profile_source == SOURCE_ENV_PROFILE
+
+    monkeypatch.setenv("FRONTIER_PROFILE", "a")
+    both_ctx = resolve_execution_context(
+        build_parser().parse_args(["--profile", "b", "profile", "status", "--project-dir", str(project)]),
+        project,
+        require_credential=False,
+    )
+    assert both_ctx.profile_name == "b"
+    assert both_ctx.profile_source == SOURCE_FLAG
+    monkeypatch.delenv("FRONTIER_PROFILE", raising=False)
+
+    prove_ctx = resolve_execution_context(
+        build_parser().parse_args(["--profile", "b", "prove", "--project-dir", str(project)]),
+        project,
+        require_credential=False,
+    )
+    upload_ctx = resolve_execution_context(
+        build_parser().parse_args(["upload", "--profile", "b", "--project-dir", str(project)]),
+        project,
+        require_credential=False,
+    )
+    assert prove_ctx.profile_name == upload_ctx.profile_name == "b"
+    assert prove_ctx.profile_source == upload_ctx.profile_source == SOURCE_FLAG
+
+    capsys.readouterr()
+    assert main(["--profile", "b", "profile", "status", "--project-dir", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert "Frontier profile: b" in out
+    assert "Selection source: --profile" in out
+    assert "Selection source: local selection" not in out
+
+    monkeypatch.setenv("FRONTIER_PROFILE", "b")
+    assert main(["profile", "status", "--project-dir", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert "Frontier profile: b" in out
+    assert "Selection source: FRONTIER_PROFILE" in out
+    monkeypatch.delenv("FRONTIER_PROFILE", raising=False)
+
+    assert main(["profile", "status", "--project-dir", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert "Frontier profile: a" in out
+    assert "Selection source: local selection" in out
+
+    assert main(["--profile", "missing", "profile", "status", "--project-dir", str(project)]) == 1
+    err = capsys.readouterr().err
+    assert "FRONTIER_PROFILE_NOT_FOUND" in err
+    assert "Frontier profile: a" not in err
+
+

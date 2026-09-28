@@ -94,10 +94,14 @@ def cmd_login(args: Any) -> int:
     profile_name = (getattr(args, "frontier_profile", None) or "").strip() or None
     api_url = (getattr(args, "api_url", None) or DEFAULT_API_URL).rstrip("/")
     if not getattr(args, "api_key", False):
-        print("Browser login is not available in this runner version.")
-        print("Run: frontier login --api-key")
-        print(f"Create a key at {api_url}/settings after signing in.")
-        return 1
+        from frontier.onboard.user_auth import complete_user_login
+
+        return complete_user_login(
+            args,
+            sleeper=getattr(args, "_sleep", None),
+            opener=getattr(args, "_open_browser", None),
+            clock=getattr(args, "_clock", None),
+        )
     reader = getattr(args, "_getpass", None) or getpass.getpass
     try:
         api_key = str(reader("Project API key: ")).strip()
@@ -179,10 +183,22 @@ def cmd_logout(args: Any) -> int:
 
 
 def cmd_auth_status(args: Any) -> int:
+    from frontier.credentials import load_user_authorization
+    from frontier.onboard.user_auth import require_user_authorization
+
+    api_url = (getattr(args, "api_url", None) or DEFAULT_API_URL).rstrip("/")
+    user_line = "User: not authenticated"
+    if load_user_authorization(api_url):
+        try:
+            user = require_user_authorization(api_url)
+            user_line = f"User: {user.email or user.user_id} (expires {user.expires_at})"
+        except InstallError:
+            user_line = "User: stored authorization was rejected"
+    print(user_line)
     ctx = resolve_execution_context(args, _project_dir_from_args(args), require_credential=False)
     creds = ctx.creds
     if not creds:
-        print("Not authenticated")
+        print("Project key: not authenticated")
         if ctx.profile_name:
             print(f"Frontier profile: {ctx.profile_name}")
             print(f"Next: frontier login --api-key --profile {ctx.profile_name}")
@@ -199,6 +215,7 @@ def cmd_auth_status(args: Any) -> int:
         print("Next: frontier login --api-key")
         return 1
     print("Authenticated")
+    print("Project key: authenticated")
     if ctx.profile_name:
         print(f"Frontier profile: {ctx.profile_name}")
     print(f"Organization: {identity.organization or creds.organization or '(unknown)'}")

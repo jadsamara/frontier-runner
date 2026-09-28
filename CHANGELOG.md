@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-09-27
+
+- CLI browser login (`frontier login`) uses a PKCE device-code flow and stores a short-lived user token separately from project API keys.
+- `frontier project create` / `frontier profile create --create-project` create a SaaS project with user authorization, issue a project key, and bind a named Frontier profile without printing the key.
+
 ## [0.2.3] — 2026-09-27
 
 - Named Frontier profiles: local execution contexts that bind a SaaS project credential, API origin, optional dbt target, and optional profiles.yml path without replacing `dbt_project.yml` `profile:`.
@@ -107,6 +112,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SaaS commands resolve stored keychain credentials through one shared
   resolver instead of requiring `FRONTIER_API_KEY` in the environment.
 
+[0.2.4]: https://github.com/jadsamara/frontier-runner/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/jadsamara/frontier-runner/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/jadsamara/frontier-runner/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/jadsamara/frontier-runner/compare/v0.2.0...v0.2.1

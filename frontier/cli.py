@@ -148,6 +148,14 @@ from frontier.onboard.profile_commands import (
     cmd_profile_status,
     cmd_profile_use,
 )
+from frontier.onboard.project_commands import (
+    cmd_organization_list,
+    cmd_project_create,
+    cmd_project_key_create,
+    cmd_project_list,
+    cmd_project_status,
+)
+from frontier.onboard.user_auth import cmd_auth_user_logout, cmd_auth_user_status
 from frontier.onboard.constants import DEFAULT_API_URL
 from frontier.onboard.routes import (
     derive_source_route,
@@ -2681,15 +2689,23 @@ def _add_project_dir(parser: argparse.ArgumentParser) -> None:
         dest="project_dir_opt",
         help="dbt project directory (same as the positional path)",
     )
-    _add_profile_option(parser)
+    _add_profile_option(parser, inherit_parent=True)
 
 
-def _add_profile_option(parser: argparse.ArgumentParser) -> None:
+def _add_profile_option(
+    parser: argparse.ArgumentParser,
+    *,
+    inherit_parent: bool = False,
+) -> None:
+    # Nested subparsers overwrite a parent dest when they declare the same
+    # option with default=None. SUPPRESS lets `frontier --profile b …` win
+    # over a later subparser default, while still accepting `--profile` after
+    # the subcommand.
     parser.add_argument(
         "--profile",
         dest="frontier_profile",
         metavar="NAME",
-        default=None,
+        default=argparse.SUPPRESS if inherit_parent else None,
         help=FRONTIER_PROFILE_HELP,
     )
 
@@ -2979,14 +2995,14 @@ def build_parser() -> argparse.ArgumentParser:
     signup.add_argument("--api-url", help="SaaS origin")
     signup.set_defaults(func=cmd_signup)
 
-    login = sub.add_parser("login", help="Store a project API key in the OS keychain")
+    login = sub.add_parser("login", help="Sign in as a Frontier user, or store a project API key")
     login.add_argument("--api-key", action="store_true", help="Paste a project API key (hidden input). Never pass the key as a positional argument.")
     login.add_argument("--api-url", help="SaaS origin")
-    _add_profile_option(login)
+    _add_profile_option(login, inherit_parent=True)
     login.set_defaults(func=cmd_login)
 
     logout = sub.add_parser("logout", help="Remove stored Frontier API credentials")
-    _add_profile_option(logout)
+    _add_profile_option(logout, inherit_parent=True)
     logout.add_argument(
         "--remove-metadata",
         action="store_true",
@@ -2997,8 +3013,15 @@ def build_parser() -> argparse.ArgumentParser:
     auth = sub.add_parser("auth", help="Show authentication status")
     auth_sub = auth.add_subparsers(dest="auth_command", required=True)
     auth_status = auth_sub.add_parser("status", help="Show whether the CLI is authenticated")
-    _add_profile_option(auth_status)
+    _add_profile_option(auth_status, inherit_parent=True)
+    auth_status.add_argument("--api-url", help="SaaS origin")
     auth_status.set_defaults(func=cmd_auth_status)
+    auth_user_status = auth_sub.add_parser("user-status", help="Show Frontier user authorization")
+    auth_user_status.add_argument("--api-url", help="SaaS origin")
+    auth_user_status.set_defaults(func=cmd_auth_user_status)
+    auth_user_logout = auth_sub.add_parser("user-logout", help="Revoke stored Frontier user authorization")
+    auth_user_logout.add_argument("--api-url", help="SaaS origin")
+    auth_user_logout.set_defaults(func=cmd_auth_user_logout)
 
     profile = sub.add_parser(
         "profile",
@@ -3008,6 +3031,7 @@ def build_parser() -> argparse.ArgumentParser:
             "dbt `profile:` in dbt_project.yml."
         ),
     )
+    _add_profile_option(profile, inherit_parent=True)
     profile_sub = profile.add_subparsers(dest="profile_command", required=True)
     profile_create = profile_sub.add_parser(
         "create",
@@ -3022,6 +3046,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Prompt securely for the project API key (never pass the key as an argument)",
     )
+    profile_create.add_argument(
+        "--create-project",
+        metavar="NAME",
+        help="Create a SaaS project with this name, issue a key, and bind this Frontier profile",
+    )
+    profile_create.add_argument("--organization", help="Organization ID or unambiguous slug")
+    profile_create.add_argument("--use", action="store_true", help="Select this Frontier profile for the current repository")
+    profile_create.add_argument("--non-interactive", action="store_true", help="Do not prompt; require --organization when multiple orgs exist")
     profile_create.add_argument("--force", action="store_true", help="Replace an existing Frontier profile")
     profile_create.add_argument("--yes", action="store_true", help="Accept the default API origin")
     _add_project_dir(profile_create)
@@ -3047,6 +3079,61 @@ def build_parser() -> argparse.ArgumentParser:
     profile_remove.add_argument("--yes", action="store_true", help="Delete the stored credential without prompting")
     _add_project_dir(profile_remove)
     profile_remove.set_defaults(func=cmd_profile_remove)
+
+    organization = sub.add_parser("organization", help="List organizations for the signed-in Frontier user")
+    organization_sub = organization.add_subparsers(dest="organization_command", required=True)
+    organization_list = organization_sub.add_parser("list", help="List organizations you can access")
+    organization_list.add_argument("--api-url", help="SaaS origin")
+    organization_list.set_defaults(func=cmd_organization_list)
+
+    project = sub.add_parser("project", help="Create and inspect Frontier SaaS projects")
+    project_sub = project.add_subparsers(dest="project_command", required=True)
+    project_list = project_sub.add_parser("list", help="List accessible Frontier projects")
+    project_list.add_argument("--api-url", help="SaaS origin")
+    project_list.set_defaults(func=cmd_project_list)
+    project_status = project_sub.add_parser("status", help="Show one accessible Frontier project")
+    project_status.add_argument("project", help="Project name or ID")
+    project_status.add_argument("--api-url", help="SaaS origin")
+    project_status.set_defaults(func=cmd_project_status)
+    project_create = project_sub.add_parser("create", help="Create a Frontier SaaS project")
+    project_create.add_argument("name", help="SaaS project name")
+    project_create.add_argument("--organization", help="Organization ID or unambiguous slug")
+    project_create.add_argument("--profile", dest="profile", help="Create this named Frontier profile after issuing a key")
+    project_create.add_argument("--target", help="Default dbt target for the Frontier profile")
+    project_create.add_argument("--profiles", help="Optional profiles.yml path for the Frontier profile")
+    project_create.add_argument("--api-url", help="SaaS origin")
+    project_create.add_argument("--warehouse", help="Warehouse type (default snowflake)")
+    project_create.add_argument("--no-profile", action="store_true", help="Do not create a named Frontier profile")
+    project_create.add_argument("--use", action="store_true", help="Select the new Frontier profile for this repository")
+    project_create.add_argument("--non-interactive", action="store_true", help="Do not prompt")
+    project_create.add_argument("--force", action="store_true", help="Replace an existing Frontier profile")
+    project_create.add_argument(
+        "project_dir",
+        nargs="?",
+        default=".",
+        help="dbt project directory (default: current directory)",
+    )
+    project_create.add_argument(
+        "--project-dir",
+        dest="project_dir_opt",
+        help="dbt project directory for --use",
+    )
+    project_create.set_defaults(func=cmd_project_create)
+    project_key = project_sub.add_parser("key", help="Manage project API keys")
+    project_key_sub = project_key.add_subparsers(dest="project_key_command", required=True)
+    project_key_create = project_key_sub.add_parser("create", help="Issue a replacement project API key")
+    project_key_create.add_argument("project", help="Project name or ID")
+    project_key_create.add_argument("--profile", dest="profile", help="Store the key on this Frontier profile")
+    project_key_create.add_argument("--target", help="Default dbt target when creating profile metadata")
+    project_key_create.add_argument("--profiles", help="Optional profiles.yml path")
+    project_key_create.add_argument("--api-url", help="SaaS origin")
+    project_key_create.add_argument("--non-interactive", action="store_true", help="Do not prompt")
+    project_key_create.add_argument(
+        "--project-dir",
+        dest="project_dir_opt",
+        help="dbt project directory",
+    )
+    project_key_create.set_defaults(func=cmd_project_key_create)
 
     discover = sub.add_parser(
         "discover",
@@ -3275,7 +3362,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     command = getattr(args, "command", None)
-    if command not in {"update-check", "doctor", "login", "logout", "signup", "profile"}:
+    if command not in {
+        "update-check",
+        "doctor",
+        "login",
+        "logout",
+        "signup",
+        "profile",
+        "organization",
+        "project",
+        "auth",
+    }:
         from frontier.onboard.constants import DEFAULT_API_URL
 
         maybe_version_notice(str(getattr(args, "api_url", None) or DEFAULT_API_URL))

@@ -56,6 +56,17 @@ SOURCE_ENV_PROFILE = "env"
 SOURCE_LOCAL = "local"
 SOURCE_NONE = "none"
 
+PROFILE_SOURCE_LABELS = {
+    SOURCE_FLAG: "--profile",
+    SOURCE_ENV_PROFILE: "FRONTIER_PROFILE",
+    SOURCE_LOCAL: "local selection",
+    SOURCE_NONE: "none (legacy)",
+}
+
+
+def profile_source_label(source: str) -> str:
+    return PROFILE_SOURCE_LABELS.get(source, source)
+
 
 @dataclass(frozen=True)
 class ExecutionContext:

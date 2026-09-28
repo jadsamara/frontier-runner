@@ -6,11 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from frontier.context import (
-    SOURCE_FLAG,
-    SOURCE_ENV_PROFILE,
-    SOURCE_LOCAL,
-    SOURCE_NONE,
     ensure_named_profile_ids,
+    profile_source_label,
     resolve_execution_context,
 )
 from frontier.credentials import (
@@ -171,6 +168,10 @@ def _maybe_validate_target(project_dir: Path, target: str | None, profiles: str 
 
 
 def cmd_profile_create(args: Any) -> int:
+    if str(getattr(args, "create_project", "") or "").strip():
+        from frontier.onboard.project_commands import cmd_profile_create_project
+
+        return cmd_profile_create_project(args)
     name = validate_profile_name(str(getattr(args, "name", "") or ""))
     api_url = _resolve_create_api_url(args)
     want_prompt = bool(getattr(args, "api_key", False))
@@ -306,14 +307,8 @@ def _identity_status(ctx) -> str:
 def cmd_profile_status(args: Any) -> int:
     project_dir = _project_dir(args)
     ctx = resolve_execution_context(args, project_dir, honor_local_config_target=False, require_credential=False)
-    source_label = {
-        SOURCE_FLAG: "--profile",
-        SOURCE_ENV_PROFILE: "FRONTIER_PROFILE",
-        SOURCE_LOCAL: "local selection",
-        SOURCE_NONE: "none (legacy)",
-    }.get(ctx.profile_source, ctx.profile_source)
     print(f"Frontier profile: {ctx.profile_name or '(none)'}")
-    print(f"Selection source: {source_label}")
+    print(f"Selection source: {profile_source_label(ctx.profile_source)}")
     print(
         f"Organization: {format_organization_identity(ctx.organization_name, ctx.organization_id)}"
     )

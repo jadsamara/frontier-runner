@@ -167,7 +167,7 @@ def fetch_runner_versions(api_url: str) -> RunnerVersions:
         )
     return RunnerVersions(
         minimum_supported=str(body.get("minimumSupported") or "0.1.1"),
-        latest_stable=str(body.get("latestStable") or "0.2.3"),
+        latest_stable=str(body.get("latestStable") or "0.2.4"),
     )
 
 
@@ -274,3 +274,321 @@ def fetch_active_manifest_summary(creds: StoredCredentials) -> dict[str, Any] | 
             docs_path="/docs/troubleshooting#saas-unreachable",
         )
     return body
+
+
+@dataclass(frozen=True)
+class DeviceStart:
+    device_code: str
+    user_code: str
+    verification_uri: str
+    verification_uri_complete: str
+    expires_in: int
+    interval: int
+    issuer: str
+    audience: str
+
+
+@dataclass(frozen=True)
+class UserWhoAmI:
+    user_id: str
+    email: str
+    expires_at: str
+    issuer: str
+    organizations: tuple[dict[str, str], ...]
+
+
+@dataclass(frozen=True)
+class CreatedProject:
+    id: str
+    name: str
+    organization_id: str
+    organization_name: str
+    organization_slug: str
+    warehouse_type: str
+    created: bool
+
+
+@dataclass(frozen=True)
+class IssuedProjectKey:
+    id: str
+    project_id: str
+    project_name: str
+    organization_id: str
+    organization_name: str
+    key_prefix: str
+    api_key: str
+
+
+def _cli_error(
+    status: int,
+    body: dict[str, Any],
+    *,
+    fallback: str,
+    explanation: str,
+    next_action: str,
+) -> InstallError:
+    code = str(body.get("code") or fallback)
+    return InstallError(
+        code,
+        explanation,
+        cause=str(body.get("error") or f"HTTP {status}"),
+        next_action=next_action,
+        docs_path="/docs/troubleshooting",
+    )
+
+
+def start_cli_device(api_url: str, *, code_challenge: str, state: str) -> DeviceStart:
+    origin = api_url.rstrip("/") or DEFAULT_API_URL
+    status, body = _request(
+        method="POST",
+        url=urljoin(origin + "/", "api/v1/cli/device/start"),
+        payload={
+            "codeChallenge": code_challenge,
+            "codeChallengeMethod": "S256",
+            "state": state,
+        },
+    )
+    if status != 200:
+        raise _cli_error(
+            status,
+            body,
+            fallback="USER_AUTH_EXPIRED",
+            explanation="Could not start Frontier CLI login.",
+            next_action="Retry `frontier login` after confirming the API URL.",
+        )
+    return DeviceStart(
+        device_code=str(body.get("deviceCode") or ""),
+        user_code=str(body.get("userCode") or ""),
+        verification_uri=str(body.get("verificationUri") or ""),
+        verification_uri_complete=str(body.get("verificationUriComplete") or ""),
+        expires_in=int(body.get("expiresIn") or 0),
+        interval=int(body.get("interval") or 5),
+        issuer=str(body.get("issuer") or origin),
+        audience=str(body.get("audience") or "frontier-cli"),
+    )
+
+
+def poll_cli_device_token(
+    api_url: str,
+    *,
+    device_code: str,
+    code_verifier: str,
+    state: str,
+) -> dict[str, Any] | None:
+    origin = api_url.rstrip("/") or DEFAULT_API_URL
+    status, body = _request(
+        method="POST",
+        url=urljoin(origin + "/", "api/v1/cli/device/token"),
+        payload={
+            "deviceCode": device_code,
+            "codeVerifier": code_verifier,
+            "state": state,
+        },
+    )
+    if status == 400 and body.get("error") == "authorization_pending":
+        return None
+    if status != 200:
+        raise _cli_error(
+            status,
+            body,
+            fallback="USER_AUTH_EXPIRED",
+            explanation="Frontier CLI login did not complete.",
+            next_action="Retry `frontier login` and authorize the request in the browser.",
+        )
+    return body
+
+
+def fetch_cli_user(api_url: str, access_token: str) -> UserWhoAmI:
+    origin = api_url.rstrip("/") or DEFAULT_API_URL
+    status, body = _request(
+        method="GET",
+        url=urljoin(origin + "/", "api/v1/auth/user"),
+        api_key=access_token,
+    )
+    if status in {401, 403}:
+        raise _cli_error(
+            status,
+            body,
+            fallback="USER_AUTH_EXPIRED",
+            explanation="Frontier user authorization is missing or expired.",
+            next_action="Run `frontier login`.",
+        )
+    if status != 200:
+        raise _cli_error(
+            status,
+            body,
+            fallback="USER_AUTH_EXPIRED",
+            explanation="Could not read Frontier user authorization.",
+            next_action="Run `frontier login`.",
+        )
+    orgs = body.get("organizations") if isinstance(body.get("organizations"), list) else []
+    return UserWhoAmI(
+        user_id=str(body.get("userId") or ""),
+        email=str(body.get("email") or ""),
+        expires_at=str(body.get("expiresAt") or ""),
+        issuer=str(body.get("issuer") or origin),
+        organizations=tuple(
+            {
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or ""),
+                "slug": str(item.get("slug") or ""),
+                "role": str(item.get("role") or ""),
+            }
+            for item in orgs
+            if isinstance(item, dict)
+        ),
+    )
+
+
+def list_cli_organizations(api_url: str, access_token: str) -> list[dict[str, str]]:
+    return list(fetch_cli_user(api_url, access_token).organizations)
+
+
+def list_cli_projects(api_url: str, access_token: str) -> list[dict[str, str]]:
+    origin = api_url.rstrip("/") or DEFAULT_API_URL
+    status, body = _request(
+        method="GET",
+        url=urljoin(origin + "/", "api/v1/projects"),
+        api_key=access_token,
+    )
+    if status != 200:
+        raise _cli_error(
+            status,
+            body,
+            fallback="USER_AUTH_EXPIRED",
+            explanation="Could not list Frontier projects.",
+            next_action="Run `frontier login`, then retry.",
+        )
+    rows = body.get("projects") if isinstance(body.get("projects"), list) else []
+    return [
+        {
+            "id": str(item.get("id") or ""),
+            "name": str(item.get("name") or ""),
+            "organizationId": str(item.get("organizationId") or ""),
+            "organizationName": str(item.get("organizationName") or ""),
+            "organizationSlug": str(item.get("organizationSlug") or ""),
+            "role": str(item.get("role") or ""),
+        }
+        for item in rows
+        if isinstance(item, dict)
+    ]
+
+
+def get_cli_project(api_url: str, access_token: str, project: str) -> dict[str, str]:
+    origin = api_url.rstrip("/") or DEFAULT_API_URL
+    status, body = _request(
+        method="GET",
+        url=urljoin(origin + "/", f"api/v1/projects/{quote(project, safe='')}"),
+        api_key=access_token,
+    )
+    if status != 200:
+        raise _cli_error(
+            status,
+            body,
+            fallback="ORGANIZATION_NOT_FOUND",
+            explanation="Could not read that Frontier project.",
+            next_action="Run `frontier project list`.",
+        )
+    return {
+        "id": str(body.get("id") or ""),
+        "name": str(body.get("name") or ""),
+        "organizationId": str(body.get("organizationId") or ""),
+        "organizationName": str(body.get("organizationName") or ""),
+        "organizationSlug": str(body.get("organizationSlug") or ""),
+        "role": str(body.get("role") or ""),
+        "warehouseType": str(body.get("warehouseType") or ""),
+    }
+
+
+def create_cli_project(
+    api_url: str,
+    access_token: str,
+    *,
+    name: str,
+    organization: str | None,
+    warehouse_type: str | None,
+    idempotency_key: str,
+) -> CreatedProject:
+    origin = api_url.rstrip("/") or DEFAULT_API_URL
+    payload: dict[str, Any] = {"name": name}
+    if organization:
+        payload["organization"] = organization
+    if warehouse_type:
+        payload["warehouseType"] = warehouse_type
+    status, body = _request(
+        method="POST",
+        url=urljoin(origin + "/", "api/v1/projects"),
+        api_key=access_token,
+        payload=payload,
+        extra_headers={"Idempotency-Key": idempotency_key},
+    )
+    if status not in {200, 201}:
+        raise _cli_error(
+            status,
+            body,
+            fallback="PROJECT_CREATE_FAILED",
+            explanation="Could not create the Frontier project.",
+            next_action="Confirm your organization role, then retry.",
+        )
+    return CreatedProject(
+        id=str(body.get("id") or ""),
+        name=str(body.get("name") or name),
+        organization_id=str(body.get("organizationId") or ""),
+        organization_name=str(body.get("organizationName") or ""),
+        organization_slug=str(body.get("organizationSlug") or ""),
+        warehouse_type=str(body.get("warehouseType") or "snowflake"),
+        created=bool(body.get("created", status == 201)),
+    )
+
+
+def issue_cli_project_key(
+    api_url: str,
+    access_token: str,
+    project: str,
+    *,
+    key_name: str | None = None,
+) -> IssuedProjectKey:
+    origin = api_url.rstrip("/") or DEFAULT_API_URL
+    payload: dict[str, Any] = {}
+    if key_name:
+        payload["name"] = key_name
+    status, body = _request(
+        method="POST",
+        url=urljoin(origin + "/", f"api/v1/projects/{quote(project, safe='')}/api-keys"),
+        api_key=access_token,
+        payload=payload,
+    )
+    if status not in {200, 201}:
+        raise _cli_error(
+            status,
+            body,
+            fallback="PROJECT_KEY_ISSUE_FAILED",
+            explanation="The project exists, but Frontier could not issue a project API key.",
+            next_action="Run `frontier project key create PROJECT --profile NAME`.",
+        )
+    api_key = str(body.get("apiKey") or "")
+    if not api_key:
+        raise InstallError(
+            "PROJECT_KEY_ISSUE_FAILED",
+            "The project exists, but Frontier did not return a project API key.",
+            cause="The key issuance response omitted apiKey.",
+            next_action="Run `frontier project key create PROJECT --profile NAME`.",
+        )
+    return IssuedProjectKey(
+        id=str(body.get("id") or ""),
+        project_id=str(body.get("projectId") or ""),
+        project_name=str(body.get("projectName") or ""),
+        organization_id=str(body.get("organizationId") or ""),
+        organization_name=str(body.get("organizationName") or ""),
+        key_prefix=str(body.get("keyPrefix") or key_prefix(api_key)),
+        api_key=api_key,
+    )
+
+
+def revoke_cli_user_token(api_url: str, access_token: str) -> None:
+    origin = api_url.rstrip("/") or DEFAULT_API_URL
+    _request(
+        method="POST",
+        url=urljoin(origin + "/", "api/v1/cli/logout"),
+        api_key=access_token,
+    )
